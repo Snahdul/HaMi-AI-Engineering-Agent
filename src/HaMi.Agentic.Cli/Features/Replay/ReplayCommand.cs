@@ -91,7 +91,7 @@ internal static class ReplayCommand
                 return 2;
             }
 
-            foreach (ModelFile file in draft.Files)
+            foreach (ModelFile file in draft.Files ?? [])
             {
                 string target = Path.Combine(worktree, file.Path.Replace('/', Path.DirectorySeparatorChar));
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
