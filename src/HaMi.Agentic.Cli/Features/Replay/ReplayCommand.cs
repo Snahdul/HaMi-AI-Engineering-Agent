@@ -22,8 +22,34 @@ internal static class ReplayCommand
         if (args.Contains("--help", StringComparer.Ordinal))
         {
             Console.WriteLine("Usage: dotnet run --project src/HaMi.Agentic.Cli -- --repo <local-clone> [--model gpt-5.4-mini]");
+            Console.WriteLine("       dotnet run --project src/HaMi.Agentic.Cli -- --check <existing-worktree> (no API call)");
             Console.WriteLine("Required environment variable: OPENAI_API_KEY. No GitHub writes or shell tool access for the model.");
             return 0;
+        }
+
+        // Re-check previously generated files without Git changes or additional API charges.
+        if (Option(args, "--check") is { } checkPath)
+        {
+            try
+            {
+                string root = Path.GetFullPath(checkPath);
+                var files = ExpectedFiles.Select(path => new ModelFile(path,
+                    File.ReadAllText(Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar))))).ToList();
+                List<string> findings = Validate(new ModelDraft("Read-only replay validation", files));
+                if (findings.Count == 0)
+                {
+                    Console.WriteLine("Validation passed: three expected files, YAML structure and workflow semantics.");
+                    return 0;
+                }
+                Console.Error.WriteLine("Validation failed:");
+                foreach (string finding in findings) Console.Error.WriteLine($"- {finding}");
+                return 1;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Validation could not run: {ex.Message}");
+                return 1;
+            }
         }
 
         string repo = Path.GetFullPath(Option(args, "--repo") ?? Directory.GetCurrentDirectory());
@@ -65,6 +91,22 @@ internal static class ReplayCommand
             string context = BuildContext(replayDir);
             ModelDraft draft = await GenerateAsync(context, model, key);
             List<string> errors = Validate(draft);
+            int modelCalls = 1;
+
+            // One bounded correction round. Feedback describes violated workflow rules,
+            // never the historical reference solution. No file is written before validation.
+            if (errors.Count > 0)
+            {
+                Console.WriteLine("Initial model output failed validation:");
+                foreach (string error in errors) Console.WriteLine($"- {error}");
+                Console.WriteLine("Requesting one corrected draft (one additional billable API call).");
+                string feedback = context + "\n\nVALIDATION FEEDBACK FOR THIS ATTEMPT (not the historical answer):\n"
+                    + string.Join("\n", errors.Select(e => "- " + e))
+                    + "\nRegenerate all three files; preserve the original assignment and safety limits.";
+                draft = await GenerateAsync(feedback, model, key);
+                errors = Validate(draft);
+                modelCalls++;
+            }
 
             Console.WriteLine();
             Console.WriteLine("=== Model-generated implementation plan ===");
@@ -78,7 +120,7 @@ internal static class ReplayCommand
             {
                 Console.Error.WriteLine("Validation failed. Nothing will be written:");
                 foreach (string error in errors) Console.Error.WriteLine($"- {error}");
-                await WriteReportAsync(runDir, model, worktree, "validation_failed", draft, errors);
+                await WriteReportAsync(runDir, model, worktree, "validation_failed", draft, errors, modelCalls: modelCalls);
                 Console.Error.WriteLine($"Local validation report: {Path.Combine(runDir, "report.json")}");
                 return 1;
             }
@@ -87,7 +129,7 @@ internal static class ReplayCommand
             string? approval = Console.ReadLine();
             if (!string.Equals(approval, "JA", StringComparison.Ordinal))
             {
-                await WriteReportAsync(runDir, model, worktree, "not_approved", draft, []);
+                await WriteReportAsync(runDir, model, worktree, "not_approved", draft, [], modelCalls: modelCalls);
                 Console.WriteLine("No model-generated files were written.");
                 return 2;
             }
@@ -100,7 +142,7 @@ internal static class ReplayCommand
             }
 
             string gitStatus = await GitAsync(worktree, "status", "--short", "--untracked-files=all");
-            await WriteReportAsync(runDir, model, worktree, "generated", draft, [], gitStatus);
+            await WriteReportAsync(runDir, model, worktree, "generated", draft, [], gitStatus, modelCalls);
             Console.WriteLine("Files written to isolated worktree. Nothing pushed or merged.");
             Console.WriteLine(gitStatus);
             Console.WriteLine($"Local report: {Path.Combine(runDir, "report.json")}");
@@ -237,11 +279,7 @@ internal static class ReplayCommand
             if (file.Path.EndsWith(".yml", StringComparison.Ordinal))
                 ValidateIssueForm(file, errors);
             else
-            {
-                foreach (string required in new[] { "Issue", "Prüfung", "Risiken", "Freigabe" })
-                    if (!file.Content.Contains(required, StringComparison.OrdinalIgnoreCase))
-                        errors.Add($"PR template lacks concept '{required}'.");
-            }
+                ValidatePullRequestTemplate(file, errors);
         }
         return errors;
     }
@@ -280,7 +318,19 @@ internal static class ReplayCommand
                 }
 
                 if (Find(attributes, "label") is YamlScalarNode label && label.Value is { } value)
+                {
                     labels.Add(value);
+                    // Progress and results do not exist when a new issue is opened.
+                    // Publication checkboxes are different: they must remain enforceable.
+                    bool isRetrospectiveField = value.Contains("Verlauf", StringComparison.OrdinalIgnoreCase)
+                        || value.Contains("Bearbeitung", StringComparison.OrdinalIgnoreCase)
+                        || value.Contains("Ergebnis", StringComparison.OrdinalIgnoreCase)
+                        || value.Contains("Beleg", StringComparison.OrdinalIgnoreCase);
+                    if (isRetrospectiveField && Find(field, "validations") is YamlMappingNode validation
+                        && Find(validation, "required") is YamlScalarNode required
+                        && string.Equals(required.Value, "true", StringComparison.OrdinalIgnoreCase))
+                        errors.Add($"{file.Path}: '{value}' must be optional at issue creation (required: true is invalid).");
+                }
             }
 
             string[] concepts = file.Path.Contains("agent-replay", StringComparison.Ordinal)
@@ -295,6 +345,19 @@ internal static class ReplayCommand
         {
             errors.Add($"YAML syntax invalid in {file.Path}: {ex.GetType().Name}");
         }
+    }
+
+    private static void ValidatePullRequestTemplate(ModelFile file, List<string> errors)
+    {
+        string content = file.Content;
+        bool Has(string value) => content.Contains(value, StringComparison.OrdinalIgnoreCase);
+        foreach (string required in new[] { "Issue", "Prüfung", "Risiken", "Freigabe" })
+            if (!Has(required)) errors.Add($"PR template lacks concept '{required}'.");
+
+        if (!Has("Abhängig") || !Has("ADR"))
+            errors.Add("PR template must explicitly capture dependencies and architecture decisions (ADRs).");
+        if (!Has("Replay") || !(Has("historisch") || Has("Referenz")) || !(Has("Vergleich") || Has("trenn")))
+            errors.Add("PR template must explicitly separate/compare the historical reference and replay result.");
     }
 
     private static async Task<string> GitAsync(string directory, params string[] args)
@@ -312,13 +375,14 @@ internal static class ReplayCommand
     }
 
     private static Task WriteReportAsync(string runDir, string model, string worktree, string status,
-        ModelDraft draft, IReadOnlyList<string> errors, string? gitStatus = null)
+        ModelDraft draft, IReadOnlyList<string> errors, string? gitStatus = null, int modelCalls = 1)
     {
         var report = new
         {
             replay = "issue-3",
             status,
             model,
+            modelCalls,
             baseline = BaseCommit,
             worktree,
             timestampUtc = DateTimeOffset.UtcNow,
