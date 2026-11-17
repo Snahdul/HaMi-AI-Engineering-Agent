@@ -1,0 +1,30 @@
+name: Arbeitsauftrag
+description: Konkrete Änderung mit überprüfbarem Ergebnis
+title: "[Task] "
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Ziel und Nutzen
+      description: Was soll sich konkret verbessern?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Akzeptanzkriterien
+      placeholder: "- [ ] ..."
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risiken und Grenzen
+      description: Welche Inhalte dürfen nicht öffentlich werden?
+  - type: checkboxes
+    id: publication
+    attributes:
+      label: Publikationsprüfung
+      options:
+        - label: Dieses Issue enthält keine vertraulichen Informationen.
+          required: true
