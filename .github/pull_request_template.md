@@ -28,4 +28,4 @@ Closes #
 - [ ] Inhalt und Auswirkungen fachlich geprüft
 - [ ] Merge ausdrücklich freigegeben
 
-Es gelten die Publikations- und Sicherheitsgrenzen aus [SECURITY.md](../SECURITY.md). Eine PR-Erstellung oder ein erfolgreicher Test ersetzt keine menschliche Mergefreigabe.
+Es gelten die Publikations- und Sicherheitsgrenzen aus [SECURITY.md](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/blob/main/SECURITY.md). Eine PR-Erstellung oder ein erfolgreicher Test ersetzt keine menschliche Mergefreigabe.
