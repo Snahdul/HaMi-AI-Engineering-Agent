@@ -15,6 +15,15 @@ Der Stand des Agenten-Repositories vor dieser Aufgabe enthält nur README.md, .g
 - Die allgemeine Fallstudien-Dokumentation bleibt beim Methodikprojekt. Das Agenten-Repository erhält stattdessen den spezialisierten Replay-Issue-Typ.
 - Ändere keine Workflows, keinen produktiven Code und keine anderen Dateien.
 
+## Verbindliche Ausgabepfade
+Die ursprüngliche Aufgabenplanung benennt die Dateien eindeutig. Verwende exakt diese Pfade (Groß-/Kleinschreibung und Bindestriche unverändert):
+
+- `.github/ISSUE_TEMPLATE/task.yml` – Arbeitsauftrag
+- `.github/ISSUE_TEMPLATE/agent-replay.yml` – Agenten-Replay
+- `.github/pull_request_template.md` – Pull-Request-Vorlage
+
+Die allgemeinere Bezeichnung `replay.yml` genügt nicht. Andere Datei- oder Verzeichnisnamen sind nicht Teil dieses Arbeitsauftrags.
+
 ## Erlaubte Quellvorlagen
 Die drei hier mitgelieferten Dateien aus dem öffentlichen HaMi-AI-Engineering-Projekt dürfen als Ausgangsmaterial verwendet und angepasst werden. Sie sind methodische Referenzen, keine vollständige fertige Lösung dieses Auftrags.
 
