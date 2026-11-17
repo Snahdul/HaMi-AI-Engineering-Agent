@@ -30,3 +30,20 @@ jobs:
 
       - name: CLI help smoke test (no API key needed)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --help
+
+      - name: Validate historical templates without model call
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --check .
+
+      - name: Reject premature mandatory result fields (regression)
+        shell: bash
+        run: |
+          target="$RUNNER_TEMP/replay-bad"
+          mkdir -p "$target/.github/ISSUE_TEMPLATE"
+          cp .github/ISSUE_TEMPLATE/*.yml "$target/.github/ISSUE_TEMPLATE/"
+          cp .github/pull_request_template.md "$target/.github/pull_request_template.md"
+          python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]);s=p.read_text();needle="  - type: textarea\n    id: verification\n";assert needle in s;p.write_text(s.replace(needle,"    validations:\n      required: true\n"+needle,1))' "$target/.github/ISSUE_TEMPLATE/task.yml"
+          if dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --check "$target"; then
+            echo "::error::Validator accepted mandatory result/progress field"
+            exit 1
+          fi
+          echo "Expected rejection confirmed"
