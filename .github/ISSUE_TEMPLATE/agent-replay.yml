@@ -1,0 +1,59 @@
+name: Agenten-Replay
+description: Abgeschlossenen HaMi-Arbeitsvorgang als reproduzierbaren Agententest aufbereiten
+title: "[Replay] "
+body:
+  - type: textarea
+    id: reference
+    attributes:
+      label: Abgeschlossenes Referenz-Issue
+      description: Vollständige URL des abgeschlossenen Issues. Es bleibt die führende Dokumentation des ursprünglichen Arbeitsablaufs.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Historische Ausgangslage
+      description: Ausgangszustand und damals verfügbarer Kontext. Verweise statt vertraulicher Kopien verwenden.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dokumentierte Abhängigkeiten und Entscheidungen
+      description: Relevante Issues, PRs, ADRs und Werkzeuge mit Nachweisen referenzieren. Bei fehlenden Angaben ausdrücklich die Dokumentationslücke benennen.
+    validations:
+      required: true
+  - type: textarea
+    id: approach
+    attributes:
+      label: Vorgehen und Prüfansatz
+      description: Welche konkrete Teilaufgabe wird erneut ausgeführt? Was soll der Agent selbst entscheiden?
+    validations:
+      required: true
+  - type: textarea
+    id: isolation
+    attributes:
+      label: Isolierung des Agentenversuchs
+      description: Wie wird der ursprüngliche Repository-Stand bereitgestellt und der direkte Zugriff auf die fertige historische Lösung vermieden?
+    validations:
+      required: true
+  - type: textarea
+    id: criteria
+    attributes:
+      label: Vergleichs- und Akzeptanzkriterien
+      description: Funktionales Ergebnis, Tests, Freigaben, Autonomie und nachvollziehbare Abweichungen.
+      placeholder: "- [ ] ..."
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Ergebnis, Belege und Erkenntnisse
+      description: Nach dem Versuch ergänzen. Historisches Referenzergebnis und Agentenergebnis klar trennen; Konzept, Beobachtung und belegten Ist-Stand unterscheiden.
+  - type: checkboxes
+    id: publication
+    attributes:
+      label: Publikationsprüfung
+      options:
+        - label: Dieses Issue enthält keine vertraulichen Informationen oder ungeprüfte Inhalte aus privaten Referenzprojekten.
+          required: true
