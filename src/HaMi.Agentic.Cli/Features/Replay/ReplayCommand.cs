@@ -79,6 +79,7 @@ internal static class ReplayCommand
                 Console.Error.WriteLine("Validation failed. Nothing will be written:");
                 foreach (string error in errors) Console.Error.WriteLine($"- {error}");
                 await WriteReportAsync(runDir, model, worktree, "validation_failed", draft, errors);
+                Console.Error.WriteLine($"Local validation report: {Path.Combine(runDir, "report.json")}");
                 return 1;
             }
 
@@ -159,7 +160,7 @@ internal static class ReplayCommand
                     {
                         type = "object",
                         additionalProperties = false,
-                        properties = new { path = new { type = "string" }, content = new { type = "string" } },
+                        properties = new { path = new { type = "string", @enum = ExpectedFiles }, content = new { type = "string" } },
                         required = new[] { "path", "content" }
                     }
                 }
