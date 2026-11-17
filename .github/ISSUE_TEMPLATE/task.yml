@@ -1,0 +1,57 @@
+name: Arbeitsauftrag
+description: Konkrete Änderung mit überprüfbarem Ergebnis und dokumentierten Abhängigkeiten
+title: "[Task] "
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Ziel und Nutzen
+      description: Was soll sich konkret verbessern? Welches Ergebnis ist erwartet?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Ausgangslage und Kontext
+      description: Welcher tatsächliche Stand liegt vor? Welche relevanten Informationen sind bereits dokumentiert?
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Abhängigkeiten und Referenzen
+      description: Verknüpfte Issues, PRs, ADRs und gegebenenfalls freigegebene Quellen mit URLs angeben. Wenn keine vorhanden sind, "Keine" eintragen.
+      placeholder: |
+        - Abhängig von: #...
+        - Referenz: https://github.com/...
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Akzeptanzkriterien
+      placeholder: "- [ ] ..."
+    validations:
+      required: true
+  - type: textarea
+    id: work
+    attributes:
+      label: Vorgehen, Entscheidungen und Verlauf
+      description: Während der Bearbeitung fortschreiben. Auch gescheiterte Ansätze und begründete Kurswechsel dokumentieren.
+  - type: textarea
+    id: verification
+    attributes:
+      label: Prüfungen, Ergebnisse und Belege
+      description: Tests, tatsächliche Resultate, verknüpfte Commits/PRs und offene Punkte bis zum Abschluss nachtragen.
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risiken und Grenzen
+      description: Welche Eingriffe erfordern Freigaben? Welche Inhalte dürfen nicht öffentlich werden?
+  - type: checkboxes
+    id: publication
+    attributes:
+      label: Publikationsprüfung
+      options:
+        - label: Dieses Issue enthält keine vertraulichen Informationen.
+          required: true
