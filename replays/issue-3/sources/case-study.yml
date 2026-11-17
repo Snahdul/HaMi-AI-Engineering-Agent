@@ -1,0 +1,29 @@
+name: Fallstudie
+description: Praxisbeispiel für die öffentliche Darstellung aufbereiten
+title: "[Case Study] "
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Ausgangslage
+    validations:
+      required: true
+  - type: textarea
+    id: approach
+    attributes:
+      label: Vorgehen und Entscheidungen
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Ergebnis und Belege
+      description: Konzept, Beobachtung und nachweisbaren Ist-Stand trennen
+    validations:
+      required: true
+  - type: textarea
+    id: confidentiality
+    attributes:
+      label: Publikationsprüfung
+    validations:
+      required: true
