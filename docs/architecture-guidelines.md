@@ -89,7 +89,7 @@ src/HaMi.Agentic.Cli/
     CodingCommand.cs            # begrenzter Build/Test-Korrektur-Ablauf
 ```
 
-**Grenzen der aktuellen Implementierung:** Der schlanke C#-Loader verarbeitet aus dem Prompty-Format **nur** die verifizierte Teilmenge YAML-Frontmatter plus genau eine `system:`- und eine `user:`-Nachricht sowie `{{feedback}}`. Er ist **kein allgemeiner Prompty-/Jinja2-Interpreter**. Zusätzliche Template-Konstrukte und Modell-/Tool-Konfigurationen werden zurückgewiesen. Die Sicherheitsregeln (erlaubte Pfade, Tool-Verbot, Schema, Modellbudgets, Worktree-Isolation) sind weiterhin fest im Host kodiert und dürfen nicht durch Prompt-Metadaten überschrieben werden.
+**Grenzen der aktuellen Implementierung:** Der schlanke C#-Loader verarbeitet aus dem Prompty-Format **nur** die verifizierte Teilmenge YAML-Frontmatter plus genau eine `system:`- und eine `user:`-Nachricht sowie `{{feedback}}`. Er ist **kein allgemeiner Prompty-/Jinja2-Interpreter**. Zusätzliche Template-Konstrukte und Modell-/Tool-Konfigurationen werden zurückgewiesen. Sicherheits- und Laufzeitwerte wie erlaubte Pfade, Modell-Tools, Budgets und Timeouts liegen in einer vertrauenswürdigen, versionierten Policy-Datei. Der Host validiert und erzwingt diese Werte; Prompt-Metadaten dürfen sie nicht überschreiben.
 
 **Verbindlich für kommende Slices:**
 - Ein Prompt ist ein eigenständiges, überprüfbares **Feature-Asset**. Der Code lädt es über einen kleinen Adapter; keine mehrzeiligen Prompts als `const string` im C#-Quelltext.
@@ -99,6 +99,32 @@ src/HaMi.Agentic.Cli/
 - Die verbliebenen Inline-Prompts der historischen Replay-/Workflow-Slices werden **schrittweise** in deren eigene Feature-Verzeichnisse ausgelagert; keine unkontrollierte Änderung funktionierender Modellabläufe.
 
 **Formatquellen:** [Prompty-Spezifikation](https://prompty.ai/specification/file-format/) · [Semantic Kernel YAML Prompt Schema](https://learn.microsoft.com/en-us/semantic-kernel/concepts/prompts/yaml-schema).
+
+## Deklarative Execution Policies (Policy-as-Configuration)
+
+Für die Laufzeitgrenzen eines Slices verwenden wir eine **versionierte JSON-Policy** mit typisiertem Options-Modell und strikter Startvalidierung. Die Konfigurationsabstraktionen `Microsoft.Extensions.Configuration` und der Binder bilden den etablierten .NET-Mechanismus; in einer späteren DI/Host-Architektur wird die Policy über `IOptions<T>` und `IValidateOptions<T>` bzw. `ValidateOnStart` bereitgestellt.
+
+```text
+prompts/coding/ClampExpression.prompty        # fachliche Modellanweisungen
+policies/coding/clamp.policy.json              # Rechte, Ressourcenbudgets, erlaubte Pfade
+src/HaMi.Agentic.Cli/Features/Coding/
+  CodingExecutionPolicy.cs                    # typisierter Loader/Validator/Policy-Snapshot
+  CodingCommand.cs                            # Erzwingung bei Writes, Modell-/Prozessaufrufen
+  CodingAiClient.cs                           # Provideradapter liest dieselben Limits
+```
+
+Die Policy legt fest: `allowedWritePaths`, `allowedModelTools`, `allowShellCommands`, `allowGitHubWrites`, `storeModelResponses`, `maxModelCalls`, `maxOutputTokens`, `processTimeoutSeconds`, `apiTimeoutSeconds`. **Diese Werte nicht mehr im Code suchen oder in Prompts verstecken.** Die Policy ist ein eigenständig reviewbares Artefakt. Der Laufbericht dokumentiert Pfad und SHA-256-Fingerabdruck zur Nachvollziehbarkeit.
+
+**Zwei unterschiedliche Grenzen:**
+
+1. **Konfigurierbare Berechtigung:** Der vertrauenswürdige Projektverantwortliche legt die Richtlinien in der versionierten Datei fest. Der ausführende Agent und das Modell erhalten keine Schreibrechte auf diese Policy. Keine Umgebungsvariablen-/Prompt-Overrides für Berechtigungen.
+2. **Technisch implementierte Fähigkeit:** Die CLI kann derzeit ausschließlich die feste `ClampKata`-Datei beschreiben und feste `dotnet`-Befehle ausführen. Die Policy darf diese Fähigkeiten **einschränken**, nicht durch Eintrag von `shell`, `github` oder einem beliebigen Pfad neue Fähigkeiten herbeizaubern. Ein weitergehender Rechteumfang benötigt Implementierung, abgesicherte Ausführungsumgebung, Tests und Freigabe.
+
+**Fail-closed:** Fehlende Policy, unbekannte Eigenschaften, unbekannte Version, unerlaubte Berechtigungen und zu große Budgets führen **vor** Worktree-/API-Zugriff zum Abbruch. Laufzeitwerte werden als geprüfter Snapshot eingelesen, nicht während des Ausführungszyklus dynamisch nachgeladen. Der API-Schlüssel bleibt außerhalb dieser Datei im Windows-Kontext.
+
+Später kann ein `appsettings.json` die allgemeinen *nicht sicherheitsrelevanten* Einstellungen (z. B. Ausgabe-/Log-Stufe) enthalten. Die Sicherheits-Policy bleibt davon getrennt; pauschales `AddEnvironmentVariables()` als höher priorisierte Quelle für Berechtigungen wäre hier unerwünscht.
+
+**Quellen:** [Microsoft Configuration](https://learn.microsoft.com/en-us/dotnet/core/extensions/configuration) · [Options pattern und ValidateOnStart](https://learn.microsoft.com/en-us/dotnet/core/extensions/options) · [ErrorOnUnknownConfiguration](https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.configuration.binderoptions.erroronunknownconfiguration).
 
 ## Qualitätsgates je Vertical Slice
 
