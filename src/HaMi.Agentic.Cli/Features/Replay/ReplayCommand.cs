@@ -1,3 +1,4 @@
+using HaMi.Agentic.Cli.Runtime;
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
@@ -23,7 +24,8 @@ internal static class ReplayCommand
         {
             Console.WriteLine("Usage: dotnet run --project src/HaMi.Agentic.Cli -- --repo <local-clone> [--model gpt-5.4-mini] [--unattended]");
             Console.WriteLine("       dotnet run --project src/HaMi.Agentic.Cli -- --check <existing-worktree> (no API call)");
-            Console.WriteLine("Required environment variable: OPENAI_API_KEY. No GitHub writes or shell tool access for the model.");
+            Console.WriteLine("API key: OPENAI_API_KEY or Windows User/Machine alias HaMi-AI-Engineering-Agent-Key.");
+            Console.WriteLine("Worktree root: HAMI_AGENT_WORKTREE_ROOT, otherwise system temp. No GitHub writes or shell tools.");
             return 0;
         }
 
@@ -66,10 +68,10 @@ internal static class ReplayCommand
 
         string repo = Path.GetFullPath(Option(args, "--repo") ?? Directory.GetCurrentDirectory());
         string model = Option(args, "--model") ?? Environment.GetEnvironmentVariable("OPENAI_MODEL") ?? "gpt-5.4-mini";
-        string? key = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        string? key = RuntimeSettings.GetApiKey();
         if (string.IsNullOrWhiteSpace(key))
         {
-            Console.Error.WriteLine("OPENAI_API_KEY is not set; no replay was started.");
+            Console.Error.WriteLine("No API key configured (OPENAI_API_KEY or HaMi-AI-Engineering-Agent-Key); no replay was started.");
             return 2;
         }
 
@@ -91,7 +93,7 @@ internal static class ReplayCommand
             if (!string.Equals(commit, BaseCommit, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Expected historical baseline commit is not available.");
 
-            runDir = Path.Combine(Path.GetTempPath(), "hami-agent-replays",
+            runDir = Path.Combine(RuntimeSettings.GetWorktreeRoot(repo), "hami-agent-replays",
                 $"issue3-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
             Directory.CreateDirectory(runDir);
             string worktree = Path.Combine(runDir, "worktree");
