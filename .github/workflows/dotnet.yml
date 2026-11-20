@@ -86,3 +86,21 @@ jobs:
             echo "::error::Workflow was not blocked before starting without an API key"
             exit 1
           fi
+
+      - name: Build trusted fixed C# test fixture
+        run: dotnet build samples/ClampKata/ClampKata.csproj --configuration Release --nologo -p:NuGetAudit=false
+
+      - name: Validate coding agent with real compiler, tests and automated correction (offline)
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test --repo .
+
+      - name: Reject live coding without API key
+        shell: bash
+        run: |
+          set +e
+          output="$(env -u OPENAI_API_KEY dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --repo . --unattended 2>&1)"
+          result=$?
+          set -e
+          if [ "$result" -ne 2 ] || ! grep -Fq "OPENAI_API_KEY is not set" <<< "$output"; then
+            echo "::error::Coding execution must be blocked before calling a model without an API key"
+            exit 1
+          fi

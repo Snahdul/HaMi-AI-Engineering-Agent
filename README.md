@@ -89,6 +89,32 @@ dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- workflow --repo . --ma
 
 Berichte liegen ausschließlich lokal unter `%TEMP%\hami-agent-workflows\<lauf>\report.json`; es werden keine Modellinhalte, API-Schlüssel oder lokalen Artefakte nach GitHub übertragen. Der unabhängige Workflow-Durchstich ist zunächst **nur für Markdown-Artefakte** vorgesehen. Er ist weder ein generischer Softwareentwicklungsagent noch eine Lizenz zur automatischen Bearbeitung produktiver Quelltexte.
 
+## MVP 0.3 – echter, begrenzter C#-Build/Test/Korrektur-Zyklus
+
+[Issue #15](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/15) führt einen eigenständigen `coding`-Befehl ein. Als konkretes erstes Beispiel dient die feste [.NET-11-`ClampKata`](samples/ClampKata/): eine Methode `Clamp(int value, int min, int max)` mit 14 Grenzfällen und 128 deterministischen Testwerten.
+
+Der Agent erhält **ausschließlich** den Auftrag, den C#-Ausdruck hinter `=>` zu erzeugen. Vollständige Modell-Dateien, andere Bezeichner, API-/Methodenaufrufe, Statements, Imports und Shell-Befehle sind gesperrt. Der restliche Quellcode und das Testprogramm sind vertrauenswürdige, versionierte Repository-Dateien. Der Agent darf nur `samples/ClampKata/Clamp.cs` im **neu angelegten detached Worktree** verändern.
+
+Für jeden der höchstens drei Modellversuche folgen Ausdrucksprüfung, echtes `dotnet build` und gegebenenfalls ein echter `dotnet run --no-build` mit dem festen Testprogramm. Testfehler werden in den nächsten Modellaufruf zurückgespielt; bei vollständigem Scheitern wird die ursprüngliche Quelltextdatei im Worktree wiederhergestellt. Kein Modellaufruf darf selbst ein Programm oder einen Befehl auswählen.
+
+**Kostenloser Offline-Selbsttest** (benötigt .NET 11, aber keinen API-Schlüssel):
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test --repo .
+```
+
+Er prüft mit dem echten .NET-Compiler und 142 Tests zuerst eine kompilierbare, aber **falsche** Lösung und danach die korrekte Korrektur. Zusätzlich testet er verbotene Syntax und Wiederherstellung nach ausgeschöpften Versuchen.
+
+**Echter Coding-Durchlauf auf HaMi11** (mit temporär gesetztem `OPENAI_API_KEY`, maximal drei kostenpflichtige Modellaufrufe):
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --repo . --unattended --model gpt-5.4-mini
+```
+
+Der Bericht liegt ausschließlich lokal unter `%TEMP%\hami-agent-coding\<lauf>\report.json`; der erfolgreiche Worktree enthält eine geänderte `samples/ClampKata/Clamp.cs`, während das produktive `main` unverändert bleibt.
+
+**Sicherheitsgrenze:** Das ist **kein frei programmierender Agent**. `dotnet build` und `dotnet run` sind keine OS-Sandbox für beliebigen KI-Code. Die Ausführung ist hier nur vertretbar, weil die Modellantwort auf einen kurzen C#-Ausdruck ohne Methodenaufrufe und mit einer festen, bekannten Testanwendung begrenzt wird. Für allgemeine Codegenerierung ist eine gesonderte Prozess-/Betriebssystem-Isolation erforderlich.
+
 ## Sicherheit
 
 Öffentliche Informationen und erlaubte Werkzeuge sind durch [SECURITY.md](SECURITY.md) begrenzt. Der Mensch bleibt für die Freigabe und die Integration verantwortlich.
