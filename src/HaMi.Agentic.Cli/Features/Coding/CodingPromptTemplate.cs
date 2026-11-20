@@ -1,4 +1,6 @@
 using System.Text.RegularExpressions;
+using System.Text;
+using System.Security.Cryptography;
 using YamlDotNet.RepresentationModel;
 
 namespace HaMi.Agentic.Cli.Features.Coding;
@@ -15,11 +17,14 @@ internal sealed class CodingPromptTemplate
     private static readonly Regex RoleMarker =
         new(@"(?m)^(system|user|assistant):[ \t]*$", RegexOptions.CultureInvariant);
 
-    private CodingPromptTemplate(string system, string userTemplate)
+    private CodingPromptTemplate(string system, string userTemplate, string sha256)
     {
         System = system;
         UserTemplate = userTemplate;
+        Sha256 = sha256;
     }
+
+    public string Sha256 { get; }
 
     private string System { get; }
     private string UserTemplate { get; }
@@ -64,6 +69,14 @@ internal sealed class CodingPromptTemplate
         if (GetScalar(yaml, "name") != "clamp-expression")
             throw new InvalidOperationException("Unexpected prompt asset name.");
 
+        if (!yaml.Children.TryGetValue(new YamlScalarNode("inputs"), out YamlNode? inputsNode)
+            || inputsNode is not YamlSequenceNode { Children.Count: 1 } inputs
+            || inputs.Children[0] is not YamlMappingNode input
+            || GetScalar(input, "name") != "feedback"
+            || GetScalar(input, "kind") != "string"
+            || GetScalar(input, "required") != "true")
+            throw new InvalidOperationException("Prompt must declare one required string input: feedback.");
+
         YamlMappingNode template = GetMap(yaml, "template");
         if (GetScalar(GetMap(template, "format"), "kind") != "jinja2"
             || GetScalar(GetMap(template, "parser"), "kind") != "prompty")
@@ -80,7 +93,7 @@ internal sealed class CodingPromptTemplate
         string user = body[(roles[1].Index + roles[1].Length)..].Trim();
         if (string.IsNullOrEmpty(system) || string.IsNullOrEmpty(user)
             || system.Contains("{{", StringComparison.Ordinal)
-            || !user.Contains("{{feedback}}", StringComparison.Ordinal))
+            || user.Split("{{feedback}}", StringSplitOptions.None).Length != 2)
             throw new InvalidOperationException("Missing text or required feedback placeholder.");
 
         string withoutFeedback = user.Replace("{{feedback}}", "", StringComparison.Ordinal);
@@ -89,7 +102,9 @@ internal sealed class CodingPromptTemplate
             || withoutFeedback.Contains("{%", StringComparison.Ordinal))
             throw new InvalidOperationException("Unsupported template expression.");
 
-        return new CodingPromptTemplate(system, user);
+        string sha256 = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))
+            .ToLowerInvariant();
+        return new CodingPromptTemplate(system, user, sha256);
     }
 
     private static YamlMappingNode GetMap(YamlMappingNode map, string name) =>
@@ -108,7 +123,8 @@ internal sealed class CodingPromptTemplate
         CodingPrompt first = asset.Render(null);
         CodingPrompt second = asset.Render("Fixed tests failed: expected 10 but got 11");
 
-        if (string.IsNullOrWhiteSpace(first.System)
+        if (asset.Sha256.Length != 64
+            || string.IsNullOrWhiteSpace(first.System)
             || !first.User.Contains("No previous failed attempt.", StringComparison.Ordinal)
             || !second.User.Contains("Fixed tests failed:", StringComparison.Ordinal)
             || first.System.Contains("{{", StringComparison.Ordinal)
@@ -121,6 +137,8 @@ internal sealed class CodingPromptTemplate
         {
             original.Replace("name: clamp-expression", "name: other-task", StringComparison.Ordinal),
             original.Replace("{{feedback}}", "{{unknown}}", StringComparison.Ordinal),
+            original.Replace("{{feedback}}", "{{feedback}}{{feedback}}", StringComparison.Ordinal),
+            original.Replace("kind: string", "kind: boolean", StringComparison.Ordinal),
             original.Replace("user:\n", "assistant:\n", StringComparison.Ordinal),
             original.Replace("template:\n", "tools: []\ntemplate:\n", StringComparison.Ordinal)
         })
