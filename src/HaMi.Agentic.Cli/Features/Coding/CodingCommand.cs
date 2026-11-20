@@ -1,4 +1,6 @@
 using HaMi.Agentic.Cli.Runtime;
+using HaMi.Agentic.Cli.Runtime.Logging;
+using Microsoft.Extensions.Logging;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Net.Http.Headers;
@@ -31,6 +33,7 @@ internal static class CodingCommand
             Console.WriteLine("       coding --self-test --repo <local-clone> (offline, compiles and runs trusted tests)");
             Console.WriteLine("       coding --self-test-ai --repo <local-clone> (offline, fake IChatClient, no API)");
             Console.WriteLine("       coding --policy-check --repo <local-clone> (offline, validated permissions and limits)");
+            Console.WriteLine("       coding --self-test-logging --repo <local-clone> (offline, Serilog and decision logging checks)");
             Console.WriteLine("Produces only a checked C# expression in a new detached worktree; no GitHub writes.");
             return 0;
         }
@@ -89,6 +92,20 @@ internal static class CodingCommand
             }
         }
 
+        if (args.Contains("--self-test-logging", StringComparer.Ordinal))
+        {
+            try
+            {
+                AgentLoggingSelfTest.Run(repo);
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Logging self-test failed: {ex.GetType().Name}: {ex.Message}");
+                return 1;
+            }
+        }
+
         if (!args.Contains("--unattended", StringComparer.Ordinal))
         {
             Console.Error.WriteLine("Coding mode requires explicit --unattended.");
@@ -106,8 +123,12 @@ internal static class CodingCommand
             ?? Environment.GetEnvironmentVariable("OPENAI_MODEL") ?? "gpt-5.4-mini";
         bool useAiExtensions = args.Contains("--ai-extensions", StringComparer.Ordinal);
         string? runDirectory = null;
+        AgentLoggingSession? loggingSession = null;
+        ILogger? auditLog = null;
         try
         {
+            loggingSession = AgentLoggingSession.Create(repo);
+            auditLog = loggingSession.CreateLogger("HaMi.Agentic.Cli.Features.Coding");
             string origin = (await GitAsync(repo, "remote", "get-url", "origin")).Trim();
             if (!IsAllowedOrigin(origin))
                 throw new InvalidOperationException("Coding mode is restricted to the Agent repository.");
@@ -119,6 +140,14 @@ internal static class CodingCommand
             runDirectory = Path.Combine(RuntimeSettings.GetWorktreeRoot(repo), "hami-agent-coding",
                 $"mvp03-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
             Directory.CreateDirectory(runDirectory);
+            using var correlation = auditLog.BeginScope(new Dictionary<string, object>
+            {
+                ["RunId"] = Path.GetFileName(runDirectory)
+            });
+            if (loggingSession.Settings.LogDecisionSummaries)
+                CodingLogEvents.DecisionRecorded(auditLog, "CLAMP_SCOPE",
+                    "Trusted fixed Clamp fixture", "Generate one bounded C# expression",
+                    "Versioned policy permits no model tools or other write paths");
             string worktree = Path.Combine(runDirectory, "worktree");
             await GitAsync(repo, "worktree", "add", "--detach", worktree, baseline);
 
@@ -142,13 +171,15 @@ internal static class CodingCommand
             CodingRunResult outcome = await ExecuteAttemptsAsync(fixtureRoot, template, policy,
                 prompt => aiGateway is null
                     ? GenerateAsync(prompt, model, key, policy)
-                    : GenerateWithAiAsync(aiGateway, prompt, model));
+                    : GenerateWithAiAsync(aiGateway, prompt, model), auditLog, loggingSession.Settings);
 
             string gitStatus = await GitAsync(worktree, "status", "--short", "--untracked-files=all");
             await WriteReportAsync(runDirectory, model, baseline, worktree, outcome, gitStatus,
                 useAiExtensions ? "microsoft-extensions-ai-responses" : "direct-responses",
                 template.Sha256, policy);
             CodingRunReport outcomeReport = CodingRunReport.From(outcome);
+            if (outcomeReport.Success && loggingSession.Settings.LogSuccessfulSteps)
+                CodingLogEvents.RunSucceeded(auditLog, outcomeReport.ModelCalls);
             Console.WriteLine($"Coding run: {outcomeReport.Status}");
             Console.WriteLine($"Model calls: {outcomeReport.ModelCalls}; modified file: {targetPath}");
             Console.WriteLine(gitStatus);
@@ -157,11 +188,17 @@ internal static class CodingCommand
         }
         catch (Exception ex)
         {
+            if (auditLog is not null)
+                CodingLogEvents.RunFailed(auditLog, ex.GetType().Name);
             Console.Error.WriteLine($"Coding run failed ({ex.GetType().Name}): {ex.Message}");
             if (runDirectory is not null)
                 await File.WriteAllTextAsync(Path.Combine(runDirectory, "error.txt"),
                     $"Error at {DateTimeOffset.UtcNow:O}: {ex.GetType().Name}");
             return 1;
+        }
+        finally
+        {
+            loggingSession?.Dispose();
         }
     }
 
@@ -232,7 +269,8 @@ internal static class CodingCommand
 
     private static async Task<CodingRunResult> ExecuteAttemptsAsync(string fixtureRoot,
         CodingPromptTemplate promptTemplate, CodingExecutionPolicy policy,
-        Func<CodingPrompt, Task<CodingDraft>> generate)
+        Func<CodingPrompt, Task<CodingDraft>> generate, ILogger? logger = null,
+        AgentLoggingSettings? loggingSettings = null)
     {
         string source = Path.Combine(fixtureRoot, "Clamp.cs");
         string original = await File.ReadAllTextAsync(source);
@@ -253,6 +291,14 @@ internal static class CodingCommand
                 {
                     feedback = string.Join("\n", rejected.Diagnostics);
                     attempts.Add(new ExpressionRejectedAttempt(attempt, rejected.Diagnostics));
+                    if (logger is not null)
+                    {
+                        CodingLogEvents.ExpressionRejected(logger, attempt, "invalid_expression");
+                        if (loggingSettings?.LogDecisionSummaries == true && attempt < policy.MaxModelCalls)
+                            CodingLogEvents.DecisionRecorded(logger, "RETRY_VALIDATION",
+                                "Expression rejected by validator", "Retry with bounded feedback",
+                                "Remaining model-call budget allows another attempt");
+                    }
                     Console.WriteLine($"Attempt {attempt}: unsafe or invalid C# expression rejected.");
                     continue;
                 }
@@ -266,6 +312,14 @@ internal static class CodingCommand
                 {
                     feedback = "Compiler failed:\n" + compilationFailed.Diagnostics;
                     attempts.Add(new CompilationFailedAttempt(attempt, compilationFailed.Diagnostics));
+                    if (logger is not null)
+                    {
+                        CodingLogEvents.CompilationFailed(logger, attempt, "compile_failed");
+                        if (loggingSettings?.LogDecisionSummaries == true && attempt < policy.MaxModelCalls)
+                            CodingLogEvents.DecisionRecorded(logger, "RETRY_COMPILATION",
+                                "Compilation failed", "Retry with bounded compiler feedback",
+                                "Remaining model-call budget allows another attempt");
+                    }
                     Console.WriteLine($"Attempt {attempt}: compiler rejected generated C#.");
                     continue;
                 }
@@ -278,6 +332,14 @@ internal static class CodingCommand
                 {
                     feedback = "Fixed tests failed:\n" + testFailed.Diagnostics;
                     attempts.Add(new TestsFailedAttempt(attempt, testFailed.Diagnostics));
+                    if (logger is not null)
+                    {
+                        CodingLogEvents.TestsFailed(logger, attempt, "tests_failed");
+                        if (loggingSettings?.LogDecisionSummaries == true && attempt < policy.MaxModelCalls)
+                            CodingLogEvents.DecisionRecorded(logger, "RETRY_TESTS",
+                                "Fixed tests failed", "Retry with bounded test feedback",
+                                "Remaining model-call budget allows another attempt");
+                    }
                     Console.WriteLine($"Attempt {attempt}: tests failed; requesting correction.");
                     continue;
                 }
@@ -286,11 +348,15 @@ internal static class CodingCommand
                     throw new InvalidOperationException("Test execution returned no outcome.");
 
                 attempts.Add(new CodingSucceededAttempt(attempt));
+                if (logger is not null && loggingSettings?.LogSuccessfulSteps == true)
+                    CodingLogEvents.AttemptSucceeded(logger, attempt);
                 Console.WriteLine($"Attempt {attempt}: build and fixed tests passed.");
                 Console.WriteLine(testsPassed.Output);
                 completed = true;
                 return new CodingRunSucceeded(calls, attempts.ToImmutableArray());
             }
+            if (logger is not null)
+                CodingLogEvents.RunExhausted(logger, calls);
             return new CodingRunExhausted(calls, attempts.ToImmutableArray());
         }
         finally
