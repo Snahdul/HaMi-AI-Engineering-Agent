@@ -208,6 +208,33 @@ unabhängigen Grenzen: keine Modell-Tools, nur erlaubte Zieldateien, feste
 Compiler-/Testbefehle und deterministische Validierung. Siehe
 [Prompt-Injection-Bedrohungsmodell](docs/prompt-injection-threat-model.md).
 
+## Fachliche C#-15-Union-Ergebnisse im Coding-Slice
+
+[Issue #19](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/19)
+und [PR #23](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/pull/23)
+verbessern die Lesbarkeit der internen Coding-Ergebnisse:
+
+- `SourceValidationResult`, `CompilationResult`, `TestExecutionResult`:
+  jeweils genau einer der typisierten fachlichen Ausgänge.
+- `CodingAttemptResult`: genau einer von **Ausdruck abgelehnt,
+  Build fehlgeschlagen, Tests fehlgeschlagen, erfolgreich**.
+- `CodingRunResult`: erfolgreich oder Versuchslimit erschöpft.
+- `CodingRunReport`: ausdrücklich separates Berichtsmodell. Die
+  `report.json`-Felder inklusive bisheriger Status-Strings und boolescher
+  Versuchsfelder bleiben **unverändert** für vorhandene Auswertungen.
+
+Ein gemeinsamer `Result<T>`-Typ ist **nicht** vorgeschrieben. Unions
+bleiben zunächst im Coding-Vertical-Slice; weder `IChatClient` noch die
+anderen Features müssen dafür ihre Schnittstellen ändern.
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test --repo .
+```
+
+Der Offline-Test deckt alle Union-Fälle, Report-Kompatibilität, reale
+Compiler-/Testkorrekturen und Rollback ab. Details in den
+[Architekturleitlinien](docs/architecture-guidelines.md).
+
 ## Sicherheit
 
 Öffentliche Informationen und erlaubte Werkzeuge sind durch [SECURITY.md](SECURITY.md) begrenzt. Der Mensch bleibt für die Freigabe und die Integration verantwortlich.
