@@ -206,6 +206,41 @@ Die fachliche `report.json`-Schnittstelle bleibt hiervon getrennt.
 
 [Ereigniskatalog und Offline-Regressionsprüfungen](logging.md).
 
+## Zweiter ausführbarer Coding-Task – verifiziertes Produktionsziel
+
+Mit [Issue #28](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/28)
+kann `coding --task retry-budget` erstmals einen klar begrenzten
+**Produktionsquelltext** im Agenten selbst bearbeiten.
+`CodingTaskDefinition` verwaltet die einzigen zwei erlaubten Task-IDs,
+jeweils mit festem Zielpfad, zugehörigem Projekt und Allowlist der C#-
+Identifier. Ein frei erfundener Task oder eine abweichende Ziel-Datei
+wird vom Host **vor** einem Modell- oder Dateischreibaufruf abgelehnt.
+
+```text
+src/HaMi.Agentic.Cli/Features/Coding/
+  CodingTaskDefinition.cs     # Host-Allowlist: clamp-kata / retry-budget
+  RetryBudget.cs              # echter Coding-Produktionscode
+samples/RetryBudget/
+  RetryBudget.csproj          # vertrauter .NET-11-Testharness, linkt Produktionsdatei
+  Program.cs                  # feste Grenzfall- und deterministische Tests
+prompts/coding/RetryBudget.prompty
+policies/coding/retry-budget.policy.json
+```
+
+Der Modelloutput ist **weiterhin ausschließlich ein kurzer C#-Ausdruck**
+ohne Methoden-/Dateisystemzugriff, beliebige API-Aufrufe oder dynamische
+Shellbefehle. Die `retry-budget`-Policy genehmigt exakt
+`src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs`, nicht generell
+das `src/`-Verzeichnis. Die Produktion-Methode wird über `Compile Include`
+in einem fest vorgegebenen Testprojekt geprüft. Der Host behält seine
+von dieser Methode unabhängige Begrenzung auf höchstens drei Modellversuche.
+
+**Wesentliche Grenze:** Ein detached Git-Worktree ist keine OS-Sandbox.
+Generierter allgemeiner Code ist weiterhin ausdrücklich verboten,
+bis eine getrennte sichere Ausführungsumgebung und stärkere AST-/Diff-
+Prüfungen vorhanden sind. `main` wird ausschließlich nach menschlichem
+Review/Freigabe geändert.
+
 ## Qualitätsgates je Vertical Slice
 
 1. **Vertrag und Architektur**: Scope, erlaubte Pfade, Modulgrenzen, Abhängigkeiten und Definition of Done prüfen.

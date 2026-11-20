@@ -105,11 +105,17 @@ jobs:
       - name: Build trusted fixed C# test fixture
         run: dotnet build samples/ClampKata/ClampKata.csproj --configuration Release --nologo -p:NuGetAudit=false
 
-      - name: Validate coding agent with real compiler, tests and automated correction (offline)
+      - name: Build and test real RetryBudget Coding feature fixture
+        run: dotnet run --project samples/RetryBudget/RetryBudget.csproj --configuration Release --nologo
+
+      - name: Validate two bounded coding tasks with real compiler, tests and correction (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test --repo .
 
       - name: Validate versioned execution policy without API/network access
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --policy-check --repo .
+
+      - name: Validate task-specific retry policy (offline)
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --policy-check --task retry-budget --repo .
 
       - name: Test structured file logging, decisions and defaults without API access
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test-logging --repo .
@@ -152,3 +158,6 @@ jobs:
 
       - name: Assert Serilog file handles are released on Windows
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test-logging --repo .
+
+      - name: Check production RetryBudget expression and correction on Windows
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test --repo .
