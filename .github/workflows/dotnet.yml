@@ -111,6 +111,9 @@ jobs:
       - name: Validate versioned execution policy without API/network access
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --policy-check --repo .
 
+      - name: Test structured file logging, decisions and defaults without API access
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test-logging --repo .
+
       - name: Test Microsoft.Extensions.AI IChatClient coding adapter offline
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test-ai --repo .
 
