@@ -313,3 +313,45 @@ die Korrelation und ungültige Konfiguration. Weitere Informationen:
 ## Sicherheit
 
 Öffentliche Informationen und erlaubte Werkzeuge sind durch [SECURITY.md](SECURITY.md) begrenzt. Der Mensch bleibt für die Freigabe und die Integration verantwortlich.
+
+## Development Preflight – versionierter Auftrag und kontrollierter Multi-Datei-Diff
+
+Der separate CLI-Befehl `development` ist der **erste sichere Vorbereitungsdurchstich**
+für Entwicklungsaufträge mit mehreren C#-Dateien. Er ruft **kein Modell**
+auf, baut oder startet **keinen** vorgeschlagenen Code und integriert nichts.
+
+Die verbindliche, versionierte Auftragsdatei
+[`contracts/development/retry-budget-refinement.json`](contracts/development/retry-budget-refinement.json)
+enthält eine explizite Task-ID, das Ziel-Framework, Zweck, Akzeptanzkriterien
+und eine exakt definierte Allowlist für zwei produktive C#-Dateien.
+Unbekannte JSON-Felder, fehlende Pflichtangaben, doppelte Schlüssel,
+relative Pfadausbrüche oder unzulässige Dateitypen werden abgewiesen.
+
+**Kostenlose lokale Prüfung** nach `git pull --ff-only` auf `main`:
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- development --repo . --contract-check --contract contracts/development/retry-budget-refinement.json
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- development --repo . --self-test
+```
+
+Ein später in einem isolierten, detached Worktree entstandener Änderungssatz kann
+**rein lesend** gegen den auf `main` eingecheckten Vertrag geprüft werden:
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- development --repo . --worktree-check --contract contracts/development/retry-budget-refinement.json --worktree "I:\git\HaMi\_agent-worktrees\<candidate>"
+```
+
+Die Prüfung verlangt dieselbe Git-Repository-Identität, exakt den aktuellen
+`main`-Commit als Baseline und einen detached Worktree außerhalb des
+Hauptcheckouts. Sie akzeptiert nur explizit erlaubte Dateipfade und
+zulässige Git-Änderungsarten; Löschungen, Umbenennungen, Symlink-/
+Reparse-Änderungen und fremde Dateien führen zu einem Fehler. Die
+CI-Selbsttests erzeugen dafür ein temporäres Git-Repository, prüfen
+Positiv- und Negativfälle und verändern **nicht** den produktiven Checkout.
+
+**Wichtige Grenze:** Dieser Scope-Check beurteilt nicht die Fachlichkeit des
+Quellcodes, überprüft keine Anwendungs-API und ist keine OS-Sandbox.
+Die Ausführung allgemeiner KI-generierter Programme bleibt verboten,
+bis eine separate, konkret geprüfte Isolations- und Build/Test-Stufe
+implementiert ist. Die bestehenden `coding`-Aufträge bleiben unverändert.
+
