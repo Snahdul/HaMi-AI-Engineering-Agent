@@ -1,3 +1,4 @@
+using HaMi.Agentic.Cli.Runtime;
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
@@ -69,10 +70,10 @@ internal static class WorkflowCommand
                 return 2;
             }
 
-            string? apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+            string? apiKey = RuntimeSettings.GetApiKey();
             if (string.IsNullOrWhiteSpace(apiKey))
             {
-                Console.Error.WriteLine("OPENAI_API_KEY is not set; no workflow was started.");
+                Console.Error.WriteLine("No API key configured (OPENAI_API_KEY or HaMi-AI-Engineering-Agent-Key); no workflow was started.");
                 return 2;
             }
 
@@ -94,7 +95,7 @@ internal static class WorkflowCommand
                     throw new InvalidOperationException("Workflow is restricted to the Agent repository.");
 
                 string baseline = (await GitAsync(repo, "rev-parse", "refs/heads/main")).Trim();
-                runDirectory = Path.Combine(Path.GetTempPath(), "hami-agent-workflows",
+                runDirectory = Path.Combine(RuntimeSettings.GetWorktreeRoot(repo), "hami-agent-workflows",
                     $"mvp02-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
                 Directory.CreateDirectory(runDirectory);
                 string worktree = Path.Combine(runDirectory, "worktree");

@@ -6,6 +6,42 @@ Die Methodik und ihre Erkenntnisse werden im eigenständigen [HaMi AI Engineerin
 
 **Projektsteuerung:** [HaMi AI Engineering Agent – GitHub Project #2](https://github.com/users/Snahdul/projects/2/views/1) · [Statusautomatisierung und Einrichtung](docs/project-board.md).
 
+## Dauerhafte Laufzeitkonfiguration auf HaMi11 (Windows)
+
+[Issue #17](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/17) vereinheitlicht den Worktree-Pfad und die OpenAI-Key-Auflösung für die Replay-, Workflow- und Coding-Modi.
+
+Einmalig **als angemeldeter Windows-Benutzer** in PowerShell einstellen:
+
+```powershell
+# Der Root-Ordner liegt auf I: (ReFS), als Geschwister des produktiven Checkouts.
+[Environment]::SetEnvironmentVariable(
+    'HAMI_AGENT_WORKTREE_ROOT',
+    'I:\git\HaMi\_agent-worktrees',
+    'User'
+)
+
+# Nur falls der API-Schlüssel noch NICHT unter diesem Namen gespeichert ist:
+# $secret = Read-Host 'OpenAI API-Schlüssel' -AsSecureString
+# [Environment]::SetEnvironmentVariable(
+#     'HaMi-AI-Engineering-Agent-Key',
+#     [System.Net.NetworkCredential]::new('', $secret).Password,
+#     'User'
+# )
+```
+
+Der Schlüsselwert darf weder in PowerShell-Quelltexten, Git, Issues, CI noch in Logs stehen. Eine Windows-Benutzerumgebungsvariable ist **nicht verschlüsselt** und ersetzt keinen Credential-Manager.
+
+**Konfiguration prüfen – offline und ohne Schlüsselanzeige:**
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- config --check --repo .
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- config --self-test
+```
+
+Die CLI liest den API-Schlüssel in dieser Priorität: bereits vorhandenes prozesslokales `OPENAI_API_KEY`, anschließend `HaMi-AI-Engineering-Agent-Key` im Prozess bzw. unter Windows im Benutzer- oder Maschinenkontext. Es wird **kein Schlüsselwert** angezeigt. Der benutzerdefinierte Worktree-Root kommt aus `HAMI_AGENT_WORKTREE_ROOT` (Prozess → Windows User → Machine), sonst aus dem bisherigen systemseitigen Temp-Verzeichnis. Ein relativer Pfad und ein Root **innerhalb des produktiven Repository-Checkouts** werden abgelehnt.
+
+Damit ist keine globale Änderung von `TEMP`/`TMP` mehr erforderlich. Für HaMi11 muss `I:` beim Start vorhanden und schreibbar sein. Das Setzen der Benutzerumgebungsvariable allein verschiebt **keine** früheren Worktrees.
+
 ## MVP 0.1 – erster historischer Replay-Durchstich
 
 - [Issue #5: Referenzfall](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/5) – ein bereits abgeschlossenes öffentliches Issue, mit getrenntem Ausgangs- und Ergebnisstand
@@ -31,17 +67,15 @@ dotnet --version
 dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release
 dotnet run --project src/HaMi.Agentic.Cli -- --help
 
-# Den API-Schlüssel nicht im Chat, Git, Skript oder Issue hinterlegen.
-$secret = Read-Host "OpenAI API-Schlüssel" -AsSecureString
-$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new("", $secret).Password
+# Nach einmaliger Windows-Konfiguration kein erneutes Einlesen des Schlüssels:
+dotnet run --project src/HaMi.Agentic.Cli -- config --check --repo .
 dotnet run --project src/HaMi.Agentic.Cli -- --repo . --model gpt-5.4-mini
 
 # Alternative für einen lokal unbeaufsichtigten Replay (keine GitHub-Schreibrechte):
 # dotnet run --project src/HaMi.Agentic.Cli -- --repo . --model gpt-5.4-mini --unattended
-Remove-Item Env:OPENAI_API_KEY
 ```
 
-Die CLI prüft den Repository-Ursprung und den historischen Commit, erstellt einen separaten lokalen **detached Worktree** im temporären Verzeichnis und sendet ausschließlich den kuratierten Auftrag und die drei ursprünglichen öffentlichen Quellvorlagen an das Modell. **Standardmäßig** fordert sie vor dem Schreiben weiterhin ausdrücklich `JA`. **Optional** überspringt `--unattended` nur diesen lokalen Freigabepunkt, wenn `--repo` explizit gesetzt wurde, die fachliche Validierung erfolgreich ist und der abgetrennte historische Worktree sauber auf dem erwarteten Commit steht. Es werden ausschließlich die drei allowlisteten Dateien dort geschrieben; kein Push, Merge, Deployment und keine Ausführung von Modell-Shellbefehlen.
+Die CLI prüft den Repository-Ursprung und den historischen Commit, erstellt einen separaten lokalen **detached Worktree** unter dem konfigurierten Root (sonst im temporären Verzeichnis) und sendet ausschließlich den kuratierten Auftrag und die drei ursprünglichen öffentlichen Quellvorlagen an das Modell. **Standardmäßig** fordert sie vor dem Schreiben weiterhin ausdrücklich `JA`. **Optional** überspringt `--unattended` nur diesen lokalen Freigabepunkt, wenn `--repo` explizit gesetzt wurde, die fachliche Validierung erfolgreich ist und der abgetrennte historische Worktree sauber auf dem erwarteten Commit steht. Es werden ausschließlich die drei allowlisteten Dateien dort geschrieben; kein Push, Merge, Deployment und keine Ausführung von Modell-Shellbefehlen.
 
 Sie validiert die drei erzeugten Dateien auf YAML-Struktur und fachliche Pflichtabschnitte. Bei Fehlern bleibt der historische Worktree unverändert. Ergebnis und Prüfstatus werden ausschließlich lokal in `report.json` festgehalten, einschließlich `approvalMode` (`interactive` oder `unattended-isolated`) und `modelCalls`. **Der historische MVP-0.1-Replay wurde bereits in [Issue #5](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/5) technisch und fachlich geprüft und abgeschlossen.** Diese Bewertung gilt für den engen Referenzfall und ersetzt keinen Test allgemeiner autonomer Programmieraufgaben.
 
@@ -81,13 +115,13 @@ dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- workflow --repo . --ma
 dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- workflow --self-test
 ```
 
-Echten, kostenpflichtigen Ablauf nur auf HaMi11 und mit temporär gesetztem `OPENAI_API_KEY` starten:
+Echten, kostenpflichtigen Ablauf nur auf HaMi11 mit konfiguriertem API-Schlüssel starten:
 
 ```powershell
 dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- workflow --repo . --manifest workflows/mvp02.json --unattended --model gpt-5.4-mini
 ```
 
-Berichte liegen ausschließlich lokal unter `%TEMP%\hami-agent-workflows\<lauf>\report.json`; es werden keine Modellinhalte, API-Schlüssel oder lokalen Artefakte nach GitHub übertragen. Der unabhängige Workflow-Durchstich ist zunächst **nur für Markdown-Artefakte** vorgesehen. Er ist weder ein generischer Softwareentwicklungsagent noch eine Lizenz zur automatischen Bearbeitung produktiver Quelltexte.
+Berichte liegen ausschließlich lokal unter dem konfigurierten Worktree-Root in `hami-agent-workflows\<lauf>\report.json` (ohne Konfiguration unter `%TEMP%`); es werden keine Modellinhalte, API-Schlüssel oder lokalen Artefakte nach GitHub übertragen. Der unabhängige Workflow-Durchstich ist zunächst **nur für Markdown-Artefakte** vorgesehen. Er ist weder ein generischer Softwareentwicklungsagent noch eine Lizenz zur automatischen Bearbeitung produktiver Quelltexte.
 
 ## MVP 0.3 – echter, begrenzter C#-Build/Test/Korrektur-Zyklus
 
@@ -105,13 +139,13 @@ dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test --r
 
 Er prüft mit dem echten .NET-Compiler und 142 Tests zuerst eine kompilierbare, aber **falsche** Lösung und danach die korrekte Korrektur. Zusätzlich testet er verbotene Syntax und Wiederherstellung nach ausgeschöpften Versuchen.
 
-**Echter Coding-Durchlauf auf HaMi11** (mit temporär gesetztem `OPENAI_API_KEY`, maximal drei kostenpflichtige Modellaufrufe):
+**Echter Coding-Durchlauf auf HaMi11** (mit vorhandenem API-Schlüssel, maximal drei kostenpflichtige Modellaufrufe):
 
 ```powershell
 dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --repo . --unattended --model gpt-5.4-mini
 ```
 
-Der Bericht liegt ausschließlich lokal unter `%TEMP%\hami-agent-coding\<lauf>\report.json`; der erfolgreiche Worktree enthält eine geänderte `samples/ClampKata/Clamp.cs`, während das produktive `main` unverändert bleibt.
+Der Bericht liegt ausschließlich lokal unter dem konfigurierten Worktree-Root in `hami-agent-coding\<lauf>\report.json` (ohne Konfiguration unter `%TEMP%`); der erfolgreiche Worktree enthält eine geänderte `samples/ClampKata/Clamp.cs`, während das produktive `main` unverändert bleibt.
 
 **Sicherheitsgrenze:** Das ist **kein frei programmierender Agent**. `dotnet build` und `dotnet run` sind keine OS-Sandbox für beliebigen KI-Code. Die Ausführung ist hier nur vertretbar, weil die Modellantwort auf einen kurzen C#-Ausdruck ohne Methodenaufrufe und mit einer festen, bekannten Testanwendung begrenzt wird. Für allgemeine Codegenerierung ist eine gesonderte Prozess-/Betriebssystem-Isolation erforderlich.
 
