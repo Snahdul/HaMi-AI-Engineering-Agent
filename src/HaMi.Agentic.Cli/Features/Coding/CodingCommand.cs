@@ -122,7 +122,8 @@ internal static class CodingCommand
 
             string gitStatus = await GitAsync(worktree, "status", "--short", "--untracked-files=all");
             await WriteReportAsync(runDirectory, model, baseline, worktree, outcome, gitStatus,
-                useAiExtensions ? "microsoft-extensions-ai-responses" : "direct-responses");
+                useAiExtensions ? "microsoft-extensions-ai-responses" : "direct-responses",
+                template.Sha256);
             Console.WriteLine($"Coding run: {(outcome.Success ? "generated" : "validation_failed")}");
             Console.WriteLine($"Model calls: {outcome.ModelCalls}; modified file: {Target}");
             Console.WriteLine(gitStatus);
@@ -371,7 +372,8 @@ internal static class CodingCommand
     }
 
     private static Task WriteReportAsync(string dir, string model, string baseline,
-        string worktree, CodingOutcome outcome, string gitStatus, string transport)
+        string worktree, CodingOutcome outcome, string gitStatus, string transport,
+        string promptSha256)
     {
         var report = new
         {
@@ -379,6 +381,8 @@ internal static class CodingCommand
             status = outcome.Success ? "generated" : "validation_failed",
             model,
             transport,
+            promptAsset = CodingPromptTemplate.RelativePath,
+            promptSha256,
             modelCalls = outcome.ModelCalls,
             approvalMode = "unattended-isolated",
             baseline,
