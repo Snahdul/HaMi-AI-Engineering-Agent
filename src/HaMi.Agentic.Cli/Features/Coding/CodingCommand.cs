@@ -123,12 +123,19 @@ internal static class CodingCommand
             ?? Environment.GetEnvironmentVariable("OPENAI_MODEL") ?? "gpt-5.4-mini";
         bool useAiExtensions = args.Contains("--ai-extensions", StringComparer.Ordinal);
         string? runDirectory = null;
+        string runId = $"mvp03-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}";
         AgentLoggingSession? loggingSession = null;
         ILogger? auditLog = null;
+        IDisposable? correlation = null;
         try
         {
             loggingSession = AgentLoggingSession.Create(repo);
             auditLog = loggingSession.CreateLogger("HaMi.Agentic.Cli.Features.Coding");
+            // Keep the scope alive through catch: terminal failures must carry RunId.
+            correlation = auditLog.BeginScope(new Dictionary<string, object>
+            {
+                ["RunId"] = runId
+            });
             string origin = (await GitAsync(repo, "remote", "get-url", "origin")).Trim();
             if (!IsAllowedOrigin(origin))
                 throw new InvalidOperationException("Coding mode is restricted to the Agent repository.");
@@ -138,12 +145,8 @@ internal static class CodingCommand
             CodingPromptTemplate template = CodingPromptTemplate.Load(repo);
             string baseline = (await GitAsync(repo, "rev-parse", "refs/heads/main")).Trim();
             runDirectory = Path.Combine(RuntimeSettings.GetWorktreeRoot(repo), "hami-agent-coding",
-                $"mvp03-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
+                runId);
             Directory.CreateDirectory(runDirectory);
-            using var correlation = auditLog.BeginScope(new Dictionary<string, object>
-            {
-                ["RunId"] = Path.GetFileName(runDirectory)
-            });
             if (loggingSession.Settings.LogDecisionSummaries)
                 CodingLogEvents.DecisionRecorded(auditLog, "CLAMP_SCOPE",
                     "Trusted fixed Clamp fixture", "Generate one bounded C# expression",
@@ -198,6 +201,7 @@ internal static class CodingCommand
         }
         finally
         {
+            correlation?.Dispose();
             loggingSession?.Dispose();
         }
     }
