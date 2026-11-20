@@ -70,14 +70,7 @@ internal static class CodingCommand
         try
         {
             string origin = (await GitAsync(repo, "remote", "get-url", "origin")).Trim();
-            string[] allowedOrigins =
-            [
-                "github.com/Snahdul/HaMi-AI-Engineering-Agent.git",
-                "github.com:Snahdul/HaMi-AI-Engineering-Agent.git",
-                "github.com/Snahdul/HaMi-AI-Engineering-Agent",
-                "github.com:Snahdul/HaMi-AI-Engineering-Agent"
-            ];
-            if (!allowedOrigins.Any(suffix => origin.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)))
+            if (!IsAllowedOrigin(origin))
                 throw new InvalidOperationException("Coding mode is restricted to the Agent repository.");
 
             string baseline = (await GitAsync(repo, "rev-parse", "refs/heads/main")).Trim();
@@ -121,6 +114,17 @@ internal static class CodingCommand
             return 1;
         }
     }
+
+    private static bool IsAllowedOrigin(string origin) =>
+        new[]
+        {
+            "https://github.com/Snahdul/HaMi-AI-Engineering-Agent",
+            "https://github.com/Snahdul/HaMi-AI-Engineering-Agent.git",
+            "git@github.com:Snahdul/HaMi-AI-Engineering-Agent",
+            "git@github.com:Snahdul/HaMi-AI-Engineering-Agent.git",
+            "ssh://git@github.com/Snahdul/HaMi-AI-Engineering-Agent",
+            "ssh://git@github.com/Snahdul/HaMi-AI-Engineering-Agent.git"
+        }.Contains(origin, StringComparer.OrdinalIgnoreCase);
 
     private static string? Option(string[] args, string name)
     {
@@ -385,6 +389,12 @@ internal static class CodingCommand
                 throw new InvalidOperationException($"Unsafe expression accepted: {forbidden}");
         }
 
+        if (!IsAllowedOrigin("https://github.com/Snahdul/HaMi-AI-Engineering-Agent.git")
+            || !IsAllowedOrigin("git@github.com:Snahdul/HaMi-AI-Engineering-Agent.git")
+            || IsAllowedOrigin("https://evilgithub.com/Snahdul/HaMi-AI-Engineering-Agent.git")
+            || IsAllowedOrigin("https://github.com/Attacker/HaMi-AI-Engineering-Agent.git"))
+            throw new InvalidOperationException("Remote origin verification allowed an unexpected repository.");
+
         const string correct = "value < min ? min : value > max ? max : value";
         if (ValidateDraft(new CodingDraft("Plan", correct)).Count != 0)
             throw new InvalidOperationException("Valid expression was rejected.");
@@ -410,6 +420,20 @@ internal static class CodingCommand
                 || result.Attempts[1].Status != "passed")
                 throw new InvalidOperationException("Coding retry / real build+test self-test failed.");
 
+            int compilerCalls = 0;
+            CodingOutcome compilerRecovery = await ExecuteAttemptsAsync(temp, prompt =>
+            {
+                compilerCalls++;
+                if (compilerCalls == 2 && !prompt.Contains("Compiler failed:", StringComparison.Ordinal))
+                    throw new InvalidOperationException("Compiler diagnostics did not reach correction attempt.");
+                return Task.FromResult(new CodingDraft("Implement Clamp",
+                    compilerCalls == 1 ? "value < min ? min :" : correct));
+            });
+            if (!compilerRecovery.Success || compilerRecovery.ModelCalls != 2
+                || compilerRecovery.Attempts[0].Status != "build_failed"
+                || compilerRecovery.Attempts[1].Status != "passed")
+                throw new InvalidOperationException("Coding compiler failure / recovery self-test failed.");
+
             // No partial code remains after a completely unsuccessful run.
             string target = Path.Combine(temp, "Clamp.cs");
             string original = "// Clean placeholder after failed run.\n";
@@ -420,8 +444,8 @@ internal static class CodingCommand
                 || await File.ReadAllTextAsync(target) != original)
                 throw new InvalidOperationException("Exhausted attempt budget did not restore original source.");
 
-            Console.WriteLine("Coding self-test passed: restricted expression grammar, real build/test retry, "
-                + "no-key operation and rollback on exhaustion.");
+            Console.WriteLine("Coding self-test passed: strict repository origin, expression grammar, "
+                + "real compiler/test failure corrections and rollback after exhausted attempts.");
             return 0;
         }
         finally
