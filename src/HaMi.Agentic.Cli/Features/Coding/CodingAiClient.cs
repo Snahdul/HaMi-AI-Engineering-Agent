@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Runtime.CompilerServices;
 using Microsoft.Extensions.AI;
 using OpenAI;
 using OpenAI.Responses;
@@ -60,6 +61,9 @@ internal sealed class CodingAiClient(IChatClient client)
         }
     }
 
+    // The OpenAI Responses SDK currently marks CreateResponseOptions experimental (OPENAI001).
+    // Keep the opt-in compatibility boundary explicit and limited to this method.
+#pragma warning disable OPENAI001
     private static ChatOptions CreateOptions(string model) => new()
     {
         ModelId = model,
@@ -76,6 +80,8 @@ internal sealed class CodingAiClient(IChatClient client)
             StoredOutputEnabled = false
         }
     };
+
+#pragma warning restore OPENAI001
 
     public static IChatClient CreateOpenAi(string apiKey)
     {
@@ -97,6 +103,7 @@ internal sealed class CodingAiClient(IChatClient client)
         var gateway = new CodingAiClient(fake);
         CodingSuggestion result = await gateway.GenerateAsync("Implement Clamp.", "test-model");
 
+#pragma warning disable OPENAI001
         if (result.Expression != "value < min ? min : value > max ? max : value"
             || fake.Calls != 1
             || fake.Options?.ModelId != "test-model"
@@ -109,6 +116,7 @@ internal sealed class CodingAiClient(IChatClient client)
                 { StoredOutputEnabled: false })
             throw new InvalidOperationException(
                 "AI adapter did not preserve strict JSON format, no-tools, token budget or store=false.");
+#pragma warning restore OPENAI001
 
         using var bad = new ScriptedChatClient("not JSON");
         try
@@ -146,7 +154,7 @@ internal sealed class CodingAiClient(IChatClient client)
 
         public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
             IEnumerable<ChatMessage> messages, ChatOptions? options = null,
-            CancellationToken cancellationToken = default)
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             await Task.CompletedTask;
             yield break;
