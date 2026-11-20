@@ -138,7 +138,7 @@ internal static class CodingCommand
             using Microsoft.Extensions.AI.IChatClient? chatClient = useAiExtensions
                 ? CodingAiClient.CreateOpenAi(key) : null;
             var aiGateway = chatClient is null ? null : new CodingAiClient(chatClient, policy);
-            CodingOutcome outcome = await ExecuteAttemptsAsync(fixtureRoot, template, policy,
+            CodingRunResult outcome = await ExecuteAttemptsAsync(fixtureRoot, template, policy,
                 prompt => aiGateway is null
                     ? GenerateAsync(prompt, model, key, policy)
                     : GenerateWithAiAsync(aiGateway, prompt, model));
@@ -147,11 +147,12 @@ internal static class CodingCommand
             await WriteReportAsync(runDirectory, model, baseline, worktree, outcome, gitStatus,
                 useAiExtensions ? "microsoft-extensions-ai-responses" : "direct-responses",
                 template.Sha256, policy);
-            Console.WriteLine($"Coding run: {(outcome.Success ? "generated" : "validation_failed")}");
-            Console.WriteLine($"Model calls: {outcome.ModelCalls}; modified file: {targetPath}");
+            CodingRunReport outcomeReport = CodingRunReport.From(outcome);
+            Console.WriteLine($"Coding run: {outcomeReport.Status}");
+            Console.WriteLine($"Model calls: {outcomeReport.ModelCalls}; modified file: {targetPath}");
             Console.WriteLine(gitStatus);
             Console.WriteLine($"Local report: {Path.Combine(runDirectory, "report.json")}");
-            return outcome.Success ? 0 : 1;
+            return outcomeReport.Success ? 0 : 1;
         }
         catch (Exception ex)
         {
@@ -190,7 +191,7 @@ internal static class CodingCommand
         return args[index + 1];
     }
 
-    private static List<string> ValidateDraft(CodingDraft draft)
+    private static SourceValidationResult ValidateDraft(CodingDraft draft)
     {
         List<string> errors = [];
         if (string.IsNullOrWhiteSpace(draft.Plan) || draft.Plan.Length > 2000)
@@ -200,7 +201,7 @@ internal static class CodingCommand
             || draft.Expression.Contains('\n') || draft.Expression.Contains('\r'))
         {
             errors.Add("C# expression must be a single nonempty line with at most 350 characters.");
-            return errors;
+            return new SourceValidationRejected(errors);
         }
 
         string expression = draft.Expression;
@@ -217,7 +218,9 @@ internal static class CodingCommand
             if (!AllowedIdentifiers.Contains(identifier.Value))
                 errors.Add($"Expression contains a forbidden identifier: {identifier.Value}");
 
-        return errors;
+        return errors.Count == 0
+            ? new SourceValidationPassed(expression.Trim())
+            : new SourceValidationRejected(errors);
     }
 
     private static string RenderSource(string expression) =>
@@ -226,13 +229,13 @@ internal static class CodingCommand
         + "    public static int Clamp(int value, int min, int max) => " + expression.Trim() + ";\n"
         + "}\n";
 
-    private static async Task<CodingOutcome> ExecuteAttemptsAsync(string fixtureRoot,
+    private static async Task<CodingRunResult> ExecuteAttemptsAsync(string fixtureRoot,
         CodingPromptTemplate promptTemplate, CodingExecutionPolicy policy,
         Func<CodingPrompt, Task<CodingDraft>> generate)
     {
         string source = Path.Combine(fixtureRoot, "Clamp.cs");
         string original = await File.ReadAllTextAsync(source);
-        var attempts = new List<CodingAttempt>();
+        var attempts = new List<CodingAttemptResult>();
         string feedback = "";
         bool completed = false;
         int calls = 0;
@@ -244,46 +247,47 @@ internal static class CodingCommand
                 CodingPrompt prompt = promptTemplate.Render(feedback, policy.MaxFeedbackCharacters);
                 CodingDraft draft = await generate(prompt);
                 calls++;
-                List<string> errors = ValidateDraft(draft);
-                if (errors.Count > 0)
+                SourceValidationResult validation = ValidateDraft(draft);
+                if (validation is SourceValidationRejected rejected)
                 {
-                    feedback = string.Join("\n", errors);
-                    attempts.Add(new CodingAttempt(attempt, false, false, false, "expression_rejected"));
+                    feedback = string.Join("\n", rejected.Diagnostics);
+                    attempts.Add(new ExpressionRejectedAttempt(attempt, rejected.Diagnostics));
                     Console.WriteLine($"Attempt {attempt}: unsafe or invalid C# expression rejected.");
                     continue;
                 }
 
-                await File.WriteAllTextAsync(source, RenderSource(draft.Expression), new UTF8Encoding(false));
-                ProcessResult build = await RunDotnetAsync(fixtureRoot, policy,
-                    "build", "ClampKata.csproj", "--configuration", "Release", "--nologo",
-                    "-p:NuGetAudit=false");
+                if (validation is not SourceValidationPassed valid)
+                    throw new InvalidOperationException("Source validation returned no outcome.");
 
-                if (build.ExitCode != 0)
+                await File.WriteAllTextAsync(source, RenderSource(valid.Expression), new UTF8Encoding(false));
+                CompilationResult compilation = await CompileAsync(fixtureRoot, policy);
+                if (compilation is CompilationFailed compilationFailed)
                 {
-                    feedback = "Compiler failed:\n" + build.Output;
-                    attempts.Add(new CodingAttempt(attempt, true, false, false, "build_failed"));
+                    feedback = "Compiler failed:\n" + compilationFailed.Diagnostics;
+                    attempts.Add(new CompilationFailedAttempt(attempt, compilationFailed.Diagnostics));
                     Console.WriteLine($"Attempt {attempt}: compiler rejected generated C#.");
                     continue;
                 }
 
-                ProcessResult tests = await RunDotnetAsync(fixtureRoot, policy,
-                    "run", "--project", "ClampKata.csproj", "--configuration", "Release",
-                    "--no-build", "--no-restore");
-                if (tests.ExitCode != 0)
+                TestExecutionResult testExecution = await ExecuteTestsAsync(fixtureRoot, policy);
+                if (testExecution is TestExecutionFailed testFailed)
                 {
-                    feedback = "Fixed tests failed:\n" + tests.Output;
-                    attempts.Add(new CodingAttempt(attempt, true, true, false, "tests_failed"));
+                    feedback = "Fixed tests failed:\n" + testFailed.Diagnostics;
+                    attempts.Add(new TestsFailedAttempt(attempt, testFailed.Diagnostics));
                     Console.WriteLine($"Attempt {attempt}: tests failed; requesting correction.");
                     continue;
                 }
 
-                attempts.Add(new CodingAttempt(attempt, true, true, true, "passed"));
+                if (testExecution is not TestExecutionSucceeded testsPassed)
+                    throw new InvalidOperationException("Test execution returned no outcome.");
+
+                attempts.Add(new CodingSucceededAttempt(attempt));
                 Console.WriteLine($"Attempt {attempt}: build and fixed tests passed.");
-                Console.WriteLine(tests.Output);
+                Console.WriteLine(testsPassed.Output);
                 completed = true;
-                return new CodingOutcome(true, calls, attempts);
+                return new CodingRunSucceeded(calls, attempts);
             }
-            return new CodingOutcome(false, calls, attempts);
+            return new CodingRunExhausted(calls, attempts);
         }
         finally
         {
