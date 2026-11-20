@@ -355,3 +355,68 @@ Die Ausführung allgemeiner KI-generierter Programme bleibt verboten,
 bis eine separate, konkret geprüfte Isolations- und Build/Test-Stufe
 implementiert ist. Die bestehenden `coding`-Aufträge bleiben unverändert.
 
+## Docker Sandboxes: lokaler RetryBudget-Smoke-Test (Issue #33)
+
+Der neue, bewusst eingeschränkte Development-Modus `--sandbox-poc` prüft
+**nur** die vier festen, vertrauenswürdigen RetryBudget-Dateien aus
+dem Gitobjekt des lokalen main-Branches. Es wird kein KI-generierter
+Code, kein unbekanntes Projekt und keine vom Modell bestimmte Shell
+ausgeführt. Im Gast erfolgt ein Offline-Restore, Release-Build und
+die bestehende Testsuite mit 268 Prüfungen.
+
+Voraussetzungen auf HaMi11: lokale Sandbox hami-dotnet11-check,
+aus Template hami-dotnet11:0.1 mit .NET SDK 11.0.100 und ICU
+erzeugt; Workspace, Host-Mounts, Secrets und MCP-Server dürfen
+nicht eingebunden sein. Die globale Netzwerkpolicy muss Zugriffe
+auf api.github.com:443 verweigern. Der Runner prüft die vorliegenden
+Einstellungen und bricht bei Abweichungen ab.
+
+### Abnahme VOR dem Merge auf HaMi11 (separater PR-Worktree)
+
+Der PoC muss bereits mit dem tatsächlich zu prüfenden PR-Code ausgeführt
+werden. Er akzeptiert dafür einen **sauberen**, detached Review-Worktree,
+dessen HEAD auf dem **aktuellen** lokalen `main` basiert. Der Snapshot
+besteht weiterhin ausschließlich aus den fest vorgegebenen Dateien
+von `refs/heads/main`. Das produktive Arbeitsverzeichnis bleibt unverändert.
+
+```powershell
+$repo = 'I:\git\HaMi\HaMi-AI-Engineering-Agent'
+$review = 'G:\HaMi\Sandbox\PoC\Runner-PR34'
+
+git -C $repo fetch origin
+if ((git -C $repo rev-parse refs/heads/main) -ne
+    (git -C $repo rev-parse refs/remotes/origin/main)) {
+    throw 'Lokales main zuerst per git pull --ff-only aktualisieren.'
+}
+
+git -C $repo worktree add --detach $review origin/feature/issue33-sandbox-result-runner-20261120
+Set-Location $review
+git status --short
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- development --repo . --sandbox-poc-self-test
+
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- development `
+  --repo . --sandbox-poc --results-dir 'G:\HaMi\Sandbox\PoC\Runs'
+```
+
+Den Bericht unter `G:\HaMi\Sandbox\PoC\Runs\reports` und die
+beiden Logs prüfen; **erst danach** PR #34 zur Mergefreigabe vorlegen.
+Die Sandbox wird nicht automatisch gelöscht.
+
+**Kein freier Build-Agent:** Der PR-Worktree enthält lediglich den zu
+prüfenden Runner; die kompilierten RetryBudget-Dateien werden aus dem
+geschützten Git-`main` entnommen, nicht aus PR-Dateien oder lokalen
+Änderungen.
+
+Erzeugt pro Lauf einen temporären Host-Snapshot (vier Dateien,
+aus main) und kopiert ihn ohne Mount in den Gast. Windows-Eigentümer
+werden ausschließlich für diesen neuen Gastsnapshot auf agent
+gesetzt. Es werden nur report.json, build.log und test.log
+aus dem Gast nach results-dir/reports/hami-retry-poc-<id> abgeholt.
+
+Der JSON-Bericht enthält getrennte Build-/Test-Exitcodes und
+Laufzeit im Gast; Host-Diagnosen werden nicht ausgeführt.
+Der Runner startet keine neue Sandbox und löscht die vorhandene
+Test-Sandbox nicht; Kaltstart-/Lebenszyklusmessung und die
+Freigabe für beliebigen generierten Code stehen noch aus.
+Die CI testet den festen Guard und das Report-Schema ohne Docker.
+
