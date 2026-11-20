@@ -563,6 +563,7 @@ internal static class CodingCommand
             || IsAllowedOrigin("https://github.com/Attacker/HaMi-AI-Engineering-Agent.git"))
             throw new InvalidOperationException("Remote origin verification allowed an unexpected repository.");
 
+        CodingTaskDefinition.SelfTest();
         CodingRunReport.SelfTest();
         CodingExecutionPolicy.SelfTest(repo);
         CodingExecutionPolicy policy = CodingExecutionPolicy.Load(repo);
@@ -572,6 +573,14 @@ internal static class CodingCommand
         const string correct = "value < min ? min : value > max ? max : value";
         if (ValidateDraft(new CodingDraft("Plan", correct)) is not SourceValidationPassed)
             throw new InvalidOperationException("Valid expression was rejected.");
+        const string retryExpression = "attempt >= 1 && maxCalls >= 1 && attempt < maxCalls";
+        if (ValidateDraft(new CodingDraft("Plan", retryExpression),
+                CodingTaskDefinition.RetryBudget) is not SourceValidationPassed
+            || ValidateDraft(new CodingDraft("Plan", "value < maxCalls"),
+                CodingTaskDefinition.RetryBudget) is not SourceValidationRejected
+            || ValidateDraft(new CodingDraft("Plan", "Math.Clamp(attempt, 0, maxCalls)"),
+                CodingTaskDefinition.RetryBudget) is not SourceValidationRejected)
+            throw new InvalidOperationException("Retry task expression bounds were not enforced.");
 
         string sourceDir = Path.Combine(repo, FixtureDirectory.Replace('/', Path.DirectorySeparatorChar));
         string temp = Path.Combine(RuntimeSettings.GetWorktreeRoot(repo), "hami-agent-coding-selftest", Guid.NewGuid().ToString("N"));
@@ -582,7 +591,9 @@ internal static class CodingCommand
                 File.Copy(Path.Combine(sourceDir, filename), Path.Combine(temp, filename));
 
             int calls = 0;
-            CodingRunResult result = await ExecuteAttemptsAsync(temp, template, policy, prompt =>
+            CodingRunResult result = await ExecuteAttemptsAsync(
+                temp, Path.Combine(temp, "Clamp.cs"), CodingTaskDefinition.Clamp,
+                template, policy, prompt =>
             {
                 calls++;
                 if (calls == 2 && !prompt.User.Contains("Fixed tests failed:", StringComparison.Ordinal))
@@ -598,7 +609,9 @@ internal static class CodingCommand
                 throw new InvalidOperationException("Coding retry / real build+test self-test failed.");
 
             int compilerCalls = 0;
-            CodingRunResult compilerRecovery = await ExecuteAttemptsAsync(temp, template, policy, prompt =>
+            CodingRunResult compilerRecovery = await ExecuteAttemptsAsync(
+                temp, Path.Combine(temp, "Clamp.cs"), CodingTaskDefinition.Clamp,
+                template, policy, prompt =>
             {
                 compilerCalls++;
                 if (compilerCalls == 2 && !prompt.User.Contains("Compiler failed:", StringComparison.Ordinal))
@@ -617,7 +630,8 @@ internal static class CodingCommand
             string target = Path.Combine(temp, "Clamp.cs");
             string original = "// Clean placeholder after failed run.\n";
             await File.WriteAllTextAsync(target, original);
-            CodingRunResult exhausted = await ExecuteAttemptsAsync(temp, template, policy,
+            CodingRunResult exhausted = await ExecuteAttemptsAsync(
+                temp, Path.Combine(temp, "Clamp.cs"), CodingTaskDefinition.Clamp, template, policy,
                 _ => Task.FromResult(new CodingDraft("Plan", "value")));
             CodingRunReport exhaustedReport = CodingRunReport.From(exhausted);
             if (exhausted is not CodingRunExhausted
@@ -625,8 +639,49 @@ internal static class CodingCommand
                 || await File.ReadAllTextAsync(target) != original)
                 throw new InvalidOperationException("Exhausted attempt budget did not restore original source.");
 
-            Console.WriteLine("Coding self-test passed: C# 15 domain unions, strict repository origin, "
-                + "expression grammar, real compiler/test recovery and exhausted-attempt rollback.");
+            // The second task compiles a *linked production source file* with a
+            // trusted test project. Model output can only modify that one file.
+            CodingTaskDefinition retryTask = CodingTaskDefinition.RetryBudget;
+            CodingExecutionPolicy retryPolicy = CodingExecutionPolicy.Load(repo, retryTask);
+            CodingPromptTemplate retryPrompt = CodingPromptTemplate.Load(repo, retryTask);
+            string retryRoot = Path.Combine(temp, "retry-worktree");
+            string retryFixture = Path.Combine(retryRoot,
+                retryTask.FixtureDirectory.Replace('/', Path.DirectorySeparatorChar));
+            string retrySource = Path.Combine(retryRoot,
+                retryTask.TargetPath.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(retryFixture);
+            Directory.CreateDirectory(Path.GetDirectoryName(retrySource)!);
+            File.Copy(Path.Combine(repo, retryTask.TargetPath.Replace('/', Path.DirectorySeparatorChar)),
+                retrySource);
+            foreach (string filename in new[] { retryTask.ProjectFile, "Program.cs" })
+                File.Copy(Path.Combine(repo, retryTask.FixtureDirectory.Replace(
+                    '/', Path.DirectorySeparatorChar), filename),
+                    Path.Combine(retryFixture, filename));
+
+            int retryCalls = 0;
+            CodingRunResult retryResult = await ExecuteAttemptsAsync(
+                retryFixture, retrySource, retryTask, retryPrompt, retryPolicy, prompt =>
+                {
+                    retryCalls++;
+                    if (retryCalls == 2 && !prompt.User.Contains("Fixed tests failed:",
+                        StringComparison.Ordinal))
+                        throw new InvalidOperationException(
+                            "Trusted RetryBudget tests did not trigger bounded correction feedback.");
+                    return Task.FromResult(new CodingDraft("Implement retry eligibility",
+                        retryCalls == 1 ? "true" : retryExpression));
+                });
+            CodingRunReport retryReport = CodingRunReport.From(retryResult);
+            if (retryResult is not CodingRunSucceeded
+                || !retryReport.Success || retryReport.ModelCalls != 2
+                || retryReport.Attempts.Count != 2
+                || retryReport.Attempts[0].Status != "tests_failed"
+                || retryReport.Attempts[1].Status != "passed")
+                throw new InvalidOperationException(
+                    "Production RetryBudget coding task did not recover using real compiler/tests.");
+
+            Console.WriteLine("Coding self-test passed: C# 15 unions, two bounded tasks (ClampKata "
+                + "and production RetryBudget), strict path/policy contracts, real build/test "
+                + "corrections and exhausted-attempt rollback.");
             return 0;
         }
         finally
