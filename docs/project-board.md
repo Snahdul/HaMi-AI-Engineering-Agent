@@ -22,7 +22,7 @@ Diese eingebauten Workflows sind nicht durch die unten stehenden Repository-Acti
 In **Agenten-Repository → Settings → Secrets and variables → Actions**:
 
 1. Repository-Variable `HAMI_PROJECT_NUMBER` auf **`2`** setzen.
-2. Repository-Secret `HAMI_PROJECT_TOKEN` bereitstellen. Der Wert muss GitHub-Project-V2-Zugriff für das eigene Agenten-Board mit den benötigten Lese-/Schreibrechten erlauben. Möglichst eng begrenztes, widerrufbares Token verwenden.
+2. Repository-Secret `HAMI_PROJECT_TOKEN` bereitstellen: Für dieses **benutzereigene** GitHub Project ist ein Personal Access Token **(classic)** mit dem Scope `project` geeignet. GitHub dokumentiert derzeit eine Einschränkung für Fine-grained PATs bei user-owned Projects. Da der Workflow auf ein öffentliches Repository zugreift, zunächst nur `project` verwenden und den tatsächlichen API-Zugriff testen, statt vorsorglich `repo` zu vergeben. Der Token ist nicht auf Project #2 begrenzbar; ein separater, befristeter Token ermöglicht aber getrennte Rotation und Widerruf.
 3. Weder Token-Wert noch sonstige Geheimnisse in Issues, PRs, Workflows oder Logs eintragen. Eine vorhandene Berechtigung für Project #1 bedeutet nicht zwangsläufig Zugriff auf Project #2.
 4. GitHub Actions und die erlaubten Workflows prüfen. Die neuen Workflows werden erst nach kontrolliertem Merge nach `main` produktiv.
 
