@@ -22,13 +22,16 @@ internal static class DevelopmentSandboxRunner
         int RestoreExitCode, int BuildExitCode, int ExecutionExitCode,
         bool TimedOut, long CreateMilliseconds, long CopyMilliseconds,
         long RestoreMilliseconds, long BuildMilliseconds, long ExecutionMilliseconds,
-        long CleanupMilliseconds, string? Error);
+        long CleanupMilliseconds, long TotalMilliseconds, string? Error);
 
     public static async Task<int> RunAsync(
         string repo, string source, string project, string mode, string resultsDirectory)
     {
         ValidateMode(mode);
         ValidateProjectPath(project);
+        if (!Path.IsPathFullyQualified(source) || !Path.IsPathFullyQualified(resultsDirectory))
+            throw new InvalidOperationException("Snapshot and results directories must be absolute.");
+        Stopwatch lifecycle = Stopwatch.StartNew();
         source = Path.GetFullPath(source);
         repo = Path.GetFullPath(repo);
         resultsDirectory = Path.GetFullPath(resultsDirectory);
@@ -102,8 +105,9 @@ internal static class DevelopmentSandboxRunner
 
             // No shell interpolation: the project name is a validated relative
             // path and each component of the dotnet command is a fixed argv item.
-            await SbxAsync(TimeSpan.FromSeconds(20),
-                "exec", sandbox, "mkdir", "-p", "/home/agent/empty-nuget-source");
+            EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(20),
+                "exec", sandbox, "mkdir", "-p", "/home/agent/empty-nuget-source"),
+                "Prepare offline NuGet source");
 
             watch.Restart();
             SandboxProcess restored = await SbxAsync(TimeSpan.FromSeconds(75),
@@ -168,7 +172,7 @@ internal static class DevelopmentSandboxRunner
         }
 
         var report = new SandboxRunReport(1, id, guestProject, mode, restore, build,
-            execution, timedOut, createMs, copyMs, restoreMs, buildMs, executionMs, cleanupMs, error);
+            execution, timedOut, createMs, copyMs, restoreMs, buildMs, executionMs, cleanupMs, lifecycle.ElapsedMilliseconds, error);
         string reportPath = Path.Combine(reportDir, "report.json");
         await File.WriteAllTextAsync(reportPath,
             JsonSerializer.Serialize(report, new JsonSerializerOptions(JsonSerializerDefaults.Web)
@@ -297,6 +301,12 @@ internal static class DevelopmentSandboxRunner
             if (!fields.TryGetValue(key, out string? actual)
                 || !string.Equals(actual, value, StringComparison.Ordinal))
                 throw new InvalidOperationException("Sandbox security preflight failed: " + key);
+        if (!fields.TryGetValue("State", out string? state)
+            || !(state is "running" or "stopped"
+                || Regex.IsMatch(state, @"^(running|stopped) \([^)]*\)$",
+                    RegexOptions.CultureInvariant))
+            || state.Contains("not responding", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Sandbox state is not healthy.");
     }
 
     private static void ValidateDeny(SandboxProcess result, string endpoint)
@@ -326,12 +336,13 @@ internal static class DevelopmentSandboxRunner
         foreach (string argument in arguments) info.ArgumentList.Add(argument);
         using Process process = Process.Start(info)
             ?? throw new InvalidOperationException("sbx CLI is not available.");
-        Task<string> stdout = ReadBoundedAsync(process.StandardOutput);
-        Task<string> stderr = ReadBoundedAsync(process.StandardError);
         using var cts = new CancellationTokenSource(limit);
+        Task<string> stdout = ReadBoundedAsync(process.StandardOutput, cts.Token);
+        Task<string> stderr = ReadBoundedAsync(process.StandardError, cts.Token);
         try
         {
             await process.WaitForExitAsync(cts.Token);
+            return new SandboxProcess(process.ExitCode, await stdout, await stderr);
         }
         catch (OperationCanceledException)
         {
@@ -339,16 +350,15 @@ internal static class DevelopmentSandboxRunner
             await process.WaitForExitAsync();
             throw new TimeoutException("sbx operation timed out: " + arguments[0]);
         }
-        return new SandboxProcess(process.ExitCode, await stdout, await stderr);
     }
 
-    private static async Task<string> ReadBoundedAsync(StreamReader input)
+    private static async Task<string> ReadBoundedAsync(StreamReader input, CancellationToken cancellationToken)
     {
         var sb = new StringBuilder();
         char[] buffer = new char[4096];
         while (true)
         {
-            int count = await input.ReadAsync(buffer.AsMemory());
+            int count = await input.ReadAsync(buffer.AsMemory(), cancellationToken);
             if (count == 0) break;
             int kept = Math.Min(count, Math.Max(0, MaxOutputChars - sb.Length));
             if (kept > 0) sb.Append(buffer, 0, kept);
