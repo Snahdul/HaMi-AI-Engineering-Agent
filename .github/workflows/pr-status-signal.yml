@@ -1,0 +1,22 @@
+name: HaMi Agent PR status signal
+
+on:
+  pull_request:
+    types: [opened, reopened, closed, labeled, unlabeled, ready_for_review, converted_to_draft, synchronize]
+
+# Intentionally no project PAT, no repository writes and no PR checkout.
+# The trusted default-branch project workflow reacts via workflow_run.
+permissions: {}
+
+jobs:
+  signal:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Publish a non-privileged PR state-change signal
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_ACTION: ${{ github.event.action }}
+        run: |
+          echo "Internal PR #${PR_NUMBER}: ${PR_ACTION}"
