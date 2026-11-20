@@ -54,6 +54,9 @@ jobs:
       - name: Exercise detached multi-file development scope guard (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --self-test
 
+      - name: Validate general C# sandbox runner input isolation (offline)
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-run-self-test
+
       - name: Validate Docker Sandbox PoC preflight and report handling (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-poc-self-test
 
@@ -187,6 +190,9 @@ jobs:
 
       - name: Validate development task and detached worktree scope on Windows
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --self-test
+
+      - name: Validate general C# sandbox runner input isolation on Windows (offline)
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-run-self-test
 
       - name: Validate Docker Sandbox PoC report handling on Windows (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-poc-self-test

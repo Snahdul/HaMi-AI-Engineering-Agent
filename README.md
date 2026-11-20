@@ -420,3 +420,48 @@ Test-Sandbox nicht; Kaltstart-/Lebenszyklusmessung und die
 Freigabe für beliebigen generierten Code stehen noch aus.
 Die CI testet den festen Guard und das Report-Schema ohne Docker.
 
+## HaMi Developer: beliebiger generierter C#-Code in frischer MicroVM (Issue #33)
+
+Der neue Modus `development --sandbox-run` akzeptiert ein vorbereitetes C#-Projekt,
+nicht nur den RetryBudget-PoC. Der beliebige Projektcode wird **nur innerhalb**
+einer frischen, lokalen Docker-MicroVM gebaut und ausgeführt; keine Host-Shell,
+keine Modell-Keys, kein Repo-Mount und kein GitHub-Schreibzugriff im Gast.
+
+Voraussetzung: lokale Vorlage `hami-dotnet11:0.1` mit .NET 11.0.100 und ICU,
+`sbx` installiert und globale Netzwerkpolicy default deny.
+
+```powershell
+$repo = 'I:\git\HaMi\HaMi-AI-Engineering-Agent'
+$snapshot = 'G:\HaMi\Sandbox\Candidates\demo-console'
+dotnet run --project "$repo\src\HaMi.Agentic.Cli" -c Release -- `
+  development --repo $repo --sandbox-run `
+  --source $snapshot --project Demo.csproj --mode run `
+  --results-dir 'G:\HaMi\Sandbox\PoC\Runs'
+```
+
+Modi: `build` (nur Restore/Build), `run` (zusätzlich `dotnet run`),
+`test` (zusätzlich `dotnet test`). Unterprojekte als relativen
+Projektpfad angeben, z. B. `src/App/App.csproj`.
+
+Der Runner überträgt einen Snapshot mit höchstens **512 Dateien / 16 MiB**.
+Metadaten-/Credential-Dateien, Symlinks und Junctions sind gesperrt.
+Restore erfolgt **offline** aus einem leeren Gast-Paketverzeichnis.
+Externe NuGet-Pakete benötigen später einen separat bereitgestellten
+geprüften Offline-Cache. Es gibt keine vom Modell gewählten Shell-Kommandos.
+
+Pro Auftrag wird eine neue mountlose MicroVM mit 4 vCPU / 4 GiB RAM
+erstellt. Workspace, Host-Mounts, Secrets, MCP-Server, Ports und drei
+Netzwerkziele werden vor der Codeausführung kontrolliert. Zeitlimits
+gelten pro Phase (Restore 75 s, Build 120 s, Ausführung 60 s).
+Im `finally` wird die **vom Runner selbst erzeugte** Sandbox mit
+`sbx rm --force` entfernt. Der bisherige PoC bleibt unverändert.
+
+Auf dem Host entstehen unter `reports/hami-code-<id>/` die Dateien
+`report.json`, `restore.log`, `build.log` und bei Ausführung
+`execution.log`. Der JSON-Bericht enthält getrennte Exitcodes,
+Timeout-/Cleanup-Status und Phasenzeiten. Logs sind unvertrauenswürdige
+Diagnosen und werden niemals auf dem Host ausgeführt.
+
+Die CI prüft Eingabe-/Pfad-/Netzwerk-Guards ohne echte MicroVM. Der reale
+HaMi11-Durchstich mit beliebigem C# und Abbruch-/Isolationstests steht
+vor der Mergefreigabe noch aus. Kein automatischer PR-Merge.
