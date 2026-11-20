@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "taskId": "retry-budget-refinement",
+  "description": "Demonstrate a human-reviewed multi-file C# change boundary for RetryBudget and its task definition. No model-generated code may be built or executed by this slice.",
+  "targetFramework": "net11.0",
+  "allowedWritePaths": [
+    "src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs",
+    "src/HaMi.Agentic.Cli/Features/Coding/CodingTaskDefinition.cs"
+  ],
+  "acceptanceCriteria": [
+    "Only the two specified existing production C# paths may be modified or created in the detached candidate worktree.",
+    "The original main checkout remains untouched; the candidate stays at the same commit and is not attached to a branch.",
+    "Renames, deletions, symlink changes and unrelated modifications are rejected before any execution."
+  ]
+}
