@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "name": "MVP 0.2 – Agenten-Workflow-Konzept und Prüfkatalog",
+  "steps": [
+    {
+      "id": "design",
+      "instruction": "Erstelle in deutscher Sprache ein kurzes, konkretes Architekturkonzept für einen .NET-11-Entwicklungsagenten, der zwei lokale Schritte hintereinander ohne menschlichen Zwischenstopp ausführt. Beschreibe Eingaben, überprüfbare Zwischenergebnisse, Isolation in einem neuen detached Git-Worktree und die Grenzen menschlicher Freigaben. Verwende die Überschriften '## Architektur', '## Risiken' und '## Grenzen'. Vermeide Annahmen über nicht bereitgestellte Quelltexte oder Infrastruktur.",
+      "outputPath": "docs/agent-generated/01-design.md",
+      "requiredText": [
+        "## Architektur",
+        "## Risiken",
+        "## Grenzen"
+      ]
+    },
+    {
+      "id": "verification",
+      "instruction": "Verfasse anhand des validierten vorherigen Architekturkonzepts einen konkreten Prüfkatalog für diesen isolierten Workflow. Formuliere nachvollziehbare Positiv-/Negativtests für Schrittübergabe, Validierung, Abbruch vor Dateischreiben, sauberen Worktree und das Verbot produktiver Git-Schreibvorgänge. Beziehe dich explizit auf das vorherige Konzept. Verwende die Überschriften '## Akzeptanzkriterien' und '## Prüfablauf'. Kennzeichne, dass der Prüfkatalog noch kein ausgeführter Test ist.",
+      "outputPath": "docs/agent-generated/02-verification.md",
+      "requiredText": [
+        "## Akzeptanzkriterien",
+        "## Prüfablauf"
+      ]
+    }
+  ]
+}

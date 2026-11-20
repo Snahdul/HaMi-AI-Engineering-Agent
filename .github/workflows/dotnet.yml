@@ -68,3 +68,21 @@ jobs:
             exit 1
           fi
           echo "Unattended preflight guards verified without API key or network calls"
+
+      - name: Validate MVP 0.2 two-stage manifest offline
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- workflow --repo . --manifest workflows/mvp02.json --validate
+
+      - name: Verify two-stage orchestration without model or GitHub writes
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- workflow --self-test
+
+      - name: Reject live workflow when API key is absent
+        shell: bash
+        run: |
+          set +e
+          output="$(env -u OPENAI_API_KEY dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- workflow --repo . --manifest workflows/mvp02.json --unattended 2>&1)"
+          result=$?
+          set -e
+          if [ "$result" -ne 2 ] || ! grep -Fq "OPENAI_API_KEY is not set" <<< "$output"; then
+            echo "::error::Workflow was not blocked before starting without an API key"
+            exit 1
+          fi
