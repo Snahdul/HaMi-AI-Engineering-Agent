@@ -72,6 +72,34 @@ Der generierte Code folgt der **vorhandenen Architektur des Zielprojekts**, nich
 
 Eine Bibliothek wird nur genutzt, wenn sie den Use Case konkret vereinfacht: `CommunityToolkit.Mvvm` für MVVM-UI, Refit für geeignete HTTP-Integrationen, `Microsoft.Extensions.AI` für KI-Anbindung. Keine unnötigen Pakete, Schichten oder Frameworks nur aus Konvention.
 
+## Prompt Assets statt C#-Stringliteralen
+
+Für jeden Slice liegen System- und Aufgabenprompts in **separaten versionierten Dateien**. Neue Prompts verwenden bevorzugt **Prompty** (`.prompty`): YAML-Frontmatter für Metadaten/Eingaben, darunter Markdown-Text mit Rollen (`system:`, `user:`). Die bisherige Semantic-Kernel-YAML-Form bleibt für bestehende SK-Anwendungen gültig.
+
+Aktueller konkreter Coding-Slice:
+
+```text
+prompts/
+  coding/
+    ClampExpression.prompty     # lesbarer System- und User-Prompt
+src/HaMi.Agentic.Cli/
+  Features/Coding/
+    CodingPromptTemplate.cs     # geprüftes Laden/Rendern; keine LLM-Texte
+    CodingAiClient.cs           # IChatClient-Transport
+    CodingCommand.cs            # begrenzter Build/Test-Korrektur-Ablauf
+```
+
+**Grenzen der aktuellen Implementierung:** Der schlanke C#-Loader verarbeitet aus dem Prompty-Format **nur** die verifizierte Teilmenge YAML-Frontmatter plus genau eine `system:`- und eine `user:`-Nachricht sowie `{{feedback}}`. Er ist **kein allgemeiner Prompty-/Jinja2-Interpreter**. Zusätzliche Template-Konstrukte und Modell-/Tool-Konfigurationen werden zurückgewiesen. Die Sicherheitsregeln (erlaubte Pfade, Tool-Verbot, Schema, Modellbudgets, Worktree-Isolation) sind weiterhin fest im Host kodiert und dürfen nicht durch Prompt-Metadaten überschrieben werden.
+
+**Verbindlich für kommende Slices:**
+- Ein Prompt ist ein eigenständiges, überprüfbares **Feature-Asset**. Der Code lädt es über einen kleinen Adapter; keine mehrzeiligen Prompts als `const string` im C#-Quelltext.
+- Variable Eingaben erfolgen über benannte Platzhalter mit geprüftem Eingabevertrag. Compiler-/Test-Feedback ist **unvertraute Eingabedaten**, keine neue Systeminstruktion.
+- Prompt-Änderungen sind reguläre Code-Änderungen: Git-Diff, Review und Offline-Tests für Parsing, Rollen, erforderliche Variablen und Fehlerfälle.
+- Prompt-Metadaten dürfen **keine** zusätzlichen Modell-Tools, Berechtigungen, Schlüssel, Endpunkte oder Dateisystemzugriffe freischalten.
+- Die verbliebenen Inline-Prompts der historischen Replay-/Workflow-Slices werden **schrittweise** in deren eigene Feature-Verzeichnisse ausgelagert; keine unkontrollierte Änderung funktionierender Modellabläufe.
+
+**Formatquellen:** [Prompty-Spezifikation](https://prompty.ai/specification/file-format/) · [Semantic Kernel YAML Prompt Schema](https://learn.microsoft.com/en-us/semantic-kernel/concepts/prompts/yaml-schema).
+
 ## Qualitätsgates je Vertical Slice
 
 1. **Vertrag und Architektur**: Scope, erlaubte Pfade, Modulgrenzen, Abhängigkeiten und Definition of Done prüfen.
