@@ -84,7 +84,7 @@ internal static class DevelopmentSandboxPoC
         ValidateNetworkPolicy(policy);
         SandboxProcessResult sdk = await SbxAsync(TimeSpan.FromSeconds(30),
             "exec", SandboxName, "/home/agent/bin/dotnet", "--version");
-        if (sdk.ExitCode != 0 || sdk.Output.Trim() != "11.0.100")
+        if (sdk.ExitCode != 0 || !sdk.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Contains("11.0.100", StringComparer.Ordinal))
             throw new InvalidOperationException("Expected the reviewed .NET SDK 11.0.100 template.");
 
         string runId = "hami-retry-poc-" + Guid.NewGuid().ToString("N");
@@ -276,8 +276,8 @@ internal static class DevelopmentSandboxPoC
             ExpectRejected(() => SandboxReport.Parse(invalidReport));
 
         if (!BuildScript.Contains("--source /home/agent/empty-nuget-source", StringComparison.Ordinal)
-            || !BuildScript.Contains(">/dev/null", StringComparison.Ordinal) // deliberately absent
-                && !BuildScript.Contains("> \"$out/build.log\"", StringComparison.Ordinal))
+            || !BuildScript.Contains("> \"$out/build.log\"", StringComparison.Ordinal)
+            || !BuildScript.Contains("> \"$out/test.log\"", StringComparison.Ordinal))
             throw new InvalidOperationException("Fixed build script no longer captures offline diagnostics.");
     }
 
