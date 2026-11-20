@@ -13,8 +13,8 @@ internal sealed class CodingExecutionPolicy
 {
     public const string RelativePath = "policies/coding/clamp.policy.json";
 
-    // A capability allowlist is necessary even with external configuration:
-    // this MVP supports precisely one trusted fixture, no arbitrary code or tools.
+    // Both supported coding tasks are approved in CodingTaskDefinition,
+    // never granted implicitly by JSON, prompt text or model output.
     private const string SupportedWritePath = "samples/ClampKata/Clamp.cs";
 
     public int Version { get; set; }
@@ -30,30 +30,35 @@ internal sealed class CodingExecutionPolicy
     public int MaxFeedbackCharacters { get; set; }
 
     public string Sha256 { get; private set; } = "";
+    public string AssetPath { get; private set; } = RelativePath;
 
     public string OnlyWritablePath => AllowedWritePaths.Single();
 
-    public static CodingExecutionPolicy Load(string repository)
+    public static CodingExecutionPolicy Load(
+        string repository, CodingTaskDefinition? task = null)
     {
+        task ??= CodingTaskDefinition.Clamp;
+        string policyPath = task.PolicyAsset;
         string fullRepository = Path.GetFullPath(repository);
         string path = Path.Combine(fullRepository,
-            RelativePath.Replace('/', Path.DirectorySeparatorChar));
+            policyPath.Replace('/', Path.DirectorySeparatorChar));
 
         if (!File.Exists(path))
-            throw new InvalidOperationException($"Required coding policy missing: {RelativePath}");
+            throw new InvalidOperationException($"Required coding policy missing: {policyPath}");
 
         // Deliberately only one trusted provider. Do NOT add environment, command-line,
         // prompt or model response configuration providers here: no permission escalation.
         IConfigurationRoot configuration = new ConfigurationBuilder()
             .SetBasePath(fullRepository)
-            .AddJsonFile(RelativePath, optional: false, reloadOnChange: false)
+            .AddJsonFile(policyPath, optional: false, reloadOnChange: false)
             .Build();
 
         CodingExecutionPolicy policy = configuration.Get<CodingExecutionPolicy>(
             options => options.ErrorOnUnknownConfiguration = true)
             ?? throw new InvalidOperationException("Coding policy must be a JSON object.");
 
-        policy.Validate();
+        policy.Validate(task);
+        policy.AssetPath = policyPath;
         policy.Sha256 = Convert.ToHexString(
             SHA256.HashData(Encoding.UTF8.GetBytes(File.ReadAllText(path))))
             .ToLowerInvariant();
@@ -61,15 +66,15 @@ internal sealed class CodingExecutionPolicy
         return policy;
     }
 
-    private void Validate()
+    private void Validate(CodingTaskDefinition task)
     {
         if (Version != 1)
             throw new InvalidOperationException("Unsupported coding policy version.");
 
         if (AllowedWritePaths is not { Length: 1 }
-            || !string.Equals(AllowedWritePaths[0], SupportedWritePath, StringComparison.Ordinal))
+            || !string.Equals(AllowedWritePaths[0], task.TargetPath, StringComparison.Ordinal))
             throw new InvalidOperationException(
-                "This bounded coding slice only supports its fixed Clamp.cs output path.");
+                "Coding policy path must match exactly the compile-time selected task.");
 
         if (AllowedModelTools is not { Length: 0 }
             || AllowShellCommands || AllowGitHubWrites || StoreModelResponses)
@@ -94,6 +99,12 @@ internal sealed class CodingExecutionPolicy
             || actual.MaxFeedbackCharacters != 1600
             || actual.Sha256.Length != 64)
             throw new InvalidOperationException("Default coding policy does not match the test fixture.");
+
+        CodingExecutionPolicy retry = Load(repository, CodingTaskDefinition.RetryBudget);
+        if (retry.OnlyWritablePath != CodingTaskDefinition.RetryBudget.TargetPath
+            || retry.AssetPath != CodingTaskDefinition.RetryBudget.PolicyAsset
+            || retry.Sha256.Length != 64)
+            throw new InvalidOperationException("Retry task policy is not the expected narrow allowlist.");
 
         string temp = Path.Combine(Path.GetTempPath(), "hami-coding-policy-test",
             Guid.NewGuid().ToString("N"));
