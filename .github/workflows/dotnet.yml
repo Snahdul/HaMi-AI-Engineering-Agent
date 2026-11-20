@@ -82,10 +82,25 @@ jobs:
           output="$(env -u OPENAI_API_KEY dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- workflow --repo . --manifest workflows/mvp02.json --unattended 2>&1)"
           result=$?
           set -e
-          if [ "$result" -ne 2 ] || ! grep -Fq "OPENAI_API_KEY is not set" <<< "$output"; then
+          if [ "$result" -ne 2 ] || ! grep -Fq "No API key configured" <<< "$output"; then
             echo "::error::Workflow was not blocked before starting without an API key"
             exit 1
           fi
+
+      - name: Verify persistent Windows-style settings resolver offline
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- config --self-test
+
+      - name: Verify worktree path and masked named key via config check (no API)
+        shell: bash
+        run: |
+          output="$(env -u OPENAI_API_KEY 'HaMi-AI-Engineering-Agent-Key=ci-secret-must-not-appear' HAMI_AGENT_WORKTREE_ROOT="$RUNNER_TEMP/hami-worktrees" dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- config --check --repo .)"
+          if ! grep -Fq "API key: available" <<< "$output" ||
+             ! grep -Fq "Worktree root: $RUNNER_TEMP/hami-worktrees" <<< "$output" ||
+             grep -Fq "ci-secret-must-not-appear" <<< "$output"; then
+            echo "::error::Configuration check failed path/key masking check"
+            exit 1
+          fi
+          echo "Runtime settings check passed without displaying the API key"
 
       - name: Build trusted fixed C# test fixture
         run: dotnet build samples/ClampKata/ClampKata.csproj --configuration Release --nologo -p:NuGetAudit=false
@@ -100,7 +115,7 @@ jobs:
           output="$(env -u OPENAI_API_KEY dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --repo . --unattended 2>&1)"
           result=$?
           set -e
-          if [ "$result" -ne 2 ] || ! grep -Fq "OPENAI_API_KEY is not set" <<< "$output"; then
+          if [ "$result" -ne 2 ] || ! grep -Fq "No API key configured" <<< "$output"; then
             echo "::error::Coding execution must be blocked before calling a model without an API key"
             exit 1
           fi
