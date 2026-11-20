@@ -198,7 +198,9 @@ internal static class CodingCommand
             if (outcomeReport.Success && loggingSession.Settings.LogSuccessfulSteps)
                 CodingLogEvents.RunSucceeded(auditLog, outcomeReport.ModelCalls);
             Console.WriteLine($"Coding run: {outcomeReport.Status}");
-            Console.WriteLine($"Model calls: {outcomeReport.ModelCalls}; modified file: {targetPath}");
+            string changedPath = gitStatus.Contains(targetPath, StringComparison.Ordinal)
+                ? targetPath : "(none; expression unchanged)";
+            Console.WriteLine($"Model calls: {outcomeReport.ModelCalls}; modified file: {changedPath}");
             Console.WriteLine(gitStatus);
             Console.WriteLine($"Local report: {Path.Combine(runDirectory, "report.json")}");
             return outcomeReport.Success ? 0 : 1;
@@ -321,7 +323,12 @@ internal static class CodingCommand
                 if (validation is not SourceValidationPassed valid)
                     throw new InvalidOperationException("Source validation returned no outcome.");
 
-                await File.WriteAllTextAsync(source, task.RenderSource(valid.Expression), new UTF8Encoding(false));
+                // Rebase each model attempt on the original trusted file, not
+                // the preceding failed candidate. Preserve all source trivia.
+                string updatedSource = task.ReplaceExpression(original, valid.Expression);
+                if (!string.Equals(await File.ReadAllTextAsync(source), updatedSource,
+                    StringComparison.Ordinal))
+                    await File.WriteAllTextAsync(source, updatedSource, new UTF8Encoding(false));
                 CompilationResult compilation = await CompileAsync(fixtureRoot, task, policy);
                 if (compilation is CompilationFailed compilationFailed)
                 {
@@ -531,7 +538,10 @@ internal static class CodingCommand
             approvalMode = "unattended-isolated",
             baseline,
             worktree,
-            modifiedPath = outcomeReport.Success ? policy.OnlyWritablePath : null,
+            // A correct no-op expression is a passed task, not a changed file.
+            modifiedPath = outcomeReport.Success
+                && gitStatus.Contains(policy.OnlyWritablePath, StringComparison.Ordinal)
+                    ? policy.OnlyWritablePath : null,
             gitStatus,
             timestampUtc = DateTimeOffset.UtcNow,
             attempts = outcomeReport.Attempts
@@ -628,7 +638,7 @@ internal static class CodingCommand
 
             // No partial code remains after a completely unsuccessful run.
             string target = Path.Combine(temp, "Clamp.cs");
-            string original = "// Clean placeholder after failed run.\n";
+            string original = await File.ReadAllTextAsync(Path.Combine(sourceDir, "Clamp.cs"));
             await File.WriteAllTextAsync(target, original);
             CodingRunResult exhausted = await ExecuteAttemptsAsync(
                 temp, Path.Combine(temp, "Clamp.cs"), CodingTaskDefinition.Clamp, template, policy,
@@ -676,7 +686,9 @@ internal static class CodingCommand
                 || retryReport.Attempts.Count != 2
                 || retryReport.Attempts[0].Status != "tests_failed"
                 || retryReport.Attempts[1].Status != "passed"
-                || !File.ReadAllText(retrySource).Contains(retryExpression, StringComparison.Ordinal))
+                || await File.ReadAllTextAsync(retrySource) != await File.ReadAllTextAsync(
+                    Path.Combine(repo, retryTask.TargetPath.Replace('/',
+                        Path.DirectorySeparatorChar))))
                 throw new InvalidOperationException(
                     "Production RetryBudget coding task did not recover using real compiler/tests.");
 
@@ -697,6 +709,24 @@ internal static class CodingCommand
                     || resultJson.GetProperty("status").GetString() != "generated"
                     || resultJson.GetProperty("attempts").GetArrayLength() != 2)
                     throw new InvalidOperationException("RetryBudget report task/asset mapping changed.");
+            }
+
+            // A task can pass all tests while proposing an expression already
+            // present in source. In that case no file is modified.
+            string unchangedReportDir = Path.Combine(temp, "retry-unchanged-report");
+            Directory.CreateDirectory(unchangedReportDir);
+            await WriteReportAsync(unchangedReportDir, "offline-stub", "trusted-baseline",
+                retryRoot, retryResult, "", "offline-fake",
+                retryPrompt, retryPolicy, retryTask);
+            using (JsonDocument unchangedReport = JsonDocument.Parse(
+                await File.ReadAllTextAsync(Path.Combine(
+                    unchangedReportDir, "report.json"))))
+            {
+                JsonElement unchanged = unchangedReport.RootElement;
+                if (unchanged.GetProperty("modifiedPath").ValueKind != JsonValueKind.Null
+                    || unchanged.GetProperty("status").GetString() != "generated")
+                    throw new InvalidOperationException(
+                        "Unchanged successful coding run incorrectly reports a modified file.");
             }
 
             // A hostile/unrelated model expression must not survive a failed run.
