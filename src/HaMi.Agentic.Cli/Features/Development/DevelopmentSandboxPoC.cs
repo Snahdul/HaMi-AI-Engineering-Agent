@@ -131,8 +131,11 @@ internal static class DevelopmentSandboxPoC
                 Directory.CreateDirectory(Path.GetDirectoryName(hostFile)!);
                 await File.WriteAllTextAsync(hostFile, content, new UTF8Encoding(false));
             }
-            await File.WriteAllTextAsync(Path.Combine(stage, "run.sh"), BuildScript,
-                new UTF8Encoding(false));
+            // C# raw string literals inherit the source file's line endings.
+            // Windows checkouts may use CRLF, which Debian /bin/sh interprets
+            // as an invalid option in 'set -eu\r'. Always emit LF-only shell code.
+            await File.WriteAllTextAsync(Path.Combine(stage, "run.sh"),
+                ToUnixLineEndings(BuildScript), new UTF8Encoding(false));
 
             EnsureSuccess(await SbxAsync(TimeSpan.FromMinutes(2),
                 "cp", stage, SandboxName + ":/home/agent/workspace/"), "Copy trusted snapshot");
@@ -172,6 +175,9 @@ internal static class DevelopmentSandboxPoC
             if (Directory.Exists(stage)) Directory.Delete(stage, recursive: true);
         }
     }
+
+    private static string ToUnixLineEndings(string text) =>
+        text.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
 
     private static void ValidateInspection(SandboxProcessResult result)
     {
@@ -322,6 +328,15 @@ internal static class DevelopmentSandboxPoC
         if (!IsAllowedOrigin("https://github.com/Snahdul/HaMi-AI-Engineering-Agent.git")
             || IsAllowedOrigin("https://github.com/untrusted/project.git"))
             throw new InvalidOperationException("Untrusted repository origin accepted.");
+
+        // Simulate a Windows CRLF checkout even when CI runs on Linux.
+        string windowsScript = BuildScript.Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace("\n", "\r\n", StringComparison.Ordinal);
+        string portableScript = ToUnixLineEndings(windowsScript);
+        if (portableScript.Contains('\r')
+            || !portableScript.StartsWith("#!/bin/sh\nset -eu\n", StringComparison.Ordinal)
+            || !string.Equals(portableScript, ToUnixLineEndings(BuildScript), StringComparison.Ordinal))
+            throw new InvalidOperationException("Shell script must use LF-only Unix line endings.");
 
         if (!BuildScript.Contains("--source /home/agent/empty-nuget-source", StringComparison.Ordinal)
             || !BuildScript.Contains("> \"$out/build.log\"", StringComparison.Ordinal)
