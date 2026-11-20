@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "logSuccessfulSteps": false,
+  "logDecisionSummaries": true,
+  "minimumLevel": "Information",
+  "relativeDirectory": "hami-agent-logs",
+  "fileSizeLimitBytes": 1048576,
+  "retainedFileCountLimit": 7
+}

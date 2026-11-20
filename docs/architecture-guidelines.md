@@ -176,6 +176,36 @@ Die neue Struktur wird mit Offline-Tests für **alle** Union-Fälle,
 die bestehende JSON-Projektion, echte Compiler-/Testkorrekturen und
 Rollback abgesichert.
 
+## Strukturiertes High-Performance-Logging
+
+Der Agent trennt **fachliche Ereigniserzeugung** (`ILogger`) und
+**persistente Ausgabe** (Serilog). Anwendungscode verwendet ausschließlich
+`Microsoft.Extensions.Logging.ILogger` mit source-generierten
+`[LoggerMessage]`-Methoden, stabilen EventIds und typisierten Feldern.
+`Serilog.Extensions.Logging` bindet den Provider einmalig in
+`Runtime/Logging/` an. Keine direkten `Serilog.Log.*`-Aufrufe im Slice.
+
+Die versionierte [Logging-Konfiguration](../config/logging.json) legt
+zwei **unabhängige Defaults** fest:
+
+- `logSuccessfulSteps=false`: Positive Versuche/Abschlüsse unterdrücken.
+- `logDecisionSummaries=true`: Explizite, kurze Annahmen,
+  Entscheidungen und Begründungen protokollieren.
+
+Alle Laufereignisse tragen eine korrelierbare `RunId`; Fehlerereignisse
+bestehen aus EventId, Versuch und knappem Fehlercode/Exception-Typ.
+Keine Secrets, Rohprompts, vollständigen Diagnosen, Modelltexte oder
+Stacktraces in den Logs. Decision-Summaries sind **ausdrücklich
+formulierte, überprüfbare Begründungen**, keine verborgenen
+Modell-Gedankengänge.
+
+Serilog schreibt kompaktes JSON pro Zeile in den vom Arbeitsrepository
+getrennten Worktree-Root. Tages-/Größenrotation und Aufbewahrung werden
+durch eine streng validierte, datengetriebene Konfiguration gesteuert.
+Die fachliche `report.json`-Schnittstelle bleibt hiervon getrennt.
+
+[Ereigniskatalog und Offline-Regressionsprüfungen](logging.md).
+
 ## Qualitätsgates je Vertical Slice
 
 1. **Vertrag und Architektur**: Scope, erlaubte Pfade, Modulgrenzen, Abhängigkeiten und Definition of Done prüfen.

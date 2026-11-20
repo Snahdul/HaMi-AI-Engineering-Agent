@@ -235,6 +235,35 @@ Der Offline-Test deckt alle Union-Fälle, Report-Kompatibilität, reale
 Compiler-/Testkorrekturen und Rollback ab. Details in den
 [Architekturleitlinien](docs/architecture-guidelines.md).
 
+## Strukturiertes Logging und Entscheidungsbegründungen
+
+[Issue #24](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/24)
+führt für den Coding-Slice ein source-generiertes
+`Microsoft.Extensions.Logging`-Logging mit Serilog-Provider und
+kompakten rotierenden JSON-Dateien ein.
+
+In der versionierten [`config/logging.json`](config/logging.json) gelten
+folgende **unabhängigen Defaults**:
+
+- `logSuccessfulSteps: false`: Nur Fehler/Warnungen, keine normalen Erfolgseinträge.
+- `logDecisionSummaries: true`: Kurze, ausdrücklich verfasste
+  Annahmen, Entscheidungen und Begründungen zusätzlich protokollieren.
+- `minimumLevel: Information`: Entscheidungslogs werden nicht weggefiltert.
+
+Logdateien entstehen außerhalb des produktiven Checkouts im
+`HAMI_AGENT_WORKTREE_ROOT/hami-agent-logs`-Ordner.
+`RunId` korreliert Ereignisse; keine Rohprompts, Schlüssel,
+Modellantworten, Quellcodes oder vollständigen Fehlerdiagnosen im Log.
+Die fachlichen `report.json`-Dateien behalten ihr bisheriges Format.
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test-logging --repo .
+```
+
+Der Offline-Test prüft beide Schalter getrennt, die JSON-Struktur,
+die Korrelation und ungültige Konfiguration. Weitere Informationen:
+[Logging- und Entscheidungsnachweise](docs/logging.md).
+
 ## Sicherheit
 
 Öffentliche Informationen und erlaubte Werkzeuge sind durch [SECURITY.md](SECURITY.md) begrenzt. Der Mensch bleibt für die Freigabe und die Integration verantwortlich.
