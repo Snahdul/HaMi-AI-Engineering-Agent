@@ -33,8 +33,10 @@ internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy p
         ArgumentException.ThrowIfNullOrWhiteSpace(model);
 
         ChatOptions options = CreateOptions(model, prompt.System);
+        using var apiDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        apiDeadline.CancelAfter(TimeSpan.FromSeconds(policy.ApiTimeoutSeconds));
         ChatResponse response = await client.GetResponseAsync(
-            [new ChatMessage(ChatRole.User, prompt.User)], options, cancellationToken);
+            [new ChatMessage(ChatRole.User, prompt.User)], options, apiDeadline.Token);
 
         if (response.FinishReason == ChatFinishReason.Length
             || string.IsNullOrWhiteSpace(response.Text))
@@ -107,6 +109,7 @@ internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy p
             || fake.Options?.ModelId != "test-model"
             || fake.Options.Instructions != task.System
             || fake.ReceivedUserPrompt != task.User
+            || !fake.ReceivedCancellableToken
             || fake.Options.MaxOutputTokens != policy.MaxOutputTokens
             || fake.Options.ResponseFormat is not ChatResponseFormatJson
             || fake.Options.ToolMode is not NoneChatToolMode
@@ -117,6 +120,18 @@ internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy p
             throw new InvalidOperationException(
                 "AI adapter did not preserve strict JSON format, no-tools, token budget or store=false.");
 #pragma warning restore OPENAI001
+
+        using var cancelledSource = new CancellationTokenSource();
+        cancelledSource.Cancel();
+        try
+        {
+            await gateway.GenerateAsync(task, "test-model", cancelledSource.Token);
+            throw new InvalidOperationException("AI adapter ignored caller cancellation.");
+        }
+        catch (OperationCanceledException) when (cancelledSource.IsCancellationRequested)
+        {
+            // Expected: caller cancellation propagates through the policy deadline.
+        }
 
         using var bad = new ScriptedChatClient("not JSON");
         try
@@ -130,7 +145,7 @@ internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy p
         }
 
         Console.WriteLine("Microsoft.Extensions.AI self-test passed: injected IChatClient, "
-            + "JSON schema, no model tools, store=false and invalid response rejection.");
+            + "JSON schema, no model tools, store=false, cancellation and invalid response rejection.");
     }
 
     internal sealed record CodingSuggestion(string Plan, string Expression);
@@ -140,6 +155,7 @@ internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy p
         public int Calls { get; private set; }
         public ChatOptions? Options { get; private set; }
         public string? ReceivedUserPrompt { get; private set; }
+        public bool ReceivedCancellableToken { get; private set; }
 
         public Task<ChatResponse> GetResponseAsync(
             IEnumerable<ChatMessage> messages, ChatOptions? options = null,
@@ -149,6 +165,8 @@ internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy p
             if (user.Role != ChatRole.User)
                 throw new InvalidOperationException("Expected a single user prompt.");
             ReceivedUserPrompt = user.Text;
+            ReceivedCancellableToken = cancellationToken.CanBeCanceled;
+            cancellationToken.ThrowIfCancellationRequested();
             Calls++;
             Options = options;
             return Task.FromResult(new ChatResponse(
