@@ -195,8 +195,8 @@ internal sealed class CodingPromptTemplate
         // The real parser must also accept a Windows CRLF asset.
         CodingPromptTemplate windowsAsset = Parse(
             original.Replace("\n", "\r\n", StringComparison.Ordinal));
-        if (windowsAsset.Render(null).User != first.User
-            || windowsAsset.Render(null).System != first.System)
+        if (windowsAsset.Render(null, policy.MaxFeedbackCharacters).User != first.User
+            || windowsAsset.Render(null, policy.MaxFeedbackCharacters).System != first.System)
             throw new InvalidOperationException("Prompty CRLF handling is inconsistent.");
 
         foreach (string modified in new[]
