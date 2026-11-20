@@ -183,6 +183,31 @@ dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --repo . --unat
 
 **Migrationsgrenze:** Microsoft markiert den `ResponsesClient.AsIChatClient()`-Adapter noch als experimentell (`OPENAI001`). Deshalb bleibt der bisherige produktiv getestete Transport bis zu einem erfolgreichen echten Kompatibilitätstest unangetastet; das Experimental-Warning wird nur direkt an der betreffenden Factory lokal unterdrückt. Das ist **keine** Freigabe für beliebigen generierten C#-Code oder erweiterte Tool-Ausführung.
 
+### Indirekte Prompt Injection bei Diagnosedaten
+
+[Issue #21](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/21)
+führt die erste praktische Vertrauensgrenze ein: Compiler-, Test- und
+Validierungsfeedback bleibt **untrusted data**, auch wenn es gefälschte
+`system:`-Rollen oder Handlungsanweisungen enthält. Der Coding-Slice
+übergibt solche Inhalte nicht mehr als freien Prompttext, sondern
+als kodiertes JSON-Datenfeld (`source`, `truncated`, `text`).
+Das Größenbudget `maxFeedbackCharacters` ist in
+[`policies/coding/clamp.policy.json`](policies/coding/clamp.policy.json)
+konfigurierbar. Überlange Diagnosen werden abgeschnitten.
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test --repo .
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test-ai --repo .
+```
+
+Die kostenlosen Offline-Tests enthalten adversariale Diagnoseinhalte und
+prüfen, dass diese als JSON-Daten erhalten bleiben, ohne neue System-/
+User-Rollen zu erzeugen. **JSON-Kodierung ist kein vollständiger Schutz**
+gegen inhaltliche Prompt Injection. Entscheidend bleiben die vom Modell
+unabhängigen Grenzen: keine Modell-Tools, nur erlaubte Zieldateien, feste
+Compiler-/Testbefehle und deterministische Validierung. Siehe
+[Prompt-Injection-Bedrohungsmodell](docs/prompt-injection-threat-model.md).
+
 ## Sicherheit
 
 Öffentliche Informationen und erlaubte Werkzeuge sind durch [SECURITY.md](SECURITY.md) begrenzt. Der Mensch bleibt für die Freigabe und die Integration verantwortlich.
