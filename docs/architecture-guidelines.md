@@ -126,6 +126,23 @@ Später kann ein `appsettings.json` die allgemeinen *nicht sicherheitsrelevanten
 
 **Quellen:** [Microsoft Configuration](https://learn.microsoft.com/en-us/dotnet/core/extensions/configuration) · [Options pattern und ValidateOnStart](https://learn.microsoft.com/en-us/dotnet/core/extensions/options) · [ErrorOnUnknownConfiguration](https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.configuration.binderoptions.erroronunknownconfiguration).
 
+## Vertrauensgrenzen und Prompt Injection
+
+Alle Inhalte aus Compiler-/Test-/Analyzer-Ausgaben, Modellantworten, GitHub-Issues,
+Repository-Dateien, Webseiten und späteren Tool-/MCP-Ergebnissen werden als
+**untrusted data** behandelt – auch wenn sie scheinbare `system:`-Rollen,
+Anweisungen, JSON oder Markdown enthalten. Sie dürfen keine neue Policy,
+Modellrolle oder Laufzeitberechtigung definieren.
+
+Der Coding-Slice kodiert Diagnosefeedback als **begrenztes JSON-Datenfeld**,
+statt Rohtext an Promptinstruktionen anzuhängen. Das Budget
+`maxFeedbackCharacters` steht in der vertrauenswürdigen JSON-Ausführungspolicy.
+Fake-Rollen und überlange Nutzdaten werden adversarial offline getestet.
+**Das ist keine absolute Prompt-Injection-Verhinderung**: Sicherheitsentscheidungen
+sind weiterhin deterministisch in Host-/Policy-Prüfungen zu erzwingen.
+
+[Bedrohungsmodell und Sicherheitsgrenzen](prompt-injection-threat-model.md).
+
 ## Qualitätsgates je Vertical Slice
 
 1. **Vertrag und Architektur**: Scope, erlaubte Pfade, Modulgrenzen, Abhängigkeiten und Definition of Done prüfen.
