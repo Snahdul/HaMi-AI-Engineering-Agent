@@ -1,0 +1,13 @@
+root = true
+
+# Deliberately do not normalize end_of_line: the Coding slice preserves
+# original source trivia (including LF / CRLF) when changing an expression.
+[*.cs]
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+# A narrow, explicit analyzer baseline; extend based on real findings.
+dotnet_diagnostic.CA2200.severity = warning
+dotnet_diagnostic.CA2016.severity = warning
