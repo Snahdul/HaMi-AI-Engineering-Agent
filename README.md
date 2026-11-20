@@ -6,6 +6,9 @@ Die Methodik und ihre Erkenntnisse werden im eigenständigen [HaMi AI Engineerin
 
 **Projektsteuerung:** [HaMi AI Engineering Agent – GitHub Project #2](https://github.com/users/Snahdul/projects/2/views/1) · [Statusautomatisierung und Einrichtung](docs/project-board.md).
 
+
+**Architekturleitlinien:** [Modularität, Vertical Slices und Prompt Assets](docs/architecture-guidelines.md). Neue Modellprompts werden als eigenständige `.prompty`-Dateien mit YAML-Metadaten und lesbarem Prompttext versioniert.
+
 ## Dauerhafte Laufzeitkonfiguration auf HaMi11 (Windows)
 
 [Issue #17](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/17) vereinheitlicht den Worktree-Pfad und die OpenAI-Key-Auflösung für die Replay-, Workflow- und Coding-Modi.
@@ -152,6 +155,8 @@ Der Bericht liegt ausschließlich lokal unter dem konfigurierten Worktree-Root i
 ## MVP 0.5 – Microsoft.Extensions.AI als optionaler Modelltransport
 
 [Issue #19](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/19) führt `Microsoft.Extensions.AI` und `Microsoft.Extensions.AI.OpenAI` **11.0.0** ein. Der Coding-Modus kann optional über `--ai-extensions` mit einem injizierten `IChatClient` arbeiten; der bisherige direkte Responses-Transport bleibt der Standard.
+
+**Prompt-Verwaltung:** Beide Coding-Transporte laden denselben versionierten Prompt aus [`prompts/coding/ClampExpression.prompty`](prompts/coding/ClampExpression.prompty). Der Datei-Loader verarbeitet bewusst nur die benötigte Prompty-Teilmenge (YAML-Metadaten, `system:`/`user:`, `{{feedback}}`), lehnt nicht unterstützte Ausdrücke ab und wird im Offline-Selbsttest geprüft. Modellberechtigungen und Ausführungslimits bleiben unveränderlich im C#-Host. Historische Replay-/Workflow-Prompts werden separat migriert.
 
 Der optionale Adapter überträgt dieselben Begrenzungen wie bisher: striktes JSON-Schema für `plan` und `expression`, feste Token-Grenze, **keine Tools**, maximal drei Modellversuche und beim OpenAI Responses SDK ausdrücklich `StoredOutputEnabled = false` (entspricht `store=false`). Bei jeder Modellantwort bleiben die bestehenden C#-Ausdrucksregeln, der echte Compiler/Test-Harness und die Abbruch-/Rücknahmelogik unverändert. Der verwendete Transport wird im lokalen `report.json` ausgewiesen.
 
