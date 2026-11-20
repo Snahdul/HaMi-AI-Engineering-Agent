@@ -1,0 +1,377 @@
+name: HaMi Agent GitHub Project status
+
+on:
+  issues:
+    types: [labeled]
+  workflow_run:
+    workflows: ["HaMi Agent PR status signal"]
+    types: [completed]
+  schedule:
+    # Fallback only. Pull request events are synchronized immediately.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "Issue or pull request in this repository"
+        type: choice
+        options: [issue, pull_request]
+        required: true
+      number:
+        description: "Issue/PR number"
+        type: number
+        required: true
+      status:
+        description: "Desired project status"
+        type: choice
+        options: [Todo, In Progress, Review, Done, Cancelled]
+        required: true
+
+# No privileged PR trigger. The secret is used only from the default branch,
+# after the unprivileged PR signal has completed. No PR code checkout.
+permissions: {}
+
+jobs:
+  sync:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'issues' &&
+       (github.event.label.name == 'workflow:in-progress' ||
+        github.event.label.name == 'workflow:review')) ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'pull_request' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.HAMI_PROJECT_TOKEN }}
+      PROJECT_OWNER: Snahdul
+      PROJECT_NUMBER: ${{ vars.HAMI_PROJECT_NUMBER }}
+      REPOSITORY: ${{ github.repository }}
+      EVENT_NAME: ${{ github.event_name }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      SIGNAL_PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+      SIGNAL_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      SIGNAL_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+      INPUT_KIND: ${{ inputs.kind }}
+      INPUT_NUMBER: ${{ inputs.number }}
+      INPUT_STATUS: ${{ inputs.status }}
+    steps:
+      - name: Synchronize GitHub Project status
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Missing secret HAMI_PROJECT_TOKEN"; exit 1
+          fi
+          if ! [[ "$PROJECT_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Missing or invalid variable HAMI_PROJECT_NUMBER"; exit 1
+          fi
+
+          project="$(gh api graphql \
+            -f query='query($owner: String!, $number: Int!) {
+              user(login: $owner) {
+                projectV2(number: $number) {
+                  id
+                  fields(first: 50) {
+                    nodes {
+                      ... on ProjectV2SingleSelectField {
+                        id name options { id name }
+                      }
+                    }
+                  }
+                }
+              }
+            }' \
+            -f owner="$PROJECT_OWNER" -F number="$PROJECT_NUMBER")"
+          project_id="$(jq -er '.data.user.projectV2.id' <<< "$project")"
+          field_id="$(jq -er '.data.user.projectV2.fields.nodes[] | select(.name == "Status") | .id' <<< "$project")"
+          # Fail explicitly until the Status field has the required fifth option.
+          if ! jq -e '.data.user.projectV2.fields.nodes[] |
+            select(.name == "Status") | .options[] |
+            select(.name == "Cancelled")' <<< "$project" >/dev/null; then
+            echo "::error::Status option 'Cancelled' is missing in Project #$PROJECT_NUMBER (Settings > Fields > Status)"
+            exit 1
+          fi
+
+          # Read existing project entries; the built-in workflows own Auto-add/Todo.
+          find_item() {
+            local wanted="$1" cursor="" result entry more
+            while :; do
+              local args=(-f query='query($project: ID!, $after: String) {
+                node(id: $project) {
+                  ... on ProjectV2 {
+                    items(first: 100, after: $after) {
+                      nodes {
+                        id
+                        content {
+                          ... on Issue { id }
+                          ... on PullRequest { id }
+                        }
+                        fieldValueByName(name: "Status") {
+                          ... on ProjectV2ItemFieldSingleSelectValue { name }
+                        }
+                      }
+                      pageInfo { hasNextPage endCursor }
+                    }
+                  }
+                }
+              }' -f project="$project_id")
+              if [ -n "$cursor" ]; then args+=(-f after="$cursor"); fi
+              result="$(gh api graphql "${args[@]}")"
+              entry="$(jq -r --arg id "$wanted" \
+                '.data.node.items.nodes[] | select(.content.id == $id) |
+                 [.id, (.fieldValueByName.name // "")] | @tsv' <<< "$result")"
+              if [ -n "$entry" ]; then printf '%s\n' "$entry"; return 0; fi
+              more="$(jq -r '.data.node.items.pageInfo.hasNextPage' <<< "$result")"
+              if [ "$more" != "true" ]; then return 1; fi
+              cursor="$(jq -er '.data.node.items.pageInfo.endCursor' <<< "$result")"
+            done
+          }
+
+          sync_one() {
+            local node_id="$1" desired="$2" retries="$3"
+            local entry="" item_id="" prior="" option="" attempt
+            option="$(jq -er --arg status "$desired" \
+              '.data.user.projectV2.fields.nodes[] | select(.name == "Status") |
+               .options[] | select(.name == $status) | .id' <<< "$project")"
+
+            # A PR signal should not spend a minute waiting for GitHub's
+            # asynchronous Auto-add. Issues retain their existing retry policy.
+            local max_attempts="$retries"
+            if [ "${4:-}" = "pr-scheduled" ] && [ "$max_attempts" -gt 3 ]; then
+              max_attempts=3
+            fi
+            for attempt in $(seq 1 "$max_attempts"); do
+              entry="$(find_item "$node_id" || true)"
+              if [ -n "$entry" ]; then
+                item_id="$(cut -f 1 <<< "$entry")"
+                prior="$(cut -f 2 <<< "$entry")"
+                if [ -n "$prior" ]; then break; fi
+              fi
+              if [ "$attempt" -lt "$max_attempts" ]; then sleep 3; fi
+            done
+
+            if [ -z "$item_id" ] || [ -z "$prior" ]; then
+              if [ "${4:-}" != "pr-scheduled" ]; then
+                echo "::warning::Project entry/initial status not available: $node_id"
+                return 1
+              fi
+
+              # The project Auto-add timeline and GraphQL item list can disagree.
+              # GitHub documents addProjectV2ItemById as idempotent: an existing
+              # item is returned, never duplicated. Only internal PRs reach here.
+              echo "::notice::Resolving PR Project item via idempotent GitHub mutation: $node_id"
+              item_id="$(gh api graphql \
+                -f query='mutation($project: ID!, $content: ID!) {
+                  addProjectV2ItemById(input: {
+                    projectId: $project
+                    contentId: $content
+                  }) { item { id } }
+                }' \
+                -f project="$project_id" -f content="$node_id" \
+                --jq '.data.addProjectV2ItemById.item.id')"
+              if [ -z "$item_id" ] || [ "$item_id" = "null" ]; then
+                echo "::error::Could not resolve a Project item for PR $node_id"
+                return 1
+              fi
+
+              # Read current field directly from the returned Project item so
+              # an existing human Done decision remains protected.
+              prior="$(gh api graphql \
+                -f query='query($item: ID!) {
+                  node(id: $item) {
+                    ... on ProjectV2Item {
+                      fieldValueByName(name: "Status") {
+                        ... on ProjectV2ItemFieldSingleSelectValue { name }
+                      }
+                    }
+                  }
+                }' -f item="$item_id" \
+                --jq '.data.node.fieldValueByName.name // ""')"
+              if [ -z "$prior" ]; then
+                prior="(unset)"
+              fi
+            fi
+            # Do not reactivate a merged/completed PR. An unmerged closure
+            # may correct a previously incorrect Done to Cancelled.
+            if [ "${4:-}" = "pr-scheduled" ] && [ "$prior" = "Done" ] &&
+               [ "$desired" != "Cancelled" ]; then
+              echo "$node_id: already Done; leaving completion state unchanged"
+              return 0
+            fi
+            if [ "$prior" = "$desired" ]; then
+              echo "$node_id: already $desired"; return 0
+            fi
+
+            gh api graphql \
+              -f query='mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $project
+                  itemId: $item
+                  fieldId: $field
+                  value: { singleSelectOptionId: $option }
+                }) { projectV2Item { id } }
+              }' \
+              -f project="$project_id" -f item="$item_id" \
+              -f field="$field_id" -f option="$option" \
+              --jq '.data.updateProjectV2ItemFieldValue.projectV2Item.id' >/dev/null
+
+            echo "$node_id: $prior → $desired"
+            echo "**$node_id:** $prior → $desired" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # Work against the current state to avoid stale event transitions.
+          sync_issue() {
+            local number="$1" retries="${2:-20}" issue labels target
+            issue="$(gh api "repos/$REPOSITORY/issues/$number")"
+            if [ "$(jq -r '.state' <<< "$issue")" != "open" ]; then return 0; fi
+            labels="$(jq -c '[.labels[].name]' <<< "$issue")"
+            if jq -e 'index("workflow:review") != null' <<< "$labels" >/dev/null; then
+              target="Review"
+            elif jq -e 'index("workflow:in-progress") != null' <<< "$labels" >/dev/null; then
+              target="In Progress"
+            else
+              return 0
+            fi
+            sync_one "$(jq -er '.node_id' <<< "$issue")" "$target" "$retries"
+          }
+
+          # Trusted base-branch code reads the CURRENT PR state.
+          # Never check out, evaluate or execute code or text from a pull request.
+          sync_pr() {
+            local number="$1" retries="${2:-20}" pr labels target origin state
+            pr="$(gh api "repos/$REPOSITORY/pulls/$number")"
+            origin="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
+            if [ "$origin" != "$REPOSITORY" ]; then
+              echo "Ignoring PR from external repository"
+              return 0
+            fi
+            state="$(jq -er '.state' <<< "$pr")"
+            case "$state" in
+              closed)
+                if [ "$(jq -r '.merged_at // ""' <<< "$pr")" != "" ]; then
+                  echo "PR #$number was merged; GitHub Projects owns Done"
+                  return 0
+                fi
+                target="Cancelled"
+                ;;
+              open)
+                labels="$(jq -c '[.labels[].name]' <<< "$pr")"
+                if jq -e 'index("workflow:review") != null' <<< "$labels" >/dev/null; then
+                  target="Review"
+                elif jq -e 'index("workflow:in-progress") != null' <<< "$labels" >/dev/null; then
+                  target="In Progress"
+                else
+                  target="Review"
+                fi
+                ;;
+              *)
+                echo "::error::Unknown PR state '$state' for #$number"
+                return 1
+                ;;
+            esac
+            sync_one "$(jq -er '.node_id' <<< "$pr")" "$target" "$retries" pr-scheduled
+          }
+
+          case "$EVENT_NAME" in
+            workflow_run)
+              if [ "$SIGNAL_HEAD_REPO" != "$REPOSITORY" ]; then
+                echo "Ignoring external workflow signal"
+                exit 0
+              fi
+              if [[ "$SIGNAL_PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+                sync_pr "$SIGNAL_PR_NUMBER"
+              else
+                # workflow_run.pull_requests may be empty, especially on close.
+                # Include closed PRs so the fallback can resolve cancellations.
+                candidates="$(gh api "repos/$REPOSITORY/pulls?state=all&per_page=100" \
+                  --paginate --jq '.[] | [.number, .head.ref, (.head.repo.full_name // "")] | @tsv')"
+                found=false
+                while IFS=$'\t' read -r number head_branch origin; do
+                  [ -n "$number" ] || continue
+                  if [ "$origin" = "$REPOSITORY" ] && [ "$head_branch" = "$SIGNAL_BRANCH" ]; then
+                    sync_pr "$number"
+                    found=true
+                  fi
+                done <<< "$candidates"
+                if [ "$found" != "true" ]; then
+                  echo "No internal PR matches the signal branch"
+                fi
+              fi
+              ;;
+            issues)
+              sync_issue "$ISSUE_NUMBER"
+              ;;
+            workflow_dispatch)
+              case "$INPUT_KIND" in
+                issue) endpoint="issues/$INPUT_NUMBER" ;;
+                pull_request) endpoint="pulls/$INPUT_NUMBER" ;;
+                *) echo "::error::Invalid item type"; exit 1 ;;
+              esac
+              item="$(gh api "repos/$REPOSITORY/$endpoint")"
+              item_state="$(jq -er '.state' <<< "$item")"
+              if [ "$INPUT_KIND" = "pull_request" ]; then
+                merged_at="$(jq -r '.merged_at // ""' <<< "$item")"
+                case "$INPUT_STATUS" in
+                  Cancelled)
+                    if [ "$item_state" != "closed" ] || [ -n "$merged_at" ]; then
+                      echo "::error::Cancelled requires an unmerged closed PR"; exit 1
+                    fi
+                    ;;
+                  Done)
+                    if [ -z "$merged_at" ]; then
+                      echo "::error::Done requires a merged PR"; exit 1
+                    fi
+                    ;;
+                  *)
+                    if [ "$item_state" != "open" ]; then
+                      echo "::error::Cannot reactivate a closed PR manually"; exit 1
+                    fi
+                    ;;
+                esac
+              else
+                if [ "$INPUT_STATUS" = "Cancelled" ]; then
+                  echo "::error::Cancelled is reserved for unmerged closed PRs"; exit 1
+                fi
+                if [ "$item_state" != "open" ] && [ "$INPUT_STATUS" != "Done" ]; then
+                  echo "::error::Cannot reactivate a closed issue"; exit 1
+                fi
+              fi
+              sync_one "$(jq -er '.node_id' <<< "$item")" "$INPUT_STATUS" 20
+              ;;
+            schedule)
+              # Recover missing PR events, including unmerged closed PRs.
+              open_pr_numbers="$(gh api "repos/$REPOSITORY/pulls?state=open&per_page=100" \
+                --paginate --jq '.[].number')"
+              while IFS= read -r number; do
+                [ -n "$number" ] || continue
+                sync_pr "$number" 2 || true
+              done <<< "$open_pr_numbers"
+
+              closed_unmerged_numbers="$(gh api "repos/$REPOSITORY/pulls?state=closed&per_page=100" \
+                --paginate --jq '.[] | select(.merged_at == null) | .number')"
+              while IFS= read -r number; do
+                [ -n "$number" ] || continue
+                sync_pr "$number" 2 || true
+              done <<< "$closed_unmerged_numbers"
+
+              # Repair any missed issue label events as well.
+              active_issues="$(gh api "repos/$REPOSITORY/issues?state=open&per_page=100" \
+                --paginate --jq '
+                  .[] | select(.pull_request == null) |
+                  ([.labels[].name] as $labels |
+                    select(($labels | index("workflow:review")) != null or
+                           ($labels | index("workflow:in-progress")) != null)) |
+                  .number')"
+              while IFS=$'\t' read -r number; do
+                [ -n "$number" ] || continue
+                sync_issue "$number" 2 || true
+              done <<< "$active_issues"
+              ;;
+            *)
+              echo "::error::Unsupported event"; exit 1
+              ;;
+          esac
