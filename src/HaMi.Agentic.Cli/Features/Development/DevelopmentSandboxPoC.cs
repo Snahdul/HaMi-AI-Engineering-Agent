@@ -75,6 +75,11 @@ internal static class DevelopmentSandboxPoC
             || (await DevelopmentWorktreeGuard.GitAsync(repo, "branch", "--show-current")).Trim() != "main")
             throw new InvalidOperationException("PoC requires the trusted main checkout root.");
 
+        string origin = (await DevelopmentWorktreeGuard.GitAsync(
+            repo, "remote", "get-url", "origin")).Trim();
+        if (!IsAllowedOrigin(origin))
+            throw new InvalidOperationException("PoC is restricted to the HaMi Agent repository.");
+
         // Fail closed before copying anything to the guest.
         SandboxProcessResult inspect = await SbxAsync(TimeSpan.FromSeconds(30),
             "inspect", SandboxName);
@@ -275,6 +280,10 @@ internal static class DevelopmentSandboxPoC
         })
             ExpectRejected(() => SandboxReport.Parse(invalidReport));
 
+        if (!IsAllowedOrigin("https://github.com/Snahdul/HaMi-AI-Engineering-Agent.git")
+            || IsAllowedOrigin("https://github.com/untrusted/project.git"))
+            throw new InvalidOperationException("Untrusted repository origin accepted.");
+
         if (!BuildScript.Contains("--source /home/agent/empty-nuget-source", StringComparison.Ordinal)
             || !BuildScript.Contains("> \"$out/build.log\"", StringComparison.Ordinal)
             || !BuildScript.Contains("> \"$out/test.log\"", StringComparison.Ordinal))
@@ -287,6 +296,17 @@ internal static class DevelopmentSandboxPoC
         catch (InvalidOperationException) { return; }
         throw new InvalidOperationException("Unsafe sandbox input was accepted.");
     }
+
+    private static bool IsAllowedOrigin(string origin) =>
+        new[]
+        {
+            "https://github.com/Snahdul/HaMi-AI-Engineering-Agent",
+            "https://github.com/Snahdul/HaMi-AI-Engineering-Agent.git",
+            "git@github.com:Snahdul/HaMi-AI-Engineering-Agent",
+            "git@github.com:Snahdul/HaMi-AI-Engineering-Agent.git",
+            "ssh://git@github.com/Snahdul/HaMi-AI-Engineering-Agent",
+            "ssh://git@github.com/Snahdul/HaMi-AI-Engineering-Agent.git"
+        }.Contains(origin, StringComparer.OrdinalIgnoreCase);
 
     private static bool SamePath(string left, string right) =>
         string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(left)),
