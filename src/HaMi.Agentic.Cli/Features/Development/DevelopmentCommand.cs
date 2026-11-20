@@ -189,7 +189,14 @@ internal static class DevelopmentCommand
                 catch (InvalidOperationException) { /* Best-effort cleanup of disposable fixture. */ }
             }
             if (Directory.Exists(root))
+            {
+                // Git for Windows may leave read-only loose Git objects in the
+                // disposable .git directory; normalize attributes for cleanup.
+                foreach (string file in Directory.EnumerateFiles(root, "*",
+                    SearchOption.AllDirectories))
+                    File.SetAttributes(file, FileAttributes.Normal);
                 Directory.Delete(root, recursive: true);
+            }
         }
     }
 
