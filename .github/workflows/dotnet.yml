@@ -48,6 +48,12 @@ jobs:
           dotnet format whitespace src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --no-restore --verify-no-changes --include "${sources[@]}"
           dotnet format analyzers src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --no-restore --verify-no-changes --severity warn --include "${sources[@]}"
 
+      - name: Validate versioned development task contract (offline)
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --contract-check --contract contracts/development/retry-budget-refinement.json
+
+      - name: Exercise detached multi-file development scope guard (offline)
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --self-test
+
       - name: CLI help smoke test (no API key needed)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --help
 
@@ -175,6 +181,9 @@ jobs:
 
       - name: Release build with warnings as errors
         run: dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-restore
+
+      - name: Validate development task and detached worktree scope on Windows
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --self-test
 
       - name: Assert Serilog file handles are released on Windows
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test-logging --repo .
