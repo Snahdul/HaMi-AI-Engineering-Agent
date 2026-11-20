@@ -187,7 +187,7 @@ internal static class DevelopmentSandboxPoC
         {
             ["Name"] = SandboxName,
             ["Agent"] = "shell",
-            ["State"] = "running", // inspect includes running uptime
+            ["State"] = "running or stopped", // sbx stops local sandboxes when idle
             ["Workspace"] = "-",
             ["Clone source"] = "-",
             ["Configured host mounts"] = "none",
@@ -203,11 +203,19 @@ internal static class DevelopmentSandboxPoC
         {
             if (!fields.TryGetValue(key, out string? actual)
                 || (key == "State"
-                    ? !actual.StartsWith(value + " (", StringComparison.Ordinal)
+                    ? !IsAcceptableSandboxState(actual)
                     : !string.Equals(actual, value, StringComparison.Ordinal)))
                 throw new InvalidOperationException("Sandbox security preflight failed: " + key);
         }
     }
+
+    // A local sbx create/exec sandbox may be stopped between commands.
+    // A non-responsive or transitional state must still fail closed.
+    private static bool IsAcceptableSandboxState(string state) =>
+        (state is "running" or "stopped"
+            || Regex.IsMatch(state, @"^(running|stopped) \([^)]*\)$",
+                RegexOptions.CultureInvariant))
+        && !state.Contains("not responding", StringComparison.OrdinalIgnoreCase);
 
     private static void ValidateNetworkPolicy(SandboxProcessResult result)
     {
@@ -269,6 +277,11 @@ internal static class DevelopmentSandboxPoC
             Auth mode: not configured
             """;
         ValidateInspection(new SandboxProcessResult(0, inspection, ""));
+        ValidateInspection(new SandboxProcessResult(0,
+            inspection.Replace("State: running (10s)", "State: starting", StringComparison.Ordinal),
+            inspection.Replace("State: running (10s)", "State: running (not responding)", StringComparison.Ordinal), ""));
+        ValidateInspection(new SandboxProcessResult(0,
+            inspection.Replace("State: running (10s)", "State: stopped (15m)", StringComparison.Ordinal), ""));
         ValidateNetworkPolicy(new SandboxProcessResult(0,
             "Denied: api.github.com:443\nReason: no matching allow rule (default deny)", ""));
 
