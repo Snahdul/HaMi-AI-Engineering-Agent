@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "allowedWritePaths": [
+    "samples/ClampKata/Clamp.cs"
+  ],
+  "allowedModelTools": [],
+  "allowShellCommands": false,
+  "allowGitHubWrites": false,
+  "storeModelResponses": false,
+  "maxModelCalls": 3,
+  "maxOutputTokens": 1000,
+  "processTimeoutSeconds": 110,
+  "apiTimeoutSeconds": 240
+}

@@ -6,6 +6,9 @@ Die Methodik und ihre Erkenntnisse werden im eigenständigen [HaMi AI Engineerin
 
 **Projektsteuerung:** [HaMi AI Engineering Agent – GitHub Project #2](https://github.com/users/Snahdul/projects/2/views/1) · [Statusautomatisierung und Einrichtung](docs/project-board.md).
 
+
+**Architekturleitlinien:** [Modularität, Vertical Slices und Prompt Assets](docs/architecture-guidelines.md). Neue Modellprompts werden als eigenständige `.prompty`-Dateien mit YAML-Metadaten und lesbarem Prompttext versioniert.
+
 ## Dauerhafte Laufzeitkonfiguration auf HaMi11 (Windows)
 
 [Issue #17](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/17) vereinheitlicht den Worktree-Pfad und die OpenAI-Key-Auflösung für die Replay-, Workflow- und Coding-Modi.
@@ -148,6 +151,37 @@ dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --repo . --unat
 Der Bericht liegt ausschließlich lokal unter dem konfigurierten Worktree-Root in `hami-agent-coding\<lauf>\report.json` (ohne Konfiguration unter `%TEMP%`); der erfolgreiche Worktree enthält eine geänderte `samples/ClampKata/Clamp.cs`, während das produktive `main` unverändert bleibt.
 
 **Sicherheitsgrenze:** Das ist **kein frei programmierender Agent**. `dotnet build` und `dotnet run` sind keine OS-Sandbox für beliebigen KI-Code. Die Ausführung ist hier nur vertretbar, weil die Modellantwort auf einen kurzen C#-Ausdruck ohne Methodenaufrufe und mit einer festen, bekannten Testanwendung begrenzt wird. Für allgemeine Codegenerierung ist eine gesonderte Prozess-/Betriebssystem-Isolation erforderlich.
+
+## MVP 0.5 – Microsoft.Extensions.AI als optionaler Modelltransport
+
+[Issue #19](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/19) führt `Microsoft.Extensions.AI` und `Microsoft.Extensions.AI.OpenAI` **11.0.0** ein. Der Coding-Modus kann optional über `--ai-extensions` mit einem injizierten `IChatClient` arbeiten; der bisherige direkte Responses-Transport bleibt der Standard.
+
+**Prompt-Verwaltung:** Beide Coding-Transporte laden denselben versionierten Prompt aus [`prompts/coding/ClampExpression.prompty`](prompts/coding/ClampExpression.prompty). Der Datei-Loader verarbeitet bewusst nur die benötigte Prompty-Teilmenge (YAML-Metadaten, `system:`/`user:`, `{{feedback}}`), lehnt nicht unterstützte Ausdrücke ab und wird im Offline-Selbsttest geprüft. Modellberechtigungen und Ausführungslimits werden über die vertrauenswürdige, versionierte [Execution Policy](policies/coding/clamp.policy.json) konfiguriert, vor dem Lauf strikt validiert und im C#-Host durchgesetzt. Historische Replay-/Workflow-Prompts werden separat migriert.
+
+Der optionale Adapter überträgt dieselben Begrenzungen wie bisher: striktes JSON-Schema für `plan` und `expression`, feste Token-Grenze, **keine Tools**, maximal drei Modellversuche und beim OpenAI Responses SDK ausdrücklich `StoredOutputEnabled = false` (entspricht `store=false`). Bei jeder Modellantwort bleiben die bestehenden C#-Ausdrucksregeln, der echte Compiler/Test-Harness und die Abbruch-/Rücknahmelogik unverändert. Der verwendete Transport wird im lokalen `report.json` ausgewiesen.
+
+**Deklarative Ausführungsrichtlinie:** Der Coding-Slice liest [`policies/coding/clamp.policy.json`](policies/coding/clamp.policy.json) mit `Microsoft.Extensions.Configuration.Json` und strengem typisierten Binder (`ErrorOnUnknownConfiguration`). Dort stehen erlaubte Schreibpfade und Modell-Tools, GitHub-/Shell-Berechtigungen, API-Speicherung und die Limits für Aufrufe, Token und Prozess-/API-Dauer. Ein ungültiger, fehlender oder über die geprüften Fähigkeiten hinausgehender Eintrag stoppt **vor** API- oder Worktree-Zugriff. Sicherheitswerte lassen sich nicht per Prompt oder Umgebungsvariable überschreiben. Laufberichte enthalten künftig den Policy-Pfad und SHA-256.
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --policy-check --repo .
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test --repo .
+```
+
+Diese Befehle prüfen die Policy ohne API-Kosten. Die technischen Schranken des bisher auf `Clamp` begrenzten MVP bleiben bestehen; eine Konfigurationsänderung kann nicht die Ausführung beliebigen Codes oder Shell-/GitHub-Tools freischalten. Siehe [Architekturleitlinien](docs/architecture-guidelines.md).
+
+**Kostenloser Offline-Test (Fake-IChatClient, kein Modellaufruf):**
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test-ai --repo .
+```
+
+**Optionaler Live-Kompatibilitätstest** (erst nach CI/Review/Merge; bis zu drei kostenpflichtige Modellaufrufe):
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --repo . --unattended --ai-extensions --model gpt-5.4-mini
+```
+
+**Migrationsgrenze:** Microsoft markiert den `ResponsesClient.AsIChatClient()`-Adapter noch als experimentell (`OPENAI001`). Deshalb bleibt der bisherige produktiv getestete Transport bis zu einem erfolgreichen echten Kompatibilitätstest unangetastet; das Experimental-Warning wird nur direkt an der betreffenden Factory lokal unterdrückt. Das ist **keine** Freigabe für beliebigen generierten C#-Code oder erweiterte Tool-Ausführung.
 
 ## Sicherheit
 
