@@ -10,7 +10,7 @@ namespace HaMi.Agentic.Cli.Features.Coding;
 /// Opt-in model transport for the existing bounded Clamp task.
 /// The provider is injected via IChatClient, allowing deterministic offline tests.
 /// </summary>
-internal sealed class CodingAiClient(IChatClient client)
+internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy policy)
 {
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web);
     private static readonly JsonElement Schema = JsonSerializer.SerializeToElement(new
@@ -59,11 +59,11 @@ internal sealed class CodingAiClient(IChatClient client)
     // The OpenAI Responses SDK currently marks CreateResponseOptions experimental (OPENAI001).
     // Keep the opt-in compatibility boundary explicit and limited to this method.
 #pragma warning disable OPENAI001
-    private static ChatOptions CreateOptions(string model, string instructions) => new()
+    private ChatOptions CreateOptions(string model, string instructions) => new()
     {
         ModelId = model,
         Instructions = instructions,
-        MaxOutputTokens = 1000,
+        MaxOutputTokens = policy.MaxOutputTokens,
         ResponseFormat = ChatResponseFormat.ForJsonSchema(Schema, "hami_clamp_coding"),
         ToolMode = ChatToolMode.None,
         Tools = [],
@@ -72,7 +72,7 @@ internal sealed class CodingAiClient(IChatClient client)
         // Preserve the old transport's explicit store=false contract.
         RawRepresentationFactory = _ => new CreateResponseOptions
         {
-            StoredOutputEnabled = false
+            StoredOutputEnabled = policy.StoreModelResponses
         }
     };
 
@@ -92,12 +92,13 @@ internal sealed class CodingAiClient(IChatClient client)
     public static async Task SelfTestAsync(string repository)
     {
         CodingPromptTemplate.SelfTest(repository);
+        CodingExecutionPolicy policy = CodingExecutionPolicy.Load(repository);
         CodingPrompt task = CodingPromptTemplate.Load(repository).Render(null);
         const string validJson =
             """{"plan":"Compare the value with the bounds.","expression":"value < min ? min : value > max ? max : value"}""";
 
         using var fake = new ScriptedChatClient(validJson);
-        var gateway = new CodingAiClient(fake);
+        var gateway = new CodingAiClient(fake, policy);
         CodingSuggestion result = await gateway.GenerateAsync(task, "test-model");
 
 #pragma warning disable OPENAI001
@@ -106,7 +107,7 @@ internal sealed class CodingAiClient(IChatClient client)
             || fake.Options?.ModelId != "test-model"
             || fake.Options.Instructions != task.System
             || fake.ReceivedUserPrompt != task.User
-            || fake.Options.MaxOutputTokens != 1000
+            || fake.Options.MaxOutputTokens != policy.MaxOutputTokens
             || fake.Options.ResponseFormat is not ChatResponseFormatJson
             || fake.Options.ToolMode is not NoneChatToolMode
             || fake.Options.Tools?.Count != 0
@@ -120,7 +121,7 @@ internal sealed class CodingAiClient(IChatClient client)
         using var bad = new ScriptedChatClient("not JSON");
         try
         {
-            await new CodingAiClient(bad).GenerateAsync(task, "test-model");
+            await new CodingAiClient(bad, policy).GenerateAsync(task, "test-model");
             throw new InvalidOperationException("AI adapter accepted invalid JSON.");
         }
         catch (InvalidOperationException ex) when (ex.Message == "Structured AI response is not valid JSON.")
