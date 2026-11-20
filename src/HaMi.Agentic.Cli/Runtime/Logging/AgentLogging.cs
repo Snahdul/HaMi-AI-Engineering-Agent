@@ -163,6 +163,19 @@ internal static class AgentLoggingSelfTest
                 && !noDecisionText.Contains("DecisionRecorded", StringComparison.Ordinal),
                 "Disabling decisions must not suppress failures or warnings.");
 
+            AgentLoggingSettings onlySuccesses = AgentLoggingSettings.Parse(
+                original.Replace("\"logSuccessfulSteps\": false",
+                    "\"logSuccessfulSteps\": true", StringComparison.Ordinal)
+                .Replace("\"logDecisionSummaries\": true",
+                    "\"logDecisionSummaries\": false", StringComparison.Ordinal));
+            string successOnly = Emit(onlySuccesses, Path.Combine(temp, "success-only"));
+            Ensure(successOnly.Contains("AttemptSucceeded", StringComparison.Ordinal)
+                && !successOnly.Contains("DecisionRecorded", StringComparison.Ordinal)
+                && successOnly.Contains("ExpressionRejected", StringComparison.Ordinal),
+                "Success=true and decisions=false must work independently.");
+
+            TestRotation(original, Path.Combine(temp, "rotation"));
+
             foreach (string bad in new[]
             {
                 original.Replace("\"version\": 1", "\"version\": 2", StringComparison.Ordinal),
@@ -189,13 +202,42 @@ internal static class AgentLoggingSelfTest
             }
 
             Console.WriteLine("Structured logging self-test passed: "
-                + "defaults success=false/decisions=true; independent toggles, "
-                + "structured failure events, safe path and bounded rotation.");
+                + "defaults success=false/decisions=true, all four toggle combinations, "
+                + "correlated JSON events, configured rollover/retention and safe paths.");
         }
         finally
         {
             Directory.Delete(temp, recursive: true);
         }
+    }
+
+    private static void TestRotation(string configuration, string temp)
+    {
+        AgentLoggingSettings smallFiles = AgentLoggingSettings.Parse(
+            configuration.Replace("\"fileSizeLimitBytes\": 1048576",
+                    "\"fileSizeLimitBytes\": 65536", StringComparison.Ordinal)
+                .Replace("\"retainedFileCountLimit\": 7",
+                    "\"retainedFileCountLimit\": 2", StringComparison.Ordinal));
+
+        using (var session = AgentLoggingSession.CreateForTest(smallFiles, temp))
+        {
+            var logger = session.CreateLogger("HaMi.Agentic.Cli.Features.Coding");
+            using var scope = logger.BeginScope(new Dictionary<string, object>
+            {
+                ["RunId"] = "selftest-rotation-001"
+            });
+
+            // Many short structured events (not one oversized diagnostic) must
+            // trigger size rollover; the retention policy keeps at most 2 files.
+            for (int attempt = 1; attempt <= 2400; attempt++)
+                CodingLogEvents.ExpressionRejected(logger, attempt, "invalid_expression");
+        }
+
+        string[] files = Directory.GetFiles(Path.Combine(temp,
+            smallFiles.RelativeDirectory), "agent-*.clef");
+        Ensure(files.Length == 2 && files.All(f => new FileInfo(f).Length
+                <= smallFiles.FileSizeLimitBytes + 4096),
+            "Serilog size rollover and retention did not enforce the configured limits.");
     }
 
     private static string Emit(AgentLoggingSettings settings, string temp)
