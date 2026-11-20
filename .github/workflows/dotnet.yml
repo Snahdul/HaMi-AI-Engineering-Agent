@@ -44,11 +44,9 @@ jobs:
             # only changes configuration/documentation.
             sources=(src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs)
           fi
-          printf 'Checking %s\\n' "${sources[@]}"
-          dotnet format whitespace src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj \\
-            --no-restore --verify-no-changes --include "${sources[@]}"
-          dotnet format analyzers src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj \\
-            --no-restore --verify-no-changes --severity warn --include "${sources[@]}"
+          printf 'Checking %s\n' "${sources[@]}"
+          dotnet format whitespace src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --no-restore --verify-no-changes --include "${sources[@]}"
+          dotnet format analyzers src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --no-restore --verify-no-changes --severity warn --include "${sources[@]}"
 
       - name: CLI help smoke test (no API key needed)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --help
