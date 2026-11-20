@@ -108,6 +108,17 @@ internal sealed class CodingExecutionPolicy
             if (Load(temp).Sha256 != actual.Sha256)
                 throw new InvalidOperationException("Policy SHA-256 is not deterministic.");
 
+            // A policy owner may tighten resource budgets without editing C#.
+            string tighter = baseline
+                .Replace("\"maxModelCalls\": 3", "\"maxModelCalls\": 2", StringComparison.Ordinal)
+                .Replace("\"maxOutputTokens\": 1000", "\"maxOutputTokens\": 500", StringComparison.Ordinal)
+                .Replace("\"processTimeoutSeconds\": 110", "\"processTimeoutSeconds\": 30", StringComparison.Ordinal);
+            File.WriteAllText(target, tighter);
+            CodingExecutionPolicy reduced = Load(temp);
+            if (reduced.MaxModelCalls != 2 || reduced.MaxOutputTokens != 500
+                || reduced.ProcessTimeoutSeconds != 30)
+                throw new InvalidOperationException("Tighter declarative policy was not applied.");
+
             // Fail closed when a human typo or accidental widening is introduced.
             foreach (string malformed in new[]
             {
