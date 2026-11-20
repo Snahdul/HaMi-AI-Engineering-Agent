@@ -198,7 +198,9 @@ internal static class CodingCommand
             if (outcomeReport.Success && loggingSession.Settings.LogSuccessfulSteps)
                 CodingLogEvents.RunSucceeded(auditLog, outcomeReport.ModelCalls);
             Console.WriteLine($"Coding run: {outcomeReport.Status}");
-            Console.WriteLine($"Model calls: {outcomeReport.ModelCalls}; modified file: {targetPath}");
+            string changedPath = gitStatus.Contains(targetPath, StringComparison.Ordinal)
+                ? targetPath : "(none; expression unchanged)";
+            Console.WriteLine($"Model calls: {outcomeReport.ModelCalls}; modified file: {changedPath}");
             Console.WriteLine(gitStatus);
             Console.WriteLine($"Local report: {Path.Combine(runDirectory, "report.json")}");
             return outcomeReport.Success ? 0 : 1;
@@ -707,6 +709,24 @@ internal static class CodingCommand
                     || resultJson.GetProperty("status").GetString() != "generated"
                     || resultJson.GetProperty("attempts").GetArrayLength() != 2)
                     throw new InvalidOperationException("RetryBudget report task/asset mapping changed.");
+            }
+
+            // A task can pass all tests while proposing an expression already
+            // present in source. In that case no file is modified.
+            string unchangedReportDir = Path.Combine(temp, "retry-unchanged-report");
+            Directory.CreateDirectory(unchangedReportDir);
+            await WriteReportAsync(unchangedReportDir, "offline-stub", "trusted-baseline",
+                retryRoot, retryResult, "", "offline-fake",
+                retryPrompt, retryPolicy, retryTask);
+            using (JsonDocument unchangedReport = JsonDocument.Parse(
+                await File.ReadAllTextAsync(Path.Combine(
+                    unchangedReportDir, "report.json"))))
+            {
+                JsonElement unchanged = unchangedReport.RootElement;
+                if (unchanged.GetProperty("modifiedPath").ValueKind != JsonValueKind.Null
+                    || unchanged.GetProperty("status").GetString() != "generated")
+                    throw new InvalidOperationException(
+                        "Unchanged successful coding run incorrectly reports a modified file.");
             }
 
             // A hostile/unrelated model expression must not survive a failed run.
