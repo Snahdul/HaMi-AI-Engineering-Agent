@@ -201,7 +201,7 @@ internal static class CodingCommand
             || draft.Expression.Contains('\n') || draft.Expression.Contains('\r'))
         {
             errors.Add("C# expression must be a single nonempty line with at most 350 characters.");
-            return new SourceValidationRejected(errors);
+            return new SourceValidationRejected(errors.ToArray());
         }
 
         string expression = draft.Expression;
@@ -220,7 +220,7 @@ internal static class CodingCommand
 
         return errors.Count == 0
             ? new SourceValidationPassed(expression.Trim())
-            : new SourceValidationRejected(errors);
+            : new SourceValidationRejected(errors.ToArray());
     }
 
     private static string RenderSource(string expression) =>
@@ -269,6 +269,9 @@ internal static class CodingCommand
                     continue;
                 }
 
+                if (compilation is not CompilationSucceeded)
+                    throw new InvalidOperationException("Compilation returned no outcome.");
+
                 TestExecutionResult testExecution = await ExecuteTestsAsync(fixtureRoot, policy);
                 if (testExecution is TestExecutionFailed testFailed)
                 {
@@ -285,9 +288,9 @@ internal static class CodingCommand
                 Console.WriteLine($"Attempt {attempt}: build and fixed tests passed.");
                 Console.WriteLine(testsPassed.Output);
                 completed = true;
-                return new CodingRunSucceeded(calls, attempts);
+                return new CodingRunSucceeded(calls, attempts.ToArray());
             }
-            return new CodingRunExhausted(calls, attempts);
+            return new CodingRunExhausted(calls, attempts.ToArray());
         }
         finally
         {
