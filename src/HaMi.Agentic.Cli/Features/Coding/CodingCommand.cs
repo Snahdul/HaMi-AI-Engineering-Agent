@@ -321,7 +321,12 @@ internal static class CodingCommand
                 if (validation is not SourceValidationPassed valid)
                     throw new InvalidOperationException("Source validation returned no outcome.");
 
-                await File.WriteAllTextAsync(source, task.RenderSource(valid.Expression), new UTF8Encoding(false));
+                // Rebase each model attempt on the original trusted file, not
+                // the preceding failed candidate. Preserve all source trivia.
+                string updatedSource = task.ReplaceExpression(original, valid.Expression);
+                if (!string.Equals(await File.ReadAllTextAsync(source), updatedSource,
+                    StringComparison.Ordinal))
+                    await File.WriteAllTextAsync(source, updatedSource, new UTF8Encoding(false));
                 CompilationResult compilation = await CompileAsync(fixtureRoot, task, policy);
                 if (compilation is CompilationFailed compilationFailed)
                 {
@@ -531,7 +536,10 @@ internal static class CodingCommand
             approvalMode = "unattended-isolated",
             baseline,
             worktree,
-            modifiedPath = outcomeReport.Success ? policy.OnlyWritablePath : null,
+            // A correct no-op expression is a passed task, not a changed file.
+            modifiedPath = outcomeReport.Success
+                && gitStatus.Contains(policy.OnlyWritablePath, StringComparison.Ordinal)
+                    ? policy.OnlyWritablePath : null,
             gitStatus,
             timestampUtc = DateTimeOffset.UtcNow,
             attempts = outcomeReport.Attempts
@@ -628,7 +636,7 @@ internal static class CodingCommand
 
             // No partial code remains after a completely unsuccessful run.
             string target = Path.Combine(temp, "Clamp.cs");
-            string original = "// Clean placeholder after failed run.\n";
+            string original = await File.ReadAllTextAsync(Path.Combine(sourceDir, "Clamp.cs"));
             await File.WriteAllTextAsync(target, original);
             CodingRunResult exhausted = await ExecuteAttemptsAsync(
                 temp, Path.Combine(temp, "Clamp.cs"), CodingTaskDefinition.Clamp, template, policy,
@@ -676,7 +684,9 @@ internal static class CodingCommand
                 || retryReport.Attempts.Count != 2
                 || retryReport.Attempts[0].Status != "tests_failed"
                 || retryReport.Attempts[1].Status != "passed"
-                || !File.ReadAllText(retrySource).Contains(retryExpression, StringComparison.Ordinal))
+                || await File.ReadAllTextAsync(retrySource) != await File.ReadAllTextAsync(
+                    Path.Combine(repo, retryTask.TargetPath.Replace('/',
+                        Path.DirectorySeparatorChar))))
                 throw new InvalidOperationException(
                     "Production RetryBudget coding task did not recover using real compiler/tests.");
 
