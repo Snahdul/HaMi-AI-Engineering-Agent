@@ -27,6 +27,7 @@ internal sealed class CodingExecutionPolicy
     public int MaxOutputTokens { get; set; }
     public int ProcessTimeoutSeconds { get; set; }
     public int ApiTimeoutSeconds { get; set; }
+    public int MaxFeedbackCharacters { get; set; }
 
     public string Sha256 { get; private set; } = "";
 
@@ -79,7 +80,8 @@ internal sealed class CodingExecutionPolicy
         if (MaxModelCalls is < 1 or > 3
             || MaxOutputTokens is < 128 or > 1000
             || ProcessTimeoutSeconds is < 10 or > 110
-            || ApiTimeoutSeconds is < 10 or > 240)
+            || ApiTimeoutSeconds is < 10 or > 240
+            || MaxFeedbackCharacters is < 128 or > 4096)
             throw new InvalidOperationException("Coding policy exceeds supported resource limits.");
     }
 
@@ -89,6 +91,7 @@ internal sealed class CodingExecutionPolicy
         if (actual.MaxModelCalls != 3
             || actual.MaxOutputTokens != 1000
             || actual.OnlyWritablePath != SupportedWritePath
+            || actual.MaxFeedbackCharacters != 1600
             || actual.Sha256.Length != 64)
             throw new InvalidOperationException("Default coding policy does not match the test fixture.");
 
@@ -112,11 +115,13 @@ internal sealed class CodingExecutionPolicy
             string tighter = baseline
                 .Replace("\"maxModelCalls\": 3", "\"maxModelCalls\": 2", StringComparison.Ordinal)
                 .Replace("\"maxOutputTokens\": 1000", "\"maxOutputTokens\": 500", StringComparison.Ordinal)
-                .Replace("\"processTimeoutSeconds\": 110", "\"processTimeoutSeconds\": 30", StringComparison.Ordinal);
+                .Replace("\"processTimeoutSeconds\": 110", "\"processTimeoutSeconds\": 30", StringComparison.Ordinal)
+                .Replace("\"maxFeedbackCharacters\": 1600", "\"maxFeedbackCharacters\": 512", StringComparison.Ordinal);
             File.WriteAllText(target, tighter);
             CodingExecutionPolicy reduced = Load(temp);
             if (reduced.MaxModelCalls != 2 || reduced.MaxOutputTokens != 500
-                || reduced.ProcessTimeoutSeconds != 30)
+                || reduced.ProcessTimeoutSeconds != 30
+                || reduced.MaxFeedbackCharacters != 512)
                 throw new InvalidOperationException("Tighter declarative policy was not applied.");
 
             // Fail closed when a human typo or accidental widening is introduced.
@@ -135,6 +140,10 @@ internal sealed class CodingExecutionPolicy
                 baseline.Replace("\"version\": 1", "\"version\": 2", StringComparison.Ordinal),
                 baseline.Replace("\"apiTimeoutSeconds\": 240",
                     "\"apiTimeoutSeconds\": 241", StringComparison.Ordinal),
+                baseline.Replace("\"maxFeedbackCharacters\": 1600",
+                    "\"maxFeedbackCharacters\": 4097", StringComparison.Ordinal),
+                baseline.Replace("\"maxFeedbackCharacters\": 1600",
+                    "\"maxFeedbackCharacters\": 0", StringComparison.Ordinal),
                 baseline.Replace("\"version\": 1",
                     "\"version\": 1,\n  \"unexpectedSetting\": true", StringComparison.Ordinal)
             })

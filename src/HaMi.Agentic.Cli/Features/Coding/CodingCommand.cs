@@ -53,6 +53,7 @@ internal static class CodingCommand
                 Console.WriteLine($"Shell/GitHub writes: {policy.AllowShellCommands}/{policy.AllowGitHubWrites}");
                 Console.WriteLine($"Model calls: {policy.MaxModelCalls}; output tokens: {policy.MaxOutputTokens}");
                 Console.WriteLine($"Process/API timeout: {policy.ProcessTimeoutSeconds}/{policy.ApiTimeoutSeconds} seconds");
+                Console.WriteLine($"Untrusted feedback budget: {policy.MaxFeedbackCharacters} characters");
                 Console.WriteLine($"Policy SHA-256: {policy.Sha256}");
                 return 0;
             }
@@ -240,7 +241,7 @@ internal static class CodingCommand
         {
             for (int attempt = 1; attempt <= policy.MaxModelCalls; attempt++)
             {
-                CodingPrompt prompt = promptTemplate.Render(feedback);
+                CodingPrompt prompt = promptTemplate.Render(feedback, policy.MaxFeedbackCharacters);
                 CodingDraft draft = await generate(prompt);
                 calls++;
                 List<string> errors = ValidateDraft(draft);
@@ -324,7 +325,9 @@ internal static class CodingCommand
         }
         string text = await stdout + "\n" + await stderr;
         // No arbitrary model-provided command line or arguments are ever used here.
-        return new ProcessResult(process.ExitCode, text.Length <= 1600 ? text : text[^1600..]);
+        return new ProcessResult(process.ExitCode,
+            text.Length <= policy.MaxFeedbackCharacters
+                ? text : text[^policy.MaxFeedbackCharacters..]);
     }
 
     private static async Task<string> GitAsync(string directory, params string[] args)
