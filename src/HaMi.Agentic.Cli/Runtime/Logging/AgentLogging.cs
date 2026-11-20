@@ -142,6 +142,7 @@ internal static class AgentLoggingSelfTest
         {
             string baseline = Emit(defaults, Path.Combine(temp, "default"));
             Ensure(baseline.Contains("ExpressionRejected", StringComparison.Ordinal)
+                && baseline.Contains("CodingRunFailed", StringComparison.Ordinal)
                 && baseline.Contains("DecisionRecorded", StringComparison.Ordinal)
                 && !baseline.Contains("AttemptSucceeded", StringComparison.Ordinal)
                 && !baseline.Contains("RunSucceeded", StringComparison.Ordinal),
@@ -203,7 +204,7 @@ internal static class AgentLoggingSelfTest
 
             Console.WriteLine("Structured logging self-test passed: "
                 + "defaults success=false/decisions=true, all four toggle combinations, "
-                + "correlated JSON events, configured rollover/retention and safe paths.");
+                + "correlated failure events, configured rollover/retention and safe paths.");
         }
         finally
         {
@@ -252,6 +253,16 @@ internal static class AgentLoggingSelfTest
             });
 
             CodingLogEvents.ExpressionRejected(logger, 1, "invalid_expression");
+            // Exercise a terminal failure *after* a prior event while the same
+            // correlation scope is still active, as in the Coding command's catch.
+            try
+            {
+                throw new OperationCanceledException("Untrusted message must not be logged");
+            }
+            catch (OperationCanceledException ex)
+            {
+                CodingLogEvents.RunFailed(logger, ex.GetType().Name);
+            }
             if (settings.LogDecisionSummaries)
                 CodingLogEvents.DecisionRecorded(logger, "CLAMP_BOUNDARY",
                     "Trusted fixed fixture", "Generate bounded Clamp expression",
