@@ -131,8 +131,19 @@ internal sealed class CodingPromptTemplate
             || second.User.Contains("{{feedback}}", StringComparison.Ordinal))
             throw new InvalidOperationException("Prompty asset was not loaded and rendered correctly.");
 
+        // Canonicalize before creating mutation fixtures: the working tree can use
+        // CRLF on Windows while all negative test patterns are expressed with LF.
         string original = File.ReadAllText(Path.Combine(repository,
-            RelativePath.Replace('/', Path.DirectorySeparatorChar)));
+            RelativePath.Replace('/', Path.DirectorySeparatorChar)))
+            .Replace("\r\n", "\n", StringComparison.Ordinal);
+
+        // The real parser must also accept a Windows CRLF asset.
+        CodingPromptTemplate windowsAsset = Parse(
+            original.Replace("\n", "\r\n", StringComparison.Ordinal));
+        if (windowsAsset.Render(null).User != first.User
+            || windowsAsset.Render(null).System != first.System)
+            throw new InvalidOperationException("Prompty CRLF handling is inconsistent.");
+
         foreach (string modified in new[]
         {
             original.Replace("name: clamp-expression", "name: other-task", StringComparison.Ordinal),
