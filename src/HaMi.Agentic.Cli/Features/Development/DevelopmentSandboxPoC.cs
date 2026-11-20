@@ -219,7 +219,9 @@ internal static class DevelopmentSandboxPoC
 
     private static void ValidateNetworkPolicy(SandboxProcessResult result)
     {
-        if (result.ExitCode != 0
+        // Docker sbx policy check returns exit code 1 when access is denied.
+        // Exit code 0 means allowed and must always fail the security gate.
+        if (result.ExitCode != 1
             || !result.Output.Contains("Denied:", StringComparison.Ordinal)
             || !result.Output.Contains("no matching allow rule (default deny)", StringComparison.Ordinal))
             throw new InvalidOperationException("Sandbox network denial could not be confirmed.");
@@ -281,7 +283,7 @@ internal static class DevelopmentSandboxPoC
             inspection.Replace("State: running (10s)", "State: stopped", StringComparison.Ordinal), ""));
         ValidateInspection(new SandboxProcessResult(0,
             inspection.Replace("State: running (10s)", "State: stopped (15m)", StringComparison.Ordinal), ""));
-        ValidateNetworkPolicy(new SandboxProcessResult(0,
+        ValidateNetworkPolicy(new SandboxProcessResult(1,
             "Denied: api.github.com:443\nReason: no matching allow rule (default deny)", ""));
 
         foreach (string unsafeInspection in new[]
@@ -297,8 +299,13 @@ internal static class DevelopmentSandboxPoC
 
         ExpectRejected(() => ValidateNetworkPolicy(new SandboxProcessResult(0,
             "Allowed: api.github.com:443", "")));
+        // Even text claiming denial must fail if the CLI returned success (allowed).
+        ExpectRejected(() => ValidateNetworkPolicy(new SandboxProcessResult(0,
+            "Denied: api.github.com:443\nReason: no matching allow rule (default deny)", "")));
         ExpectRejected(() => ValidateNetworkPolicy(new SandboxProcessResult(1,
             "Denied: api.github.com:443", "")));
+        ExpectRejected(() => ValidateNetworkPolicy(new SandboxProcessResult(2,
+            "Denied: api.github.com:443\nReason: no matching allow rule (default deny)", "")));
 
         if (!SandboxReport.Parse("""{"schemaVersion":1,"buildExitCode":0,"testExitCode":0,"elapsedSeconds":1}""").Success
             || SandboxReport.Parse("""{"schemaVersion":1,"buildExitCode":0,"testExitCode":1,"elapsedSeconds":1}""").Success)
