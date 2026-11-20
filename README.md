@@ -18,14 +18,14 @@ Die Methodik und ihre Erkenntnisse werden im eigenständigen [HaMi AI Engineerin
 
 - Git sowie das .NET 11 SDK (siehe `global.json`)
 - Eine eigene OpenAI-API-Berechtigung mit Guthaben (separat von ChatGPT Plus)
-- Der Repository-Checkout auf dem Branch mit der MVP-Implementierung
+- Der aktuelle Repository-Checkout auf `main` (enthält die freigegebene MVP-Implementierung)
 
 ### Erster lokaler Lauf (PowerShell)
 
 ```powershell
 git clone https://github.com/Snahdul/HaMi-AI-Engineering-Agent.git
 cd HaMi-AI-Engineering-Agent
-git switch feature/issue6-first-replay-cli
+git switch main
 
 dotnet --version
 dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release
@@ -35,12 +35,15 @@ dotnet run --project src/HaMi.Agentic.Cli -- --help
 $secret = Read-Host "OpenAI API-Schlüssel" -AsSecureString
 $env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new("", $secret).Password
 dotnet run --project src/HaMi.Agentic.Cli -- --repo . --model gpt-5.4-mini
+
+# Alternative für einen lokal unbeaufsichtigten Replay (keine GitHub-Schreibrechte):
+# dotnet run --project src/HaMi.Agentic.Cli -- --repo . --model gpt-5.4-mini --unattended
 Remove-Item Env:OPENAI_API_KEY
 ```
 
-Die CLI prüft den Repository-Ursprung und den historischen Commit, erstellt einen separaten lokalen **detached Worktree** im temporären Verzeichnis, sendet ausschließlich den kuratierten Auftrag und die drei ursprünglichen öffentlichen Quellvorlagen an das Modell und fordert vor dem Schreiben eine ausdrückliche Bestätigung (`JA`).
+Die CLI prüft den Repository-Ursprung und den historischen Commit, erstellt einen separaten lokalen **detached Worktree** im temporären Verzeichnis und sendet ausschließlich den kuratierten Auftrag und die drei ursprünglichen öffentlichen Quellvorlagen an das Modell. **Standardmäßig** fordert sie vor dem Schreiben weiterhin ausdrücklich `JA`. **Optional** überspringt `--unattended` nur diesen lokalen Freigabepunkt, wenn `--repo` explizit gesetzt wurde, die fachliche Validierung erfolgreich ist und der abgetrennte historische Worktree sauber auf dem erwarteten Commit steht. Es werden ausschließlich die drei allowlisteten Dateien dort geschrieben; kein Push, Merge, Deployment und keine Ausführung von Modell-Shellbefehlen.
 
-Anschließend validiert sie die drei erzeugten Dateien auf YAML-Struktur und fachliche Pflichtabschnitte. Bei Fehlern bleibt der historische Worktree unverändert. Ergebnis und Prüfstatus werden ausschließlich lokal in `report.json` festgehalten; ein erfolgreicher Replay-Versuch ist **noch nicht** behauptet. Die CLI führt keinen fremden generierten Code und keine vom Modell ausgegebenen Shell-Kommandos aus.
+Sie validiert die drei erzeugten Dateien auf YAML-Struktur und fachliche Pflichtabschnitte. Bei Fehlern bleibt der historische Worktree unverändert. Ergebnis und Prüfstatus werden ausschließlich lokal in `report.json` festgehalten, einschließlich `approvalMode` (`interactive` oder `unattended-isolated`) und `modelCalls`. **Der historische MVP-0.1-Replay wurde bereits in [Issue #5](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/5) technisch und fachlich geprüft und abgeschlossen.** Diese Bewertung gilt für den engen Referenzfall und ersetzt keinen Test allgemeiner autonomer Programmieraufgaben.
 
 ### Fachliche Validierung ohne zusätzlichen Modellaufruf
 
