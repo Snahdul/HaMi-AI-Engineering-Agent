@@ -47,3 +47,24 @@ jobs:
             exit 1
           fi
           echo "Expected rejection confirmed"
+
+      - name: Verify unattended replay preflight without model access
+        shell: bash
+        run: |
+          set +e
+          output="$(dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --unattended 2>&1)"
+          result=$?
+          set -e
+          if [ "$result" -ne 2 ] || ! grep -Fq -- "--unattended requires explicit --repo" <<< "$output"; then
+            echo "::error::Unattended mode did not reject an implicit repository before an API call"
+            exit 1
+          fi
+          set +e
+          output="$(dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --unattended --check . 2>&1)"
+          result=$?
+          set -e
+          if [ "$result" -ne 2 ] || ! grep -Fq -- "cannot be combined with read-only --check" <<< "$output"; then
+            echo "::error::Unattended mode did not reject the conflicting read-only option"
+            exit 1
+          fi
+          echo "Unattended preflight guards verified without API key or network calls"
