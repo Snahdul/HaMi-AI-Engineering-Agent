@@ -143,6 +143,39 @@ sind weiterhin deterministisch in Host-/Policy-Prüfungen zu erzwingen.
 
 [Bedrohungsmodell und Sicherheitsgrenzen](prompt-injection-threat-model.md).
 
+## Fachlich benannte Ergebnisse mit C# 15 Unions
+
+Erwartete fachliche Ausgänge eines **einzelnen Vertical Slices** werden mit
+nominalen C#-15-Union-Typen modelliert, nicht pauschal mit einem globalen
+`Result<T>` für sämtliche APIs. Die Namen sind anwendungsfallbezogen:
+`SourceValidationResult`, `CompilationResult`, `TestExecutionResult`,
+`CodingAttemptResult` und `CodingRunResult`. Jeder Union-Case bekommt
+einen eindeutigen fachlichen Namen und erforderliche Diagnoseinformationen.
+
+Die Coding-Implementierung liegt in
+[`Features/Coding/CodingResults.cs`](../src/HaMi.Agentic.Cli/Features/Coding/CodingResults.cs).
+Der tatsächlich benutzte Ablauf differenziert Quellcode-Ablehnung, Compilerfehler,
+fehlgeschlagene Tests und erfolgreiche Versuche. `CodingRunSucceeded` und
+`CodingRunExhausted` sind die einzigen regulären Gesamtausgänge. Die
+Ausführung kann bei unerwarteten Infrastruktur-/Programmfehlern weiterhin
+mit einer Exception abbrechen; diese Fehler werden nicht als fiktive
+fachliche Ergebnisse kaschiert.
+
+**Result vs. Report:** `CodingRunResult` beschreibt den Zustand des
+Auftrags. `CodingRunReport` ist ein gesondertes, stabiles
+Kompatibilitäts-/Auditmodell. Die Union-Fälle werden explizit auf die
+historischen `report.json`-Felder projiziert (Status, Versuchsliste und
+boolesche Flags), ohne neue widersprüchliche Zustände im fachlichen
+Ablauf zu ermöglichen. Die vorhandenen Berichtsfelder bleiben erhalten.
+
+**Regeln:** Compiler-geprüfte `switch`-Abdeckung ohne generischen Catch-all;
+immutable Snapshots der Versuche, keine globale Super-Union; keine
+Unions in fremde SDK-Schnittstellen pressen. Für sehr heiße
+Werttypenpfade müssten mögliche Boxing-Kosten untersucht werden.
+Die neue Struktur wird mit Offline-Tests für **alle** Union-Fälle,
+die bestehende JSON-Projektion, echte Compiler-/Testkorrekturen und
+Rollback abgesichert.
+
 ## Qualitätsgates je Vertical Slice
 
 1. **Vertrag und Architektur**: Scope, erlaubte Pfade, Modulgrenzen, Abhängigkeiten und Definition of Done prüfen.
