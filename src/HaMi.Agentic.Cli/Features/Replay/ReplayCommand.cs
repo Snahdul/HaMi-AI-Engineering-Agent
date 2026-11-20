@@ -21,10 +21,22 @@ internal static class ReplayCommand
     {
         if (args.Contains("--help", StringComparer.Ordinal))
         {
-            Console.WriteLine("Usage: dotnet run --project src/HaMi.Agentic.Cli -- --repo <local-clone> [--model gpt-5.4-mini]");
+            Console.WriteLine("Usage: dotnet run --project src/HaMi.Agentic.Cli -- --repo <local-clone> [--model gpt-5.4-mini] [--unattended]");
             Console.WriteLine("       dotnet run --project src/HaMi.Agentic.Cli -- --check <existing-worktree> (no API call)");
             Console.WriteLine("Required environment variable: OPENAI_API_KEY. No GitHub writes or shell tool access for the model.");
             return 0;
+        }
+
+        bool unattended = args.Contains("--unattended", StringComparer.Ordinal);
+        if (unattended && args.Contains("--check", StringComparer.Ordinal))
+        {
+            Console.Error.WriteLine("--unattended cannot be combined with read-only --check.");
+            return 2;
+        }
+        if (unattended && !args.Contains("--repo", StringComparer.Ordinal))
+        {
+            Console.Error.WriteLine("--unattended requires explicit --repo <local-clone>.");
+            return 2;
         }
 
         // Re-check previously generated files without Git changes or additional API charges.
@@ -120,18 +132,34 @@ internal static class ReplayCommand
             {
                 Console.Error.WriteLine("Validation failed. Nothing will be written:");
                 foreach (string error in errors) Console.Error.WriteLine($"- {error}");
-                await WriteReportAsync(runDir, model, worktree, "validation_failed", draft, errors, modelCalls: modelCalls);
+                await WriteReportAsync(runDir, model, worktree, "validation_failed", draft, errors, modelCalls: modelCalls,
+                    approvalMode: unattended ? "unattended-isolated" : "interactive");
                 Console.Error.WriteLine($"Local validation report: {Path.Combine(runDir, "report.json")}");
                 return 1;
             }
 
-            Console.Write("Write these three validated files to the isolated worktree? Type JA: ");
-            string? approval = Console.ReadLine();
-            if (!string.Equals(approval, "JA", StringComparison.Ordinal))
+            if (unattended)
             {
-                await WriteReportAsync(runDir, model, worktree, "not_approved", draft, [], modelCalls: modelCalls);
-                Console.WriteLine("No model-generated files were written.");
-                return 2;
+                // Only bypass the interactive local-file prompt inside this freshly created
+                // detached historical worktree. This does not authorize GitHub writes.
+                string head = (await GitAsync(worktree, "rev-parse", "HEAD")).Trim();
+                string state = await GitAsync(worktree, "status", "--porcelain", "--untracked-files=all");
+                if (!string.Equals(head, BaseCommit, StringComparison.OrdinalIgnoreCase)
+                    || !string.IsNullOrWhiteSpace(state))
+                    throw new InvalidOperationException("Refusing unattended writes: historical worktree is not clean at the expected baseline.");
+                Console.WriteLine("Unattended local mode: validation passed; writing allowlisted files to the isolated worktree.");
+            }
+            else
+            {
+                Console.Write("Write these three validated files to the isolated worktree? Type JA: ");
+                string? approval = Console.ReadLine();
+                if (!string.Equals(approval, "JA", StringComparison.Ordinal))
+                {
+                    await WriteReportAsync(runDir, model, worktree, "not_approved", draft, [], modelCalls: modelCalls,
+                        approvalMode: "interactive");
+                    Console.WriteLine("No model-generated files were written.");
+                    return 2;
+                }
             }
 
             foreach (ModelFile file in draft.Files ?? [])
@@ -142,7 +170,8 @@ internal static class ReplayCommand
             }
 
             string gitStatus = await GitAsync(worktree, "status", "--short", "--untracked-files=all");
-            await WriteReportAsync(runDir, model, worktree, "generated", draft, [], gitStatus, modelCalls);
+            await WriteReportAsync(runDir, model, worktree, "generated", draft, [], gitStatus, modelCalls,
+                approvalMode: unattended ? "unattended-isolated" : "interactive");
             Console.WriteLine("Files written to isolated worktree. Nothing pushed or merged.");
             Console.WriteLine(gitStatus);
             Console.WriteLine($"Local report: {Path.Combine(runDir, "report.json")}");
@@ -375,7 +404,8 @@ internal static class ReplayCommand
     }
 
     private static Task WriteReportAsync(string runDir, string model, string worktree, string status,
-        ModelDraft draft, IReadOnlyList<string> errors, string? gitStatus = null, int modelCalls = 1)
+        ModelDraft draft, IReadOnlyList<string> errors, string? gitStatus = null, int modelCalls = 1,
+        string approvalMode = "interactive")
     {
         var report = new
         {
@@ -383,6 +413,7 @@ internal static class ReplayCommand
             status,
             model,
             modelCalls,
+            approvalMode,
             baseline = BaseCommit,
             worktree,
             timestampUtc = DateTimeOffset.UtcNow,
