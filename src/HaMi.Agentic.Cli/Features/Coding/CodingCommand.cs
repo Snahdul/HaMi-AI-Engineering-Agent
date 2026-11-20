@@ -1,3 +1,4 @@
+using HaMi.Agentic.Cli.Runtime;
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
@@ -57,10 +58,10 @@ internal static class CodingCommand
             return 2;
         }
 
-        string? key = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        string? key = RuntimeSettings.GetApiKey();
         if (string.IsNullOrWhiteSpace(key))
         {
-            Console.Error.WriteLine("OPENAI_API_KEY is not set; no coding run started.");
+            Console.Error.WriteLine("No API key configured (OPENAI_API_KEY or HaMi-AI-Engineering-Agent-Key); no coding run started.");
             return 2;
         }
 
@@ -74,7 +75,7 @@ internal static class CodingCommand
                 throw new InvalidOperationException("Coding mode is restricted to the Agent repository.");
 
             string baseline = (await GitAsync(repo, "rev-parse", "refs/heads/main")).Trim();
-            runDirectory = Path.Combine(Path.GetTempPath(), "hami-agent-coding",
+            runDirectory = Path.Combine(RuntimeSettings.GetWorktreeRoot(repo), "hami-agent-coding",
                 $"mvp03-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
             Directory.CreateDirectory(runDirectory);
             string worktree = Path.Combine(runDirectory, "worktree");
@@ -400,7 +401,7 @@ internal static class CodingCommand
             throw new InvalidOperationException("Valid expression was rejected.");
 
         string sourceDir = Path.Combine(repo, FixtureDirectory.Replace('/', Path.DirectorySeparatorChar));
-        string temp = Path.Combine(Path.GetTempPath(), "hami-agent-coding-selftest", Guid.NewGuid().ToString("N"));
+        string temp = Path.Combine(RuntimeSettings.GetWorktreeRoot(repo), "hami-agent-coding-selftest", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(temp);
         try
         {
