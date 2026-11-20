@@ -5,7 +5,6 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Serilog;
 using Serilog.Events;
-using Serilog.Extensions.Logging;
 using Serilog.Formatting.Compact;
 using HaMi.Agentic.Cli.Features.Coding;
 
@@ -102,7 +101,10 @@ internal sealed class AgentLoggingSession : IDisposable
         {
             builder.ClearProviders();
             builder.SetMinimumLevel(LogLevel.Trace);
-            builder.AddProvider(new SerilogLoggerProvider(sink, dispose: true));
+            // AddSerilog(..., dispose: true) registers a DI-owned provider via a
+            // factory. AddProvider(instance) leaves the externally created
+            // singleton undisposed; on Windows the .clef file then remains locked.
+            builder.AddSerilog(sink, dispose: true);
         });
     }
 
