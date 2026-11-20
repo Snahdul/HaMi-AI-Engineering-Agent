@@ -108,6 +108,9 @@ jobs:
       - name: Validate coding agent with real compiler, tests and automated correction (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test --repo .
 
+      - name: Test Microsoft.Extensions.AI IChatClient coding adapter offline
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test-ai --repo .
+
       - name: Reject live coding without API key
         shell: bash
         run: |
