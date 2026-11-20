@@ -50,23 +50,43 @@ internal sealed record CodingTaskDefinition(
         }
     }
 
-    public string RenderSource(string expression) => Id switch
+    /// <summary>
+    /// Replace only the expression of the approved expression-bodied method.
+    /// Preserve XML comments, whitespace and existing line endings.
+    /// </summary>
+    public string ReplaceExpression(string originalSource, string expression)
     {
-        "clamp-kata" =>
-            "// Fixed C# source scaffold. Only the expression after => is model-generated.\n"
-            + "public static class ClampKata\n{\n"
-            + "    public static int Clamp(int value, int min, int max) => "
-            + expression.Trim() + ";\n"
-            + "}\n",
-        "retry-budget" =>
-            "namespace HaMi.Agentic.Cli.Features.Coding;\n\n"
-            + "// Fixed trusted scaffold: the model can change only the expression.\n"
-            + "internal static class RetryBudget\n{\n"
-            + "    internal static bool HasAnotherAttempt(int attempt, int maxCalls) => "
-            + expression.Trim() + ";\n"
-            + "}\n",
-        _ => throw new InvalidOperationException("Unsupported coding task.")
-    };
+        string signature = Id switch
+        {
+            "clamp-kata" => "public static int Clamp(int value, int min, int max) =>",
+            "retry-budget" => "internal static bool HasAnotherAttempt(int attempt, int maxCalls) =>",
+            _ => throw new InvalidOperationException("Unsupported coding task.")
+        };
+
+        // Never patch a missing/ambiguous trusted scaffold.
+        int signatureOffset = originalSource.IndexOf(signature, StringComparison.Ordinal);
+        if (signatureOffset < 0
+            || originalSource.LastIndexOf(signature, StringComparison.Ordinal) != signatureOffset)
+            throw new InvalidOperationException("Expected exactly one approved method signature.");
+
+        int valueStart = signatureOffset + signature.Length;
+        int terminator = originalSource.IndexOf(';', valueStart);
+        if (terminator < 0)
+            throw new InvalidOperationException("Approved method has no expression terminator.");
+
+        // Preserve whitespace around the expression, including CRLF.
+        int beginning = valueStart;
+        while (beginning < terminator && char.IsWhiteSpace(originalSource[beginning]))
+            beginning++;
+        int ending = terminator;
+        while (ending > beginning && char.IsWhiteSpace(originalSource[ending - 1]))
+            ending--;
+
+        if (beginning == ending)
+            throw new InvalidOperationException("Approved method expression is missing.");
+
+        return originalSource[..beginning] + expression.Trim() + originalSource[ending..];
+    }
 
     public static void SelfTest()
     {
@@ -79,10 +99,51 @@ internal sealed record CodingTaskDefinition(
             || Clamp.AllowedIdentifiers.Contains("maxCalls"))
             throw new InvalidOperationException("Coding task allowlist accepted an invalid task.");
 
-        string source = RetryBudget.RenderSource(
-            "attempt >= 1 && maxCalls >= 1 && attempt < maxCalls");
-        if (!source.Contains("internal static bool HasAnotherAttempt(", StringComparison.Ordinal)
-            || !source.Contains("attempt < maxCalls;", StringComparison.Ordinal))
-            throw new InvalidOperationException("Retry task did not render the fixed scaffold.");
+        // The no-op must be byte-identical; changing the expression must not
+        // remove XML documentation or normalize Windows CRLF line endings.
+        string retryBaseline =
+            "namespace HaMi.Agentic.Cli.Features.Coding;\r\n"
+            + "\r\n/// <summary>Keep this documentation.</summary>\r\n"
+            + "internal static class RetryBudget\r\n{\r\n"
+            + "    internal static bool HasAnotherAttempt(int attempt, int maxCalls) =>\r\n"
+            + "        attempt >= 1 && maxCalls >= 1 && attempt < maxCalls;\r\n"
+            + "}\r\n";
+        const string originalExpression = "attempt >= 1 && maxCalls >= 1 && attempt < maxCalls";
+        const string alternative = "attempt > 0 && maxCalls > 0 && attempt < maxCalls";
+        string changed = RetryBudget.ReplaceExpression(retryBaseline, alternative);
+        string expected = retryBaseline.Replace(originalExpression, alternative,
+            StringComparison.Ordinal);
+        if (changed != expected
+            || RetryBudget.ReplaceExpression(retryBaseline, originalExpression) != retryBaseline
+            || !changed.Contains("/// <summary>Keep this documentation.</summary>\r\n",
+                StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                "Coding source patch did not preserve comments, CRLF or no-op expression.");
+
+        const string clampBaseline =
+            "// Keep original source comments.\npublic static class ClampKata\n{\n"
+            + "    public static int Clamp(int value, int min, int max) => throw new NotImplementedException();\n}\n";
+        string clampChanged = Clamp.ReplaceExpression(clampBaseline, "value");
+        if (clampChanged != clampBaseline.Replace("throw new NotImplementedException()",
+                "value", StringComparison.Ordinal))
+            throw new InvalidOperationException("Clamp patch changed more than its expression.");
+
+        foreach (string invalid in new[]
+        {
+            retryBaseline.Replace("HasAnotherAttempt", "UnknownMethod", StringComparison.Ordinal),
+            retryBaseline + retryBaseline
+        })
+        {
+            try
+            {
+                _ = RetryBudget.ReplaceExpression(invalid, "true");
+                throw new InvalidOperationException("Ambiguous coding scaffold was accepted.");
+            }
+            catch (InvalidOperationException ex) when (
+                ex.Message == "Expected exactly one approved method signature.")
+            {
+                // Expected fail-closed result.
+            }
+        }
     }
 }
