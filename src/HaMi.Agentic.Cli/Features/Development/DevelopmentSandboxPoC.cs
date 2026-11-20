@@ -71,9 +71,28 @@ internal static class DevelopmentSandboxPoC
 
         string mainRoot = (await DevelopmentWorktreeGuard.GitAsync(
             repo, "rev-parse", "--show-toplevel")).Trim();
-        if (!SamePath(mainRoot, repo)
-            || (await DevelopmentWorktreeGuard.GitAsync(repo, "branch", "--show-current")).Trim() != "main")
-            throw new InvalidOperationException("PoC requires the trusted main checkout root.");
+        if (!SamePath(mainRoot, repo))
+            throw new InvalidOperationException("PoC requires a Git checkout root.");
+
+        // The runner may itself be tested from a detached review worktree
+        // *before* the PR is merged. Only the four trusted fixture files are
+        // ever read from refs/heads/main, never from the review worktree.
+        string mainSha = (await DevelopmentWorktreeGuard.GitAsync(
+            repo, "rev-parse", "--verify", "refs/heads/main")).Trim();
+        string fetchedMainSha = (await DevelopmentWorktreeGuard.GitAsync(
+            repo, "rev-parse", "--verify", "refs/remotes/origin/main")).Trim();
+        string sharedBase = (await DevelopmentWorktreeGuard.GitAsync(
+            repo, "merge-base", "HEAD", "refs/heads/main")).Trim();
+        if (!string.Equals(mainSha, fetchedMainSha, StringComparison.Ordinal)
+            || !string.Equals(mainSha, sharedBase, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                "Main must be up to date and an ancestor of the review checkout.");
+
+        string localChanges = await DevelopmentWorktreeGuard.GitAsync(
+            repo, "status", "--porcelain", "--untracked-files=all");
+        if (!string.IsNullOrEmpty(localChanges))
+            throw new InvalidOperationException(
+                "PoC must be run from a clean, reviewed checkout.");
 
         string origin = (await DevelopmentWorktreeGuard.GitAsync(
             repo, "remote", "get-url", "origin")).Trim();
