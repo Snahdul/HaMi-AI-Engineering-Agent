@@ -14,7 +14,9 @@ internal static class DevelopmentCommand
             Console.WriteLine("Usage: development --repo <checkout> --contract-check --contract <contracts/development/*.json>");
             Console.WriteLine("       development --repo <main-checkout> --worktree-check --contract <contracts/development/*.json> --worktree <detached-worktree>");
             Console.WriteLine("       development --repo <checkout> --self-test");
-            Console.WriteLine("Read-only checks only: no model calls, generated code execution, or Git writes.");
+            Console.WriteLine("       development --repo <main-checkout> --sandbox-poc --results-dir <absolute-local-dir>");
+            Console.WriteLine("       development --repo <checkout> --sandbox-poc-self-test");
+            Console.WriteLine("Contract checks are read-only; sandbox-poc runs only the trusted RetryBudget fixture from main in the fixed local MicroVM.");
             return 0;
         }
 
@@ -23,18 +25,22 @@ internal static class DevelopmentCommand
             string? repo = null;
             string? contractPath = null;
             string? worktree = null;
+            string? resultsDir = null;
             string? action = null;
             for (int i = 0; i < args.Length; i++)
             {
                 switch (args[i])
                 {
                     case "--self-test":
+                    case "--sandbox-poc-self-test":
+                    case "--sandbox-poc":
                     case "--contract-check":
                     case "--worktree-check":
                         if (action is not null) throw new ArgumentException("Exactly one development action required.");
                         action = args[i];
                         break;
                     case "--repo":
+                    case "--results-dir":
                     case "--contract":
                     case "--worktree":
                         string option = args[i];
@@ -43,6 +49,10 @@ internal static class DevelopmentCommand
                         string value = args[++i];
                         switch (option)
                         {
+                            case "--results-dir":
+                                if (resultsDir is not null) throw new ArgumentException("Duplicate --results-dir.");
+                                resultsDir = value;
+                                break;
                             case "--repo":
                                 if (repo is not null) throw new ArgumentException("Duplicate --repo.");
                                 repo = value;
@@ -65,6 +75,25 @@ internal static class DevelopmentCommand
             if (repo is null || action is null)
                 throw new ArgumentException("Development mode requires --repo and exactly one action.");
             repo = Path.GetFullPath(repo);
+
+            if (action == "--sandbox-poc-self-test")
+            {
+                if (contractPath is not null || worktree is not null || resultsDir is not null)
+                    throw new ArgumentException("Sandbox PoC self-test accepts only --repo.");
+                DevelopmentSandboxPoC.SelfTest();
+                Console.WriteLine("Sandbox PoC offline validation passed.");
+                return 0;
+            }
+
+            if (action == "--sandbox-poc")
+            {
+                if (contractPath is not null || worktree is not null || resultsDir is null)
+                    throw new ArgumentException("Sandbox PoC requires --results-dir and no candidate or contract.");
+                return await DevelopmentSandboxPoC.RunAsync(repo, resultsDir);
+            }
+
+            if (resultsDir is not null)
+                throw new ArgumentException("--results-dir is only supported by --sandbox-poc.");
 
             if (action == "--self-test")
             {
