@@ -241,6 +241,7 @@ internal static class AgentLoggingSelfTest
         Ensure(files.Length == 2 && files.All(f => new FileInfo(f).Length
                 <= smallFiles.FileSizeLimitBytes + 4096),
             "Serilog size rollover and retention did not enforce the configured limits.");
+        EnsureFileHandlesReleased(files);
     }
 
     private static string Emit(AgentLoggingSettings settings, string temp)
@@ -279,6 +280,7 @@ internal static class AgentLoggingSelfTest
         string[] files = Directory.GetFiles(Path.Combine(temp, settings.RelativeDirectory),
             "agent-*.clef");
         Ensure(files.Length > 0, "No log file was emitted.");
+        EnsureFileHandlesReleased(files);
         string all = string.Join("\n", files.SelectMany(File.ReadAllLines));
         foreach (string line in all.Split('\n', StringSplitOptions.RemoveEmptyEntries))
         {
@@ -293,6 +295,17 @@ internal static class AgentLoggingSelfTest
             && !all.Contains("secret", StringComparison.OrdinalIgnoreCase),
             "Logging unexpectedly contained a secret or raw prompt field.");
         return all;
+    }
+
+    private static void EnsureFileHandlesReleased(IEnumerable<string> files)
+    {
+        // Windows file-lock regression: an exclusive open must succeed after
+        // AgentLoggingSession.Dispose(), even for rolled files.
+        foreach (string path in files)
+        {
+            using var exclusive = new FileStream(path, FileMode.Open,
+                FileAccess.Read, FileShare.None);
+        }
     }
 
     private static void Ensure(bool condition, string message)
