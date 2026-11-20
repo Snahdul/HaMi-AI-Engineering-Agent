@@ -278,8 +278,7 @@ internal static class DevelopmentSandboxPoC
             """;
         ValidateInspection(new SandboxProcessResult(0, inspection, ""));
         ValidateInspection(new SandboxProcessResult(0,
-            inspection.Replace("State: running (10s)", "State: starting", StringComparison.Ordinal),
-            inspection.Replace("State: running (10s)", "State: running (not responding)", StringComparison.Ordinal), ""));
+            inspection.Replace("State: running (10s)", "State: stopped", StringComparison.Ordinal), ""));
         ValidateInspection(new SandboxProcessResult(0,
             inspection.Replace("State: running (10s)", "State: stopped (15m)", StringComparison.Ordinal), ""));
         ValidateNetworkPolicy(new SandboxProcessResult(0,
@@ -291,7 +290,8 @@ internal static class DevelopmentSandboxPoC
             inspection.Replace("Configured host mounts: none", "Configured host mounts: 1", StringComparison.Ordinal),
             inspection.Replace("MCP servers: none", "MCP servers: github", StringComparison.Ordinal),
             inspection.Replace("Secrets: none", "Secrets: 1", StringComparison.Ordinal),
-            inspection.Replace("State: running (10s)", "State: stopped", StringComparison.Ordinal)
+            inspection.Replace("State: running (10s)", "State: starting", StringComparison.Ordinal),
+            inspection.Replace("State: running (10s)", "State: running (not responding)", StringComparison.Ordinal)
         })
             ExpectRejected(() => ValidateInspection(new SandboxProcessResult(0, unsafeInspection, "")));
 
