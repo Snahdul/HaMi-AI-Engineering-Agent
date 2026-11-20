@@ -1,4 +1,5 @@
 using HaMi.Agentic.Cli.Runtime;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
@@ -201,7 +202,7 @@ internal static class CodingCommand
             || draft.Expression.Contains('\n') || draft.Expression.Contains('\r'))
         {
             errors.Add("C# expression must be a single nonempty line with at most 350 characters.");
-            return new SourceValidationRejected(errors.ToArray());
+            return new SourceValidationRejected(errors.ToImmutableArray());
         }
 
         string expression = draft.Expression;
@@ -220,7 +221,7 @@ internal static class CodingCommand
 
         return errors.Count == 0
             ? new SourceValidationPassed(expression.Trim())
-            : new SourceValidationRejected(errors.ToArray());
+            : new SourceValidationRejected(errors.ToImmutableArray());
     }
 
     private static string RenderSource(string expression) =>
@@ -288,9 +289,9 @@ internal static class CodingCommand
                 Console.WriteLine($"Attempt {attempt}: build and fixed tests passed.");
                 Console.WriteLine(testsPassed.Output);
                 completed = true;
-                return new CodingRunSucceeded(calls, attempts.ToArray());
+                return new CodingRunSucceeded(calls, attempts.ToImmutableArray());
             }
-            return new CodingRunExhausted(calls, attempts.ToArray());
+            return new CodingRunExhausted(calls, attempts.ToImmutableArray());
         }
         finally
         {
