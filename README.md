@@ -152,11 +152,57 @@ Der Bericht liegt ausschließlich lokal unter dem konfigurierten Worktree-Root i
 
 **Sicherheitsgrenze:** Das ist **kein frei programmierender Agent**. `dotnet build` und `dotnet run` sind keine OS-Sandbox für beliebigen KI-Code. Die Ausführung ist hier nur vertretbar, weil die Modellantwort auf einen kurzen C#-Ausdruck ohne Methodenaufrufe und mit einer festen, bekannten Testanwendung begrenzt wird. Für allgemeine Codegenerierung ist eine gesonderte Prozess-/Betriebssystem-Isolation erforderlich.
 
+## MVP 0.6 – zweiter begrenzter Coding-Auftrag am Agenten selbst
+
+[Issue #28](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/28)
+erweitert die fest kodierte Task-Allowlist um `retry-budget`. Anders als
+die ursprüngliche `ClampKata` bearbeitet dieser Auftrag **wirklichen
+Produktionscode des Coding-Agenten**:
+[`RetryBudget.HasAnotherAttempt`](src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs).
+Die Regel wird für die protokollierte Entscheidung verwendet, ob ein
+weiterer Korrekturversuch möglich ist. Der Host erzwingt die maximale
+Modellaufrufzahl unabhängig davon weiterhin mit seiner eigenen Schleife.
+
+Der Generator darf **ausschließlich einen kurzen C#-Ausdruck** in dieser
+vorab definierten Methode im isolierten Git-Worktree ändern. Die feste
+[RetryBudget-Testsuite](samples/RetryBudget/) bindet das echte
+Produktions-Quelltextfile über `Compile Include` ein und prüft die
+negativen und positiven Grenzen. Ein gesondertes [Prompty-Asset](prompts/coding/RetryBudget.prompty)
+und eine [Execution Policy](policies/coding/retry-budget.policy.json)
+definieren die auf diesen Task begrenzte Eingabe und Berechtigungen.
+
+**Ohne API-Kosten** – beide Task-Verträge, echte Compiler-/Testkorrekturen
+und Rollback prüfen:
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test --repo .
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --policy-check --task retry-budget --repo .
+```
+
+**Optionaler Live-Durchstich auf HaMi11 nach Merge und Freigabe** (maximal
+drei kostenpflichtige Modellaufrufe):
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --task retry-budget --repo . --unattended --ai-extensions --model gpt-5.4-mini
+```
+
+Ohne `--task` bleibt `clamp-kata` der Default. Fremde Task-IDs, fremde
+Dateipfade, unbekannte Identifier, Modelltools und freie Shell-/GitHub-
+Schreibvorgänge werden weiterhin abgelehnt. Der lokale `report.json`
+dokumentiert Task-ID, Prompt-/Policy-Fingerabdruck, Ergebnis und
+den exakt bearbeiteten Pfad. Das produktive `main` wird **nicht**
+automatisch verändert.
+
+**Abgrenzung:** Zwei ausdrücklich zugelassene Expressions sind noch
+kein allgemeiner C#-Entwicklungsagent. Beliebiger KI-generierter
+Programmcode darf auf HaMi11 nicht ohne zusätzliche OS-Sandbox
+ausgeführt werden.
+
 ## MVP 0.5 – Microsoft.Extensions.AI als optionaler Modelltransport
 
 [Issue #19](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/19) führt `Microsoft.Extensions.AI` und `Microsoft.Extensions.AI.OpenAI` **11.0.0** ein. Der Coding-Modus kann optional über `--ai-extensions` mit einem injizierten `IChatClient` arbeiten; der bisherige direkte Responses-Transport bleibt der Standard.
 
-**Prompt-Verwaltung:** Beide Coding-Transporte laden denselben versionierten Prompt aus [`prompts/coding/ClampExpression.prompty`](prompts/coding/ClampExpression.prompty). Der Datei-Loader verarbeitet bewusst nur die benötigte Prompty-Teilmenge (YAML-Metadaten, `system:`/`user:`, `{{feedback}}`), lehnt nicht unterstützte Ausdrücke ab und wird im Offline-Selbsttest geprüft. Modellberechtigungen und Ausführungslimits werden über die vertrauenswürdige, versionierte [Execution Policy](policies/coding/clamp.policy.json) konfiguriert, vor dem Lauf strikt validiert und im C#-Host durchgesetzt. Historische Replay-/Workflow-Prompts werden separat migriert.
+**Prompt-Verwaltung:** Beide Coding-Transporte laden den versionierten Prompt des ausgewählten Tasks (Standard: [`ClampExpression.prompty`](prompts/coding/ClampExpression.prompty), zweiter Task: [`RetryBudget.prompty`](prompts/coding/RetryBudget.prompty)). Der Datei-Loader verarbeitet bewusst nur die benötigte Prompty-Teilmenge (YAML-Metadaten, `system:`/`user:`, `{{feedback}}`), lehnt nicht unterstützte Ausdrücke ab und wird im Offline-Selbsttest geprüft. Modellberechtigungen und Ausführungslimits werden über die vertrauenswürdige, versionierte [Execution Policy](policies/coding/clamp.policy.json) konfiguriert, vor dem Lauf strikt validiert und im C#-Host durchgesetzt. Historische Replay-/Workflow-Prompts werden separat migriert.
 
 Der optionale Adapter überträgt dieselben Begrenzungen wie bisher: striktes JSON-Schema für `plan` und `expression`, feste Token-Grenze, **keine Tools**, maximal drei Modellversuche und beim OpenAI Responses SDK ausdrücklich `StoredOutputEnabled = false` (entspricht `store=false`). Bei jeder Modellantwort bleiben die bestehenden C#-Ausdrucksregeln, der echte Compiler/Test-Harness und die Abbruch-/Rücknahmelogik unverändert. Der verwendete Transport wird im lokalen `report.json` ausgewiesen.
 
@@ -167,7 +213,7 @@ dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --policy-check 
 dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test --repo .
 ```
 
-Diese Befehle prüfen die Policy ohne API-Kosten. Die technischen Schranken des bisher auf `Clamp` begrenzten MVP bleiben bestehen; eine Konfigurationsänderung kann nicht die Ausführung beliebigen Codes oder Shell-/GitHub-Tools freischalten. Siehe [Architekturleitlinien](docs/architecture-guidelines.md).
+Diese Befehle prüfen die Policy ohne API-Kosten. Die technischen Schranken der zwei explizit erlaubten Coding-Tasks bleiben bestehen; eine Konfigurationsänderung kann nicht die Ausführung beliebigen Codes oder Shell-/GitHub-Tools freischalten. Siehe [Architekturleitlinien](docs/architecture-guidelines.md).
 
 **Kostenloser Offline-Test (Fake-IChatClient, kein Modellaufruf):**
 
