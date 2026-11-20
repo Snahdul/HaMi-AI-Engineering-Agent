@@ -95,7 +95,8 @@ internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy p
     {
         CodingPromptTemplate.SelfTest(repository);
         CodingExecutionPolicy policy = CodingExecutionPolicy.Load(repository);
-        CodingPrompt task = CodingPromptTemplate.Load(repository).Render(null);
+        CodingPrompt task = CodingPromptTemplate.Load(repository)
+            .Render(null, policy.MaxFeedbackCharacters);
         const string validJson =
             """{"plan":"Compare the value with the bounds.","expression":"value < min ? min : value > max ? max : value"}""";
 
