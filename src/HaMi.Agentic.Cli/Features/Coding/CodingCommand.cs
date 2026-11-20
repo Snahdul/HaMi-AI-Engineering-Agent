@@ -28,8 +28,9 @@ internal static class CodingCommand
     {
         if (args.Contains("--help", StringComparer.Ordinal))
         {
-            Console.WriteLine("Usage: coding --repo <local-clone> --unattended [--model gpt-5.4-mini]");
+            Console.WriteLine("Usage: coding --repo <local-clone> --unattended [--model gpt-5.4-mini] [--ai-extensions]");
             Console.WriteLine("       coding --self-test --repo <local-clone> (offline, compiles and runs trusted tests)");
+            Console.WriteLine("       coding --self-test-ai --repo <local-clone> (offline, fake IChatClient, no API)");
             Console.WriteLine("Produces only a checked C# expression in a new detached worktree; no GitHub writes.");
             return 0;
         }
@@ -52,6 +53,20 @@ internal static class CodingCommand
             }
         }
 
+        if (args.Contains("--self-test-ai", StringComparer.Ordinal))
+        {
+            try
+            {
+                await CodingAiClient.SelfTestAsync();
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"AI adapter self-test failed: {ex.GetType().Name}: {ex.Message}");
+                return 1;
+            }
+        }
+
         if (!args.Contains("--unattended", StringComparer.Ordinal))
         {
             Console.Error.WriteLine("Coding mode requires explicit --unattended.");
@@ -67,6 +82,7 @@ internal static class CodingCommand
 
         string model = Option(args, "--model")
             ?? Environment.GetEnvironmentVariable("OPENAI_MODEL") ?? "gpt-5.4-mini";
+        bool useAiExtensions = args.Contains("--ai-extensions", StringComparer.Ordinal);
         string? runDirectory = null;
         try
         {
@@ -95,11 +111,17 @@ internal static class CodingCommand
             Console.WriteLine($"Isolated coding worktree: {worktree}");
             Console.WriteLine("Model supplies only a bounded C# expression; fixed .NET build/test commands. Maximum three model calls.");
 
+            using Microsoft.Extensions.AI.IChatClient? chatClient = useAiExtensions
+                ? CodingAiClient.CreateOpenAi(key) : null;
+            var aiGateway = chatClient is null ? null : new CodingAiClient(chatClient);
             CodingOutcome outcome = await ExecuteAttemptsAsync(fixtureRoot,
-                prompt => GenerateAsync(prompt, model, key));
+                prompt => aiGateway is null
+                    ? GenerateAsync(prompt, model, key)
+                    : GenerateWithAiAsync(aiGateway, prompt, model));
 
             string gitStatus = await GitAsync(worktree, "status", "--short", "--untracked-files=all");
-            await WriteReportAsync(runDirectory, model, baseline, worktree, outcome, gitStatus);
+            await WriteReportAsync(runDirectory, model, baseline, worktree, outcome, gitStatus,
+                useAiExtensions ? "microsoft-extensions-ai-responses" : "direct-responses");
             Console.WriteLine($"Coding run: {(outcome.Success ? "generated" : "validation_failed")}");
             Console.WriteLine($"Model calls: {outcome.ModelCalls}; modified file: {Target}");
             Console.WriteLine(gitStatus);
@@ -126,6 +148,13 @@ internal static class CodingCommand
             "ssh://git@github.com/Snahdul/HaMi-AI-Engineering-Agent",
             "ssh://git@github.com/Snahdul/HaMi-AI-Engineering-Agent.git"
         }.Contains(origin, StringComparer.OrdinalIgnoreCase);
+
+    private static async Task<CodingDraft> GenerateWithAiAsync(
+        CodingAiClient gateway, string prompt, string model)
+    {
+        CodingAiClient.CodingSuggestion result = await gateway.GenerateAsync(prompt, model);
+        return new CodingDraft(result.Plan, result.Expression);
+    }
 
     private static string? Option(string[] args, string name)
     {
@@ -353,13 +382,14 @@ internal static class CodingCommand
     }
 
     private static Task WriteReportAsync(string dir, string model, string baseline,
-        string worktree, CodingOutcome outcome, string gitStatus)
+        string worktree, CodingOutcome outcome, string gitStatus, string transport)
     {
         var report = new
         {
             task = "clamp-kata",
             status = outcome.Success ? "generated" : "validation_failed",
             model,
+            transport,
             modelCalls = outcome.ModelCalls,
             approvalMode = "unattended-isolated",
             baseline,
