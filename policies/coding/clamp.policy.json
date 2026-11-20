@@ -10,5 +10,6 @@
   "maxModelCalls": 3,
   "maxOutputTokens": 1000,
   "processTimeoutSeconds": 110,
-  "apiTimeoutSeconds": 240
+  "apiTimeoutSeconds": 240,
+  "maxFeedbackCharacters": 1600
 }
