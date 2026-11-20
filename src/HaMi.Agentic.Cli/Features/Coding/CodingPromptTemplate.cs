@@ -26,15 +26,20 @@ internal sealed class CodingPromptTemplate
     }
 
     public string Sha256 { get; }
+    public string AssetPath { get; private set; } = RelativePath;
 
     private string System { get; }
     private string UserTemplate { get; }
 
-    public static CodingPromptTemplate Load(string repository)
+    public static CodingPromptTemplate Load(
+        string repository, CodingTaskDefinition? task = null)
     {
+        task ??= CodingTaskDefinition.Clamp;
         string path = Path.Combine(repository,
-            RelativePath.Replace('/', Path.DirectorySeparatorChar));
-        return Parse(File.ReadAllText(path));
+            task.PromptAsset.Replace('/', Path.DirectorySeparatorChar));
+        CodingPromptTemplate loaded = Parse(File.ReadAllText(path), task.PromptName);
+        loaded.AssetPath = task.PromptAsset;
+        return loaded;
     }
 
     /// <summary>
@@ -67,7 +72,8 @@ internal sealed class CodingPromptTemplate
 
     private sealed record DiagnosticEnvelope(string Source, bool Truncated, string Text);
 
-    private static CodingPromptTemplate Parse(string content)
+    private static CodingPromptTemplate Parse(
+        string content, string expectedName = "clamp-expression")
     {
         if (content.Length is < 50 or > 16_384)
             throw new InvalidOperationException("Prompt asset is empty or exceeds 16 KiB.");
@@ -92,7 +98,7 @@ internal sealed class CodingPromptTemplate
             if (key is not YamlScalarNode { Value: "name" or "description" or "inputs" or "template" })
                 throw new InvalidOperationException("Unsupported Prompty frontmatter property.");
 
-        if (GetScalar(yaml, "name") != "clamp-expression")
+        if (GetScalar(yaml, "name") != expectedName)
             throw new InvalidOperationException("Unexpected prompt asset name.");
 
         if (!yaml.Children.TryGetValue(new YamlScalarNode("inputs"), out YamlNode? inputsNode)
@@ -148,6 +154,13 @@ internal sealed class CodingPromptTemplate
     {
         CodingPromptTemplate asset = Load(repository);
         CodingExecutionPolicy policy = CodingExecutionPolicy.Load(repository);
+        CodingPromptTemplate retry = Load(repository, CodingTaskDefinition.RetryBudget);
+        CodingPrompt retryPrompt = retry.Render(null, policy.MaxFeedbackCharacters);
+        if (retry.AssetPath != CodingTaskDefinition.RetryBudget.PromptAsset
+            || retry.Sha256.Length != 64
+            || !retryPrompt.User.Contains("maxCalls", StringComparison.Ordinal)
+            || !retryPrompt.System.Contains("RetryBudget.HasAnotherAttempt", StringComparison.Ordinal))
+            throw new InvalidOperationException("Retry task Prompty contract is invalid.");
         CodingPrompt first = asset.Render(null, policy.MaxFeedbackCharacters);
         CodingPrompt second = asset.Render("Fixed tests failed: expected 10 but got 11",
             policy.MaxFeedbackCharacters);
