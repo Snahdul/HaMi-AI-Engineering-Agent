@@ -19,7 +19,7 @@ internal static class DevelopmentCommand
             Console.WriteLine("       development --repo <checkout> --sandbox-run --source <snapshot-dir> --project <relative.csproj> --mode <build|run|test> --results-dir <absolute-dir>");
             Console.WriteLine("       development --repo <checkout> --sandbox-run-self-test");
             Console.WriteLine("       development --repo <checkout> --agent-self-test (offline, Akka + CLI parser)");
-            Console.WriteLine("       development --repo <checkout> --agent-run --results-dir <absolute-dir> [--contract contracts/development/agent-console-retry.json] [--source <absolute-snapshot>] [--live --model <model>]");
+            Console.WriteLine("       development --repo <checkout> --agent-run --results-dir <absolute-dir> [--contract contracts/development/agent-console-retry.json] [--live --model <model>]");
             Console.WriteLine("Agent run: model generates only Program.cs; independent ephemeral Docker MicroVM per attempt, no GitHub writes.");
             Console.WriteLine("Contract checks are read-only. sandbox-poc runs the trusted RetryBudget fixture; sandbox-run executes a bounded project snapshot only in a fresh local MicroVM.");
             return 0;
@@ -126,9 +126,10 @@ internal static class DevelopmentCommand
 
             if (action == "--agent-run")
             {
-                if (resultsDir is null || project is not null || mode is not null
-                    || worktree is not null || (model is not null && !live))
-                    throw new ArgumentException("Agent run requires --results-dir; --model only with --live.");
+                if (resultsDir is null || source is not null || project is not null
+                    || mode is not null || worktree is not null
+                    || (model is not null && !live))
+                    throw new ArgumentException("Agent run requires --results-dir and the reviewed fixture; --source is not authorized; --model only with --live.");
                 return await DevelopmentAgentCommand.RunAsync(repo,
                     contractPath, source, resultsDir, live, model);
             }
