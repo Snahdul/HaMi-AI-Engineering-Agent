@@ -43,6 +43,9 @@ internal sealed class DevelopmentIsolatedRunner(
             generatedSource, cancellationToken);
 
         cancellationToken.ThrowIfCancellationRequested();
+        // The sandbox runner owns the full MicroVM lifecycle and its bounded
+        // finally/cleanup. A coordinator deadline may prevent further retries,
+        // but must not interrupt reading the completed, auditable result.
         int cliExit = await DevelopmentSandboxRunner.RunAsync(
             repo, dir, contract.ProjectFile, contract.Mode, sandboxDir);
 
@@ -54,7 +57,7 @@ internal sealed class DevelopmentIsolatedRunner(
             throw new InvalidOperationException("Expected exactly one sandbox report per attempt.");
         string reportPath = Path.Combine(dirs[0], "report.json");
         var report = JsonSerializer.Deserialize<DevelopmentSandboxRunner.SandboxRunReport>(
-            await File.ReadAllTextAsync(reportPath, cancellationToken), JsonOptions)
+            await File.ReadAllTextAsync(reportPath, CancellationToken.None), JsonOptions)
             ?? throw new InvalidOperationException("Sandbox report could not be parsed.");
 
         bool passed = cliExit == 0 && report.Error is null
@@ -68,7 +71,7 @@ internal sealed class DevelopmentIsolatedRunner(
             : report.BuildExitCode != 0 ? "build.log" : "execution.log";
         string file = Path.Combine(dirs[0], log);
         string feedback = File.Exists(file)
-            ? await File.ReadAllTextAsync(file, cancellationToken) : "No sandbox diagnostics recorded.";
+            ? await File.ReadAllTextAsync(file, CancellationToken.None) : "No sandbox diagnostics recorded.";
         string boundedFeedback = DevelopmentSandboxRunner.SafeLogPreview(feedback);
         if (boundedFeedback.Length > 1200) boundedFeedback = boundedFeedback[..1200];
 
