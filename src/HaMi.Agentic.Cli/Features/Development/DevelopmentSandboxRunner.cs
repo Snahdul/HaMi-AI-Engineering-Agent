@@ -18,6 +18,26 @@ internal static class DevelopmentSandboxRunner
     private const int MaxOutputChars = 256 * 1024;
     private const int MaxLogPreviewChars = 4096;
     private const int MaxLogPreviewLines = 80;
+    // Host credentials must not reach sbx or the guest. The named set matches
+    // our guest policy probe. Never log secret values or environment dumps.
+    private static readonly string[] SensitiveEnvNames =
+    [
+        "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AZURE_CLIENT_SECRET",
+        "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK"
+    ];
+
+    private const string GuestEnvCheckScript =
+        "for n in OPENAI_API_KEY GITHUB_TOKEN GH_TOKEN AZURE_CLIENT_SECRET AWS_SECRET_ACCESS_KEY SSH_AUTH_SOCK; do " +
+        "case \"$n\" in " +
+        "OPENAI_API_KEY) v=${OPENAI_API_KEY-};; " +
+        "GITHUB_TOKEN) v=${GITHUB_TOKEN-};; " +
+        "GH_TOKEN) v=${GH_TOKEN-};; " +
+        "AZURE_CLIENT_SECRET) v=${AZURE_CLIENT_SECRET-};; " +
+        "AWS_SECRET_ACCESS_KEY) v=${AWS_SECRET_ACCESS_KEY-};; " +
+        "SSH_AUTH_SOCK) v=${SSH_AUTH_SOCK-};; " +
+        "esac; " +
+        "if [ -n \"$v\" ]; then printf 'NONEMPTY_CREDENTIAL_ENV=%s\\n' \"$n\"; exit 19; fi; " +
+        "done; printf 'CREDENTIAL_ENV=clean\\n';";
 
     internal sealed record SandboxRunReport(
         int SchemaVersion, string RunId, string Project, string Mode,
@@ -81,7 +101,11 @@ internal static class DevelopmentSandboxRunner
             EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(90),
                 "create", "--name", sandbox, "--template", Template,
                 "--pull", "never", "--cpus", "4", "--memory", "4g",
-                "--skills", "off", "--static-mcp", "none", "shell"), "Create sandbox");
+                "--skills", "off", "--static-mcp", "none",
+                "--env", "OPENAI_API_KEY=", "--env", "GITHUB_TOKEN=",
+                "--env", "GH_TOKEN=", "--env", "AZURE_CLIENT_SECRET=",
+                "--env", "AWS_SECRET_ACCESS_KEY=", "--env", "SSH_AUTH_SOCK=",
+                "shell"), "Create sandbox");
             createMs = watch.ElapsedMilliseconds;
             Progress(lifecycle, $"MicroVM bereit ({createMs / 1000.0:F2} s).");
 
@@ -97,6 +121,11 @@ internal static class DevelopmentSandboxRunner
                 ValidateDeny(policy, endpoint);
             }
 
+            Progress(lifecycle, "Prüfe Gast-Umgebung auf nichtleere Credential-Variablen ...");
+            SandboxProcess credentialCheck = await SbxAsync(TimeSpan.FromSeconds(20),
+                "exec", sandbox, "/bin/sh", "-c", GuestEnvCheckScript);
+            ValidateGuestCredentialPreflight(credentialCheck);
+            Progress(lifecycle, "Gast-Umgebung bestätigt: keine nichtleeren Credential-Variablen.");
             Progress(lifecycle, "Isolation bestätigt: kein Host-Mount, keine Secrets, Netzwerk gesperrt.");
             Progress(lifecycle, "Prüfe .NET SDK 11.0.100 im Gast ...");
             SandboxProcess sdk = await SbxAsync(TimeSpan.FromSeconds(40),
@@ -430,6 +459,22 @@ internal static class DevelopmentSandboxRunner
             throw new InvalidOperationException("Sandbox network is not default-deny for " + endpoint);
     }
 
+    private static void ValidateGuestCredentialPreflight(SandboxProcess result)
+    {
+        if (result.ExitCode != 0
+            || !string.Equals(result.Output.Trim(), "CREDENTIAL_ENV=clean", StringComparison.Ordinal)
+            || !string.IsNullOrEmpty(result.Error))
+        {
+            // Deliberately never include stderr or arbitrary command output:
+            // a modified guest can return text containing credentials.
+            string names = string.Join(", ", SensitiveEnvNames.Where(name =>
+                result.Output.Contains("NONEMPTY_CREDENTIAL_ENV=" + name, StringComparison.Ordinal)));
+            throw new InvalidOperationException(
+                "Guest credential environment rejected (nonempty or invalid preflight)" +
+                (names.Length == 0 ? "." : ": " + names));
+        }
+    }
+
     private static void EnsureSuccess(SandboxProcess result, string action)
     {
         if (result.ExitCode != 0)
@@ -445,6 +490,8 @@ internal static class DevelopmentSandboxRunner
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        foreach (string name in SensitiveEnvNames)
+            info.Environment.Remove(name);
         info.ArgumentList.Add("--no-input");
         foreach (string argument in arguments) info.ArgumentList.Add(argument);
         using Process process = Process.Start(info)
@@ -522,6 +569,12 @@ internal static class DevelopmentSandboxRunner
         string tooManyLines = SafeLogPreview(string.Concat(Enumerable.Repeat("line\n", MaxLogPreviewLines + 3)));
         if (!tooManyLines.Contains("[Ausgabe gekürzt;", StringComparison.Ordinal))
             throw new InvalidOperationException("Log preview line limit is not enforced.");
+
+        ValidateGuestCredentialPreflight(new SandboxProcess(0, "CREDENTIAL_ENV=clean\n", ""));
+        ExpectRejected(() => ValidateGuestCredentialPreflight(
+            new SandboxProcess(19, "NONEMPTY_CREDENTIAL_ENV=GH_TOKEN\n", "")));
+        ExpectRejected(() => ValidateGuestCredentialPreflight(
+            new SandboxProcess(0, "CREDENTIAL_ENV=clean\n", "unexpected stderr")));
 
         ValidateDeny(new SandboxProcess(1,
             "Denied: api.github.com:443\nReason: no matching allow rule (default deny)", ""),
