@@ -188,15 +188,17 @@ jobs:
       - name: Validate HaMi11 acceptance PowerShell syntax (offline)
         shell: pwsh
         run: |
-          $tokens = $null
-          $issues = $null
-          $path = Join-Path $PWD 'scripts/acceptance/Invoke-HaMiSandboxAcceptance.ps1'
-          [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$issues) | Out-Null
-          if ($issues.Count -gt 0) {
-            $issues | ForEach-Object { Write-Host "::error::$($_.Message)" }
-            exit 1
+          foreach ($file in @('Invoke-HaMiSandboxAcceptance.ps1', 'Invoke-HaMiDeveloperAcceptance.ps1')) {
+            $tokens = $null
+            $issues = $null
+            $path = Join-Path $PWD "scripts/acceptance/$file"
+            [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$issues) | Out-Null
+            if ($issues.Count -gt 0) {
+              $issues | ForEach-Object { Write-Host "::error::$($_.Message)" }
+              exit 1
+            }
+            Write-Host "Acceptance script syntax valid: $file"
           }
-          Write-Host 'Acceptance script syntax valid'
 
       - name: Compile guest security probe source without running it (offline)
         shell: pwsh
