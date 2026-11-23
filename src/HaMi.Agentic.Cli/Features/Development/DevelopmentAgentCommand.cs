@@ -1,5 +1,7 @@
 using Akka.Actor;
 using Akka.Hosting;
+using HaMi.Agentic.Cli.Runtime.Logging;
+using Microsoft.Extensions.Logging;
 using HaMi.Agentic.Cli.Runtime;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -18,34 +20,53 @@ internal static class DevelopmentAgentCommand
         string repo, string? contractPath, string? sourceDirectory,
         string resultsDirectory, bool live, string? requestedModel)
     {
+        string jobId = Guid.NewGuid().ToString("N");
+        string phase = "logging";
+        AgentLoggingSession? logging = null;
+        Microsoft.Extensions.Logging.ILogger? logger = null;
         try
         {
+            // One ILogger event is sent to both console and the rolling .clef file.
+            // The same ID names the actor job, its temporary directory and its report.
+            logging = AgentLoggingSession.Create(repo, includeConsole: true);
+            logger = logging.CreateLogger("HaMi.Agentic.Cli.Features.Development");
+            DevelopmentLogEvents.JobRequested(logger, jobId, repo, resultsDirectory,
+                live ? "live" : "offline-scripted",
+                contractPath ?? DevelopmentAgentContract.TrustedPath);
+
+            phase = "contract";
             DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, contractPath);
+            phase = "results";
             if (!Path.IsPathFullyQualified(resultsDirectory))
                 throw new InvalidOperationException("Agent results directory must be absolute.");
             if (sourceDirectory is not null)
                 throw new InvalidOperationException("First actor slice cannot override the human-reviewed source fixture.");
+
+            phase = "snapshot";
             string source = Path.Combine(repo, "samples", "SandboxCoding");
             if (!Path.IsPathFullyQualified(source))
                 throw new InvalidOperationException("Agent source snapshot must be absolute.");
-            // Verify snapshot (including symlink/junction/credential restrictions)
-            // before any model call or file staging.
             DevelopmentSandboxRunner.InspectSnapshot(source, contract.ProjectFile);
-            // Reject overlap before we create agent-job-* or spend any model call.
-            // The runner repeats this same guard for defense in depth.
+
+            phase = "storage";
             DevelopmentIsolatedRunner.ValidateStoragePaths(repo, source, resultsDirectory);
 
+            phase = "api-key";
             string? key = live ? RuntimeSettings.GetApiKey() : null;
             if (live && string.IsNullOrWhiteSpace(key))
             {
-                Console.Error.WriteLine("Agent live mode requires a configured API key; no job started.");
+                DevelopmentLogEvents.JobFailed(logger, jobId, phase, "API_KEY_MISSING",
+                    "none", "Host-API-Schluessel konfigurieren oder --live weglassen; kein Job gestartet.");
                 return 2;
             }
 
-            string runRoot = Path.Combine(resultsDirectory,
-                "agent-job-" + Guid.NewGuid().ToString("N"));
+            DevelopmentLogEvents.PreflightAccepted(logger, jobId, contract.TaskId,
+                contract.ProjectFile, contract.MaxAttempts);
+            phase = "results-allocation";
+            string runRoot = Path.Combine(resultsDirectory, "agent-job-" + jobId);
             Directory.CreateDirectory(runRoot);
 
+            phase = "generator";
             using Microsoft.Extensions.AI.IChatClient? client =
                 live ? DevelopmentAiGenerator.CreateClient(key!) : null;
             IDevelopmentCandidateGenerator generator = live
@@ -54,25 +75,27 @@ internal static class DevelopmentAgentCommand
             IDevelopmentIsolatedRunner sandbox =
                 new DevelopmentIsolatedRunner(repo, source, runRoot);
 
+            phase = "host";
             HostApplicationBuilder builder = Host.CreateApplicationBuilder();
+            // The owned job logger emits the lifecycle; suppress default host
+            // informational startup/shutdown chatter on the second pipeline.
+            builder.Logging.ClearProviders();
             builder.Services.AddAkka("hami-developer", _ => { });
             using IHost host = builder.Build();
             await host.StartAsync();
             try
             {
+                phase = "job";
                 ActorSystem system = host.Services.GetRequiredService<ActorSystem>();
-                Console.WriteLine("HaMi Developer: actor-coordinated job started; source writes only in temporary snapshots.");
-                Console.WriteLine($"Contract: {contract.TaskId}; attempts <= {contract.MaxAttempts}; model: {(live ? "live" : "offline-scripted")}");
                 DevelopmentJobReport result = await DevelopmentActorCoordinator.RunAsync(
-                    system, contract, generator, sandbox);
+                    system, contract, generator, sandbox, logger: logger, jobId: jobId);
 
+                phase = "report";
                 string jsonPath = Path.Combine(runRoot, "agent-report.json");
                 await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(result,
                     new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true }));
-                Console.WriteLine($"Agent status: {result.Status}; model calls: {result.ModelCalls}; attempts: {result.Attempts.Length}");
-                foreach (DevelopmentJobAttempt attempt in result.Attempts)
-                    Console.WriteLine($"  #{attempt.Number}: {attempt.Status}, build={attempt.BuildExitCode}, run={attempt.RunExitCode}, cleanup={attempt.CleanupSucceeded}");
-                Console.WriteLine("Agent report: " + jsonPath);
+                DevelopmentLogEvents.JobFinished(logger, jobId, result.Status,
+                    result.ModelCalls, result.Attempts.Length, jsonPath);
                 return result.Status == "passed" ? 0 : 1;
             }
             finally
@@ -84,9 +107,43 @@ internal static class DevelopmentAgentCommand
             or InvalidOperationException or UnauthorizedAccessException or JsonException
             or TimeoutException)
         {
-            // Do not log raw untrusted model/sandbox text in infrastructure errors.
-            Console.Error.WriteLine($"Agent job failed ({ex.GetType().Name}). Check the bounded job report.");
+            // Never emit raw model/sandbox data or untrusted exception messages.
+            string reason = phase switch
+            {
+                "logging" => "LOG_CONFIGURATION_INVALID",
+                "contract" => "CONTRACT_REJECTED",
+                "results" or "storage" => "RESULTS_PATH_REJECTED",
+                "snapshot" => "SNAPSHOT_REJECTED",
+                "api-key" => "API_KEY_INVALID",
+                "results-allocation" => "RESULTS_DIRECTORY_UNWRITABLE",
+                "generator" => "GENERATOR_INITIALIZATION_FAILED",
+                "host" => "HOST_START_FAILED",
+                "report" => "REPORT_WRITE_FAILED",
+                _ => "JOB_EXECUTION_FAILED"
+            };
+            string action = phase switch
+            {
+                "logging" => "config/logging.json und den externen Logpfad pruefen.",
+                "contract" => "Den versionierten, geprueften Agent-Auftrag pruefen.",
+                "results" or "storage" => "--results-dir absolut und getrennt vom Git-Repository angeben.",
+                "snapshot" => "Die freigegebene Demo-Fixture und erlaubte Dateien kontrollieren.",
+                "api-key" => "Host-API-Schluessel pruefen.",
+                "results-allocation" or "report" => "Dateiberechtigungen und freien Speicher im Ergebnisverzeichnis pruefen.",
+                "generator" => "Modell-/Provider-Konfiguration pruefen.",
+                "host" => "Akka.Hosting-Konfiguration und DI pruefen.",
+                _ => "Status der MicroVM und vorhandene Teilberichte pruefen; kein automatischer Neustart."
+            };
+            if (logger is not null)
+                DevelopmentLogEvents.JobFailed(logger, jobId, phase, reason,
+                    ex.GetType().Name, action);
+            else
+                Console.Error.WriteLine(
+                    $"Agent job {jobId} failed before logging (stage={phase}, reason={reason}, exception={ex.GetType().Name}). {action}");
             return 1;
+        }
+        finally
+        {
+            logging?.Dispose();
         }
     }
 
