@@ -696,8 +696,8 @@ kann nachträglich nicht unabhängig bewiesen werden.
 ### Agent-Logging und CLI-Bereinigung (Issue #38)
 
 Der Development-Agent schreibt korrelierte `ILogger`-Events gleichzeitig als
-lesbare Konsolenausgabe und in die bestehende rotierende Serilog-
-`.clef`-Datei unter `HAMI_AGENT_WORKTREE_ROOT/hami-agent-logs`.
+lesbare Konsolenausgabe und in die rotierenden Serilog-
+`.log`- und `.clef`-Dateien unter `HAMI_AGENT_WORKTREE_ROOT/hami-agent-logs`.
 `JobId`, Versuchsnummer, Preflight-/Sandbox-Phase, Restore-/Build-/Run-
 Exitcodes, Cleanup-Status und Retry-Entscheidung sind darin nachvollziehbar.
 Terminale Fehler nennen einen geprueften Grundcode und eine Massnahme.
