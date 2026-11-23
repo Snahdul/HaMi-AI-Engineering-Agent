@@ -9,15 +9,12 @@ namespace HaMi.Agentic.Cli.Runtime;
 /// <summary>
 /// System.CommandLine is the single parsing/dispatch boundary for named
 /// commands. Existing feature use cases remain intact while migrated.
-/// The historical option-first replay entrypoint is deliberately preserved.
+/// Replay is available only through the explicit 'replay' subcommand.
 /// </summary>
 internal static class CommandLineRouter
 {
     public static Task<int> RunAsync(string[] args)
     {
-        if (args.Length == 0 || args[0].StartsWith("--", StringComparison.Ordinal))
-            return ReplayCommand.RunAsync(args);
-
         RootCommand root = CreateRoot(args);
         return root.Parse(args).InvokeAsync();
     }
