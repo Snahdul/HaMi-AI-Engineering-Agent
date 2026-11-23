@@ -293,6 +293,17 @@ internal static class DevelopmentAgentCommand
             if (logFiles.Length == 0)
                 throw new InvalidOperationException("Development narrative file log is missing.");
 
+            string[] readableFiles = Directory.GetFiles(folder, "agent-*.log");
+            if (readableFiles.Length == 0)
+                throw new InvalidOperationException("Readable development narrative log is missing.");
+            string narrative = string.Join("\n", readableFiles.SelectMany(File.ReadAllLines));
+            int begin = narrative.IndexOf("JobRequested", StringComparison.Ordinal);
+            int failure = narrative.IndexOf("AttemptFailed", StringComparison.Ordinal);
+            int retry = narrative.IndexOf("RETRY_APPROVED", StringComparison.Ordinal);
+            int finished = narrative.IndexOf("JobFinished", StringComparison.Ordinal);
+            if (begin < 0 || failure <= begin || retry <= failure || finished <= retry)
+                throw new InvalidOperationException("Readable narrative events are out of order.");
+
             string combined = string.Join("\n", logFiles.SelectMany(File.ReadAllLines));
             foreach (string eventLine in combined.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
@@ -309,7 +320,9 @@ internal static class DevelopmentAgentCommand
                     throw new InvalidOperationException(
                         "Development log is missing the expected event: " + expected);
             if (combined.Contains("UnknownIdentifier", StringComparison.Ordinal)
-                || combined.Contains("OPENAI_API_KEY", StringComparison.Ordinal))
+                || narrative.Contains("UnknownIdentifier", StringComparison.Ordinal)
+                || combined.Contains("OPENAI_API_KEY", StringComparison.Ordinal)
+                || narrative.Contains("OPENAI_API_KEY", StringComparison.Ordinal))
                 throw new InvalidOperationException("Unsafe raw data entered development logs.");
         }
         finally
