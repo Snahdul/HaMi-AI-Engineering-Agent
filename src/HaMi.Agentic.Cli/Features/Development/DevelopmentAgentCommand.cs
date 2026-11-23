@@ -31,6 +31,9 @@ internal static class DevelopmentAgentCommand
             // Verify snapshot (including symlink/junction/credential restrictions)
             // before any model call or file staging.
             DevelopmentSandboxRunner.InspectSnapshot(source, contract.ProjectFile);
+            // Reject overlap before we create agent-job-* or spend any model call.
+            // The runner repeats this same guard for defense in depth.
+            DevelopmentIsolatedRunner.ValidateStoragePaths(repo, source, resultsDirectory);
 
             string? key = live ? RuntimeSettings.GetApiKey() : null;
             if (live && string.IsNullOrWhiteSpace(key))
@@ -93,6 +96,18 @@ internal static class DevelopmentAgentCommand
         DevelopmentAgentContract.SelfTest();
         DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, null);
         await DevelopmentAiGenerator.SelfTestAsync(contract);
+
+        // A denied destination must create no folder, stage no source
+        // and make no model call. No Docker is involved in this test.
+        string rejectedResults = Path.Combine(repo, ".hami-invalid-agent-results");
+        if (Directory.Exists(rejectedResults))
+            throw new InvalidOperationException("Preflight test destination unexpectedly already exists.");
+        int denied = await RunAsync(repo, null, null, rejectedResults, live: false, requestedModel: null);
+        if (denied != 1 || Directory.Exists(rejectedResults))
+            throw new InvalidOperationException("Results inside repository were not rejected before writes.");
+        DevelopmentIsolatedRunner.ValidateStoragePaths(repo,
+            Path.Combine(repo, "samples", "SandboxCoding"),
+            Path.Combine(Path.GetTempPath(), "hami-safe-output-external"));
         // Use the same Akka.Hosting composition root in CI as in the real
         // agent command; this catches DI/host startup errors without Docker.
         HostApplicationBuilder builder = Host.CreateApplicationBuilder();
