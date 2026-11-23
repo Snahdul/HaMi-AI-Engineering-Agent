@@ -22,7 +22,7 @@ $checks = New-Object System.Collections.ArrayList
 $start = (Get-Date).ToString('o')
 # The native executable emits UTF-8. Prevent OEM decoding while using Out-Host.
 $previousConsoleOutputEncoding = [Console]::OutputEncoding
-[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Console]::OutputEncoding
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw 'dotnet fehlt.' }
 if (-not (Get-Command sbx -ErrorAction SilentlyContinue)) { throw 'sbx fehlt.' }
