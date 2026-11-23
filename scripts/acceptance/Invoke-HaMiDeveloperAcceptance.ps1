@@ -9,7 +9,9 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ResultsRoot = 'G:\HaMi\Sandbox\PoC\Runs'
+    [string]$ResultsRoot = 'G:\HaMi\Sandbox\PoC\Runs',
+    [switch]$VerifyOnly,
+    [string]$ReportPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,35 +28,48 @@ if (-not (Get-Command sbx -ErrorAction SilentlyContinue)) { throw 'Docker sbx CL
 $before = @(& git -C $repo status --porcelain=v1)
 if ($LASTEXITCODE -ne 0) { throw 'Cannot capture current Git changes.' }
 
-Write-Host ''
-Write-Host '=== 1/3 Parser, ActorSystem, retry and timeout selftests (offline) ===' -ForegroundColor Cyan
-& dotnet run --project $project -c Release -- development --repo $repo --agent-self-test
-if ($LASTEXITCODE -ne 0) { throw 'Offline CLI/Actor self-test failed.' }
-
-Write-Host ''
-Write-Host '=== 2/3 Real MicroVM attempt 1 + automatic correction/attempt 2 ===' -ForegroundColor Cyan
-New-Item -ItemType Directory -Path $ResultsRoot -Force | Out-Null
-$existing = @(
-    Get-ChildItem -LiteralPath $ResultsRoot -Directory -Filter 'agent-job-*' |
-        ForEach-Object FullName
-)
-
-& dotnet run --project $project -c Release -- `
-    development --repo $repo --agent-run --results-dir $ResultsRoot
-if ($LASTEXITCODE -ne 0) {
-    throw 'The real MicroVM correction loop failed; inspect its agent-job report.'
+if ($VerifyOnly) {
+    if ([string]::IsNullOrWhiteSpace($ReportPath) -or
+        -not [IO.Path]::IsPathFullyQualified($ReportPath) -or
+        [IO.Path]::GetFileName($ReportPath) -ne 'agent-report.json') {
+        throw '-VerifyOnly requires an absolute path to an existing agent-report.json.'
+    }
+    $reportPath = (Resolve-Path -LiteralPath $ReportPath).Path
+    Write-Host ''
+    Write-Host '=== Verify existing agent report; NO new MicroVMs or model calls ===' -ForegroundColor Cyan
+} else {
+    if ($ReportPath) { throw '-ReportPath can only be supplied with -VerifyOnly.' }
+    Write-Host ''
+    Write-Host '=== 1/3 Parser, ActorSystem, retry and timeout selftests (offline) ===' -ForegroundColor Cyan
+    & dotnet run --project $project -c Release -- development --repo $repo --agent-self-test
+    if ($LASTEXITCODE -ne 0) { throw 'Offline CLI/Actor self-test failed.' }
+    
+    Write-Host ''
+    Write-Host '=== 2/3 Real MicroVM attempt 1 + automatic correction/attempt 2 ===' -ForegroundColor Cyan
+    New-Item -ItemType Directory -Path $ResultsRoot -Force | Out-Null
+    $existing = @(
+        Get-ChildItem -LiteralPath $ResultsRoot -Directory -Filter 'agent-job-*' |
+            ForEach-Object FullName
+    )
+    
+    & dotnet run --project $project -c Release -- `
+        development --repo $repo --agent-run --results-dir $ResultsRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The real MicroVM correction loop failed; inspect its agent-job report.'
+    }
+    
+    $newJobs = @(Get-ChildItem -LiteralPath $ResultsRoot -Directory -Filter 'agent-job-*' |
+        Where-Object { $existing -notcontains $_.FullName })
+    if ($newJobs.Count -ne 1) {
+        throw ('Expected one new agent job directory; got {0}.' -f $newJobs.Count)
+    }
+    
+    $reportPath = Join-Path $newJobs[0].FullName 'agent-report.json'
+    if (-not (Test-Path -LiteralPath $reportPath)) {
+        throw 'Agent did not create the structured completion report.'
+    }
 }
 
-$newJobs = @(Get-ChildItem -LiteralPath $ResultsRoot -Directory -Filter 'agent-job-*' |
-    Where-Object { $existing -notcontains $_.FullName })
-if ($newJobs.Count -ne 1) {
-    throw ('Expected one new agent job directory; got {0}.' -f $newJobs.Count)
-}
-
-$reportPath = Join-Path $newJobs[0].FullName 'agent-report.json'
-if (-not (Test-Path -LiteralPath $reportPath)) {
-    throw 'Agent did not create the structured completion report.'
-}
 $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
 
 Write-Host ''
@@ -81,7 +96,12 @@ foreach ($entry in @($report.attempts)) {
     $sandboxName = 'hami-code-' + $vm.runId.Substring(0, 12)
     $inspect = (& sbx inspect $sandboxName 2>&1 | Out-String)
     $inspectExit = $LASTEXITCODE
-    if ($inspectExit -eq 0 -or $inspect -notmatch '(?i)sandbox not found') {
+    # sbx prints the sandbox name and 'not found' on SEPARATE lines.
+    # Nonzero exit + exact requested sandbox name + a not-found diagnosis
+    # is strong independent evidence the guest is no longer present.
+    if ($inspectExit -eq 0 -or
+        $inspect -notmatch [regex]::Escape($sandboxName) -or
+        $inspect -notmatch '(?is)\bnot\s+found\b') {
         throw ('Cleanup could not be independently confirmed for {0}: {1}' -f $sandboxName, $inspect.Trim())
     }
     Write-Host ('PASS: ' + $sandboxName + ' was removed (independent sbx inspect).')
@@ -93,14 +113,28 @@ if ($microVmReports[0].buildExitCode -eq 0 -or
     throw 'Expected first failed compiler phase, then clean build+run in second isolated VM.'
 }
 $after = @(& git -C $repo status --porcelain=v1)
-if ($LASTEXITCODE -ne 0 -or (Compare-Object $before $after)) {
+if ($LASTEXITCODE -ne 0) { throw 'Could not read Git checkout status.' }
+if ($VerifyOnly) {
+    # The original Git baseline was not saved with the previous job report.
+    # We can inspect CURRENT tracked files, but cannot retrospectively
+    # prove unchanged pre-existing untracked files.
+    & git -C $repo diff --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Current tracked working files contain changes.' }
+    & git -C $repo diff --cached --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Current Git index contains staged changes.' }
+    Write-Host 'Current tracked Git files are clean; original untracked-file baseline not independently available.'
+} elseif (Compare-Object $before $after) {
     throw 'The source Git checkout changed during the agent run.'
 }
 $lastHead = (& git -C $repo rev-parse HEAD)
 if ($lastHead -ne $head) {
     throw 'The source Git HEAD changed during the agent run.'
 }
-Write-Host 'PASS: CLI/parser + Akka host, compiler fail/correct, 2 MicroVM cleanups, unchanged Git.' -ForegroundColor Green
+if ($VerifyOnly) {
+    Write-Host 'PASS: Stored agent report, compiler fail/correct and 2 independently removed MicroVMs.' -ForegroundColor Green
+} else {
+    Write-Host 'PASS: CLI/parser + Akka host, compiler fail/correct, 2 MicroVM cleanups, unchanged Git.' -ForegroundColor Green
+}
 Write-Host ('Model calls (scripted, no API charges): ' + $report.modelCalls)
 Write-Host ('Current HEAD: ' + $head)
 Write-Host ('Full acceptance report: ' + $reportPath)
