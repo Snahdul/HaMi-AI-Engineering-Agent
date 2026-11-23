@@ -481,6 +481,12 @@ internal static class DevelopmentSandboxRunner
             throw new InvalidOperationException($"{action} failed ({result.ExitCode}): {result.Error.Trim()}");
     }
 
+    private static void ScrubHostCredentials(ProcessStartInfo info)
+    {
+        foreach (string name in SensitiveEnvNames)
+            info.Environment.Remove(name);
+    }
+
     private static async Task<SandboxProcess> SbxAsync(TimeSpan limit, params string[] arguments)
     {
         var info = new ProcessStartInfo("sbx")
@@ -490,8 +496,7 @@ internal static class DevelopmentSandboxRunner
             RedirectStandardError = true,
             CreateNoWindow = true
         };
-        foreach (string name in SensitiveEnvNames)
-            info.Environment.Remove(name);
+        ScrubHostCredentials(info);
         info.ArgumentList.Add("--no-input");
         foreach (string argument in arguments) info.ArgumentList.Add(argument);
         using Process process = Process.Start(info)
@@ -569,6 +574,13 @@ internal static class DevelopmentSandboxRunner
         string tooManyLines = SafeLogPreview(string.Concat(Enumerable.Repeat("line\n", MaxLogPreviewLines + 3)));
         if (!tooManyLines.Contains("[Ausgabe gekürzt;", StringComparison.Ordinal))
             throw new InvalidOperationException("Log preview line limit is not enforced.");
+
+        var scrubTest = new ProcessStartInfo("sbx");
+        foreach (string name in SensitiveEnvNames)
+            scrubTest.Environment[name] = "DUMMY-CI-VALUE";
+        ScrubHostCredentials(scrubTest);
+        if (SensitiveEnvNames.Any(scrubTest.Environment.ContainsKey))
+            throw new InvalidOperationException("Sensitive host variables were not removed from sbx environment.");
 
         ValidateGuestCredentialPreflight(new SandboxProcess(0, "CREDENTIAL_ENV=clean\n", ""));
         ExpectRejected(() => ValidateGuestCredentialPreflight(
