@@ -65,11 +65,9 @@ internal sealed record DevelopmentAgentContract(
             "Write an offline console program.", "net11.0",
             "Demo.csproj", "Program.cs", "run", 2, ["Program exits zero."]);
         test.Validate();
-        if (test with { MaxAttempts = 100 } is { } impossible)
-        {
-            try { impossible.Validate(); }
-            catch (InvalidOperationException) { return; }
-            throw new InvalidOperationException("Unbounded actor attempts accepted.");
-        }
+        var invalid = test with { MaxAttempts = 100 };
+        try { invalid.Validate(); }
+        catch (InvalidOperationException) { return; }
+        throw new InvalidOperationException("Unbounded actor attempts accepted.");
     }
 }
