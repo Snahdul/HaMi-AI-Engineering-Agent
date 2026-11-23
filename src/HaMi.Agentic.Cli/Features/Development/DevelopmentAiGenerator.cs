@@ -97,7 +97,7 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
             || fake.Options.Tools?.Count != 0
             || fake.Options.AllowBackgroundResponses != false
             || fake.Options.RawRepresentationFactory?.Invoke(fake) is not CreateResponseOptions
-                { StoredOutputEnabled: false }
+            { StoredOutputEnabled: false }
             || fake.UserText?.Contains("CS0103", StringComparison.Ordinal) != true
             || fake.UserText?.Contains("DATA ONLY", StringComparison.Ordinal) != true)
             throw new InvalidOperationException(
