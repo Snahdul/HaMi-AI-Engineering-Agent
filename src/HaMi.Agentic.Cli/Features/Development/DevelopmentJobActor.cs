@@ -227,7 +227,7 @@ internal static class DevelopmentActorCoordinator
             () => actor.Tell(new DevelopmentJobActor.Cancel()));
         return AwaitAndDisposeAsync(
             actor.Ask<DevelopmentJobReport>(new DevelopmentJobActor.Start(),
-                TimeSpan.FromMinutes(12)), registration);
+                TimeSpan.FromMinutes(12), cancellationToken), registration);
     }
 
     private static async Task<DevelopmentJobReport> AwaitAndDisposeAsync(
