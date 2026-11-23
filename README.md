@@ -634,3 +634,25 @@ contracts/development/agent-console-retry.json und ein .NET-11-
 Konsolenprogramm begrenzt. Andere Projektdateien, Online-NuGet,
 Windows-/WPF-Builds und GitHub-Schreibzugriffe bleiben unzulässig.
 Architektur: docs/decisions/0001-commandline-akka-isolated-coding.md.
+
+
+**Empfohlene gebündelte HaMi11-Abnahme für PR #37:**
+
+~~~powershell
+Clear-Host
+
+$review = 'G:\HaMi\Sandbox\PoC\Runner-PR35'
+git -C $review fetch origin
+if ($LASTEXITCODE -ne 0) { throw 'Fetch fehlgeschlagen.' }
+git -C $review switch --detach origin/feature/issue36-commandline-akka-sandbox-flow-20261123
+if ($LASTEXITCODE -ne 0) { throw 'Worktree-Aktualisierung fehlgeschlagen.' }
+
+& "$review\scripts\acceptance\Invoke-HaMiDeveloperAcceptance.ps1"
+~~~
+
+Das Skript führt ohne Modellkosten nacheinander CLI-/Akka-Selbsttests
+und zwei echte frische MicroVM-Versuche (Compilerfehler, Korrektur)
+durch. Es prüft beide Cleanup-Nachweise, das neue Agent-JSON und dass
+Git-Status und HEAD des Review-Checkouts unverändert geblieben sind.
+Bestehende untracked Dateien werden weder gelöscht noch zurückgesetzt.
+Kein Git-Merge erfolgt automatisch.
