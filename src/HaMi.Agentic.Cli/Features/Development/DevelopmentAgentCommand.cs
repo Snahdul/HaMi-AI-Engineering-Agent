@@ -30,9 +30,10 @@ internal static class DevelopmentAgentCommand
             // The same ID names the actor job, its temporary directory and its report.
             logging = AgentLoggingSession.Create(repo, includeConsole: true);
             logger = logging.CreateLogger("HaMi.Agentic.Cli.Features.Development");
-            DevelopmentLogEvents.JobRequested(logger, jobId, repo, resultsDirectory,
-                live ? "live" : "offline-scripted",
-                contractPath ?? DevelopmentAgentContract.TrustedPath);
+            if (logging.Settings.LogSuccessfulSteps)
+                DevelopmentLogEvents.JobRequested(logger, jobId, repo, resultsDirectory,
+                    live ? "live" : "offline-scripted",
+                    contractPath ?? DevelopmentAgentContract.TrustedPath);
 
             phase = "contract";
             DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, contractPath);
@@ -60,8 +61,9 @@ internal static class DevelopmentAgentCommand
                 return 2;
             }
 
-            DevelopmentLogEvents.PreflightAccepted(logger, jobId, contract.TaskId,
-                contract.ProjectFile, contract.MaxAttempts);
+            if (logging.Settings.LogSuccessfulSteps)
+                DevelopmentLogEvents.PreflightAccepted(logger, jobId, contract.TaskId,
+                    contract.ProjectFile, contract.MaxAttempts);
             phase = "results-allocation";
             string runRoot = Path.Combine(resultsDirectory, "agent-job-" + jobId);
             Directory.CreateDirectory(runRoot);
@@ -88,14 +90,17 @@ internal static class DevelopmentAgentCommand
                 phase = "job";
                 ActorSystem system = host.Services.GetRequiredService<ActorSystem>();
                 DevelopmentJobReport result = await DevelopmentActorCoordinator.RunAsync(
-                    system, contract, generator, sandbox, logger: logger, jobId: jobId);
+                    system, contract, generator, sandbox, logger: logger, jobId: jobId,
+                    logSuccessfulSteps: logging.Settings.LogSuccessfulSteps,
+                    logDecisionSummaries: logging.Settings.LogDecisionSummaries);
 
                 phase = "report";
                 string jsonPath = Path.Combine(runRoot, "agent-report.json");
                 await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(result,
                     new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true }));
-                DevelopmentLogEvents.JobFinished(logger, jobId, result.Status,
-                    result.ModelCalls, result.Attempts.Length, jsonPath);
+                if (logging.Settings.LogSuccessfulSteps)
+                    DevelopmentLogEvents.JobFinished(logger, jobId, result.Status,
+                        result.ModelCalls, result.Attempts.Length, jsonPath);
                 return result.Status == "passed" ? 0 : 1;
             }
             finally
