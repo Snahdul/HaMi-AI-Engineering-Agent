@@ -42,13 +42,18 @@ string[] sensitiveEnvNames = {
     "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AZURE_CLIENT_SECRET",
     "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK"
 };
-// Print only predefined variable NAMES, never values, paths or token contents.
-string[] presentSensitiveEnvNames = sensitiveEnvNames.Where(
-    name => Environment.GetEnvironmentVariable(name) != null).ToArray();
-Console.WriteLine("SENSITIVE_ENV_COUNT=" + presentSensitiveEnvNames.Length);
-Console.WriteLine("SENSITIVE_ENV_NAMES=" +
-    (presentSensitiveEnvNames.Length == 0 ? "none" : string.Join(",", presentSensitiveEnvNames)));
-if (presentSensitiveEnvNames.Length > 0) failures.Add("SENSITIVE_ENV_PRESENT");
+// An empty variable is not a credential, but report it separately.
+// Never print secret VALUES, lengths, token prefixes or raw env dumps.
+string[] activeSensitiveNames = sensitiveEnvNames.Where(
+    name => !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(name))).ToArray();
+string[] emptySensitiveNames = sensitiveEnvNames.Where(
+    name => Environment.GetEnvironmentVariable(name) is { Length: 0 }).ToArray();
+Console.WriteLine("SENSITIVE_ENV_NONEMPTY_COUNT=" + activeSensitiveNames.Length);
+Console.WriteLine("SENSITIVE_ENV_NONEMPTY_NAMES=" +
+    (activeSensitiveNames.Length == 0 ? "none" : string.Join(",", activeSensitiveNames)));
+Console.WriteLine("SENSITIVE_ENV_EMPTY_NAMES=" +
+    (emptySensitiveNames.Length == 0 ? "none" : string.Join(",", emptySensitiveNames)));
+if (activeSensitiveNames.Length > 0) failures.Add("SENSITIVE_ENV_PRESENT");
 
 foreach (string line in File.ReadLines("/proc/self/mountinfo"))
 {
