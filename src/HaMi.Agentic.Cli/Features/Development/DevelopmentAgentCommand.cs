@@ -91,9 +91,15 @@ internal static class DevelopmentAgentCommand
         CommandLineRouter.SelfTest();
         DevelopmentAgentContract.SelfTest();
         DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, null);
-        ActorSystem system = ActorSystem.Create("hami-development-offline-tests");
+        // Use the same Akka.Hosting composition root in CI as in the real
+        // agent command; this catches DI/host startup errors without Docker.
+        HostApplicationBuilder builder = Host.CreateApplicationBuilder();
+        builder.Services.AddAkka("hami-development-offline-tests", _ => { });
+        using IHost host = builder.Build();
+        await host.StartAsync();
         try
         {
+            ActorSystem system = host.Services.GetRequiredService<ActorSystem>();
             var sandbox = new SimulatedIsolatedRunner();
             DevelopmentJobReport completed = await DevelopmentActorCoordinator.RunAsync(
                 system, contract, new DevelopmentScriptedGenerator(), sandbox);
@@ -123,7 +129,7 @@ internal static class DevelopmentAgentCommand
         }
         finally
         {
-            await system.Terminate();
+            await host.StopAsync();
         }
     }
 
