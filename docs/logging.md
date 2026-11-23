@@ -43,7 +43,7 @@ rollierenden `Serilog.Sinks.File`-Sink mit `CompactJsonFormatter`.
 
 Ausgabe unter
 `<HAMI_AGENT_WORKTREE_ROOT>/hami-agent-logs/agent-<Datum>.clef`:
-jede Zeile ist ein einzelnes maschinenlesbares Compact-JSON-Ereignis. Die
+jede Zeile ist ein einzelnes maschinenlesbares Compact-JSON-Ereignis. Zusaetzlich liegt unter demselben Root eine direkt lesbare Datei `agent-<Datum>.log` mit chronologischen Nachrichten, Zeitstempel und Level. Beide Dateien entstehen aus denselben ILogger-Events und sind unabhaengig nach Groesse/Datum rotiert und in ihrer Aufbewahrung begrenzt. Die
 Rotation erfolgt täglich und bei Erreichen des konfigurierten Größenlimits,
 mit begrenzter Dateianzahl. Der Logordner liegt außerhalb des produktiven
 Checkouts. Die Event-Scope-Eigenschaft `RunId` korreliert Ereignisse eines Laufs.
@@ -96,7 +96,7 @@ stabilen, lokalen fachlichen `report.json`-Bericht.
 ## Development-Agent (Issue #38)
 
 `development --agent-run` nutzt dieselbe `ILogger`-/Serilog-Session, nun mit
-**Console-Provider und unveraenderter rollierender Compact-JSON-Datei**.
+**Console-Provider, lesbarer rotierender .log-Datei und Compact-JSON-Datei**.
 EventIds 3600–3610 beschreiben Startparameter, Preflight, Generierung,
 MicroVM-Phasen, Retry-Entscheidungen, klassifizierte Compilerfehler und
 abschliessenden Bericht. Die eindeutige `JobId` korreliert Actor,
