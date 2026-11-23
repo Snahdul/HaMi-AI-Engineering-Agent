@@ -18,6 +18,9 @@ internal static class DevelopmentCommand
             Console.WriteLine("       development --repo <checkout> --sandbox-poc-self-test");
             Console.WriteLine("       development --repo <checkout> --sandbox-run --source <snapshot-dir> --project <relative.csproj> --mode <build|run|test> --results-dir <absolute-dir>");
             Console.WriteLine("       development --repo <checkout> --sandbox-run-self-test");
+            Console.WriteLine("       development --repo <checkout> --agent-self-test (offline, Akka + CLI parser)");
+            Console.WriteLine("       development --repo <checkout> --agent-run --results-dir <absolute-dir> [--contract contracts/development/agent-console-retry.json] [--source <absolute-snapshot>] [--live --model <model>]");
+            Console.WriteLine("Agent run: model generates only Program.cs; independent ephemeral Docker MicroVM per attempt, no GitHub writes.");
             Console.WriteLine("Contract checks are read-only. sandbox-poc runs the trusted RetryBudget fixture; sandbox-run executes a bounded project snapshot only in a fresh local MicroVM.");
             return 0;
         }
@@ -31,6 +34,8 @@ internal static class DevelopmentCommand
             string? source = null;
             string? project = null;
             string? mode = null;
+            string? model = null;
+            bool live = false;
             string? action = null;
             for (int i = 0; i < args.Length; i++)
             {
@@ -41,11 +46,18 @@ internal static class DevelopmentCommand
                     case "--sandbox-poc":
                     case "--sandbox-run":
                     case "--sandbox-run-self-test":
+                    case "--agent-run":
+                    case "--agent-self-test":
                     case "--contract-check":
                     case "--worktree-check":
                         if (action is not null) throw new ArgumentException("Exactly one development action required.");
                         action = args[i];
                         break;
+                    case "--live":
+                        if (live) throw new ArgumentException("Duplicate --live.");
+                        live = true;
+                        break;
+                    case "--model":
                     case "--repo":
                     case "--results-dir":
                     case "--source":
@@ -59,6 +71,10 @@ internal static class DevelopmentCommand
                         string value = args[++i];
                         switch (option)
                         {
+                            case "--model":
+                                if (model is not null) throw new ArgumentException("Duplicate --model.");
+                                model = value;
+                                break;
                             case "--source":
                                 if (source is not null) throw new ArgumentException("Duplicate --source.");
                                 source = value;
@@ -97,6 +113,28 @@ internal static class DevelopmentCommand
             if (repo is null || action is null)
                 throw new ArgumentException("Development mode requires --repo and exactly one action.");
             repo = Path.GetFullPath(repo);
+
+            if (action == "--agent-self-test")
+            {
+                if (source is not null || project is not null || mode is not null
+                    || contractPath is not null || worktree is not null
+                    || resultsDir is not null || model is not null || live)
+                    throw new ArgumentException("Agent self-test accepts only --repo.");
+                await DevelopmentAgentCommand.SelfTestAsync(repo);
+                return 0;
+            }
+
+            if (action == "--agent-run")
+            {
+                if (resultsDir is null || project is not null || mode is not null
+                    || worktree is not null || (model is not null && !live))
+                    throw new ArgumentException("Agent run requires --results-dir; --model only with --live.");
+                return await DevelopmentAgentCommand.RunAsync(repo,
+                    contractPath, source, resultsDir, live, model);
+            }
+
+            if (model is not null || live)
+                throw new ArgumentException("--model and --live require --agent-run.");
 
             if (action == "--sandbox-run-self-test")
             {
