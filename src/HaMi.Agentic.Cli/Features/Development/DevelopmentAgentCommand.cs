@@ -127,7 +127,21 @@ internal static class DevelopmentAgentCommand
                 || hanging.Calls != 1 || timeout.Attempts[0].Status != "timed-out")
                 throw new InvalidOperationException("Actor retried an unsafe sandbox timeout.");
 
-            Console.WriteLine("Akka development offline self-test passed: fail/correct, retry budget, timeout stop, CLI validation.");
+            foreach (string failure in new[] { "preflight", "restore", "build-exec", "cleanup" })
+            {
+                var faultRunner = new SimulatedIsolatedRunner(failure: failure);
+                DevelopmentJobReport fault = await DevelopmentActorCoordinator.RunAsync(
+                    system, contract, new DevelopmentScriptedGenerator(), faultRunner);
+                string expected = failure == "cleanup" ? "cleanup-failed" : "infrastructure-failed";
+                if (fault.Status != "failed" || fault.ModelCalls != 1
+                    || faultRunner.Calls != 1 || fault.Attempts.Length != 1
+                    || fault.Attempts[0].Status != expected)
+                    throw new InvalidOperationException(
+                        "Actor retried an infrastructure or unconfirmed-cleanup error: " + failure);
+            }
+
+            Console.WriteLine("Akka development offline self-test passed: fail/correct, "
+                + "retry budget, timeout, preflight, restore, build-exec and cleanup fail-closed.");
         }
         finally
         {
@@ -135,7 +149,7 @@ internal static class DevelopmentAgentCommand
         }
     }
 
-    private sealed class SimulatedIsolatedRunner(bool timeout = false)
+    private sealed class SimulatedIsolatedRunner(bool timeout = false, string? failure = null)
         : IDevelopmentIsolatedRunner
     {
         public int Calls { get; private set; }
@@ -146,6 +160,18 @@ internal static class DevelopmentAgentCommand
         {
             cancellationToken.ThrowIfCancellationRequested();
             Calls++;
+            if (failure == "preflight")
+                return Task.FromResult(new DevelopmentSandboxAttempt(false, -1, -1, -1,
+                    false, true, "Guest credentials must be empty", null, "Credential preflight failed."));
+            if (failure == "restore")
+                return Task.FromResult(new DevelopmentSandboxAttempt(false, 1, -1, -1,
+                    false, true, "Offline NuGet restore failed", null));
+            if (failure == "build-exec")
+                return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 1, -1,
+                    false, true, "Sandbox execution failed before compiler diagnostics", null));
+            if (failure == "cleanup")
+                return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 1, -1,
+                    false, false, "error CS0103: UnknownIdentifier", null));
             if (timeout)
                 return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 0, -1,
                     true, true, "Simulated timeout", null));
