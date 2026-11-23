@@ -433,6 +433,7 @@ Voraussetzung: lokale Vorlage `hami-dotnet11:0.1` mit .NET 11.0.100 und ICU,
 ```powershell
 $repo = 'I:\git\HaMi\HaMi-AI-Engineering-Agent'
 $snapshot = 'G:\HaMi\Sandbox\Candidates\demo-console'
+Clear-Host
 dotnet run --project "$repo\src\HaMi.Agentic.Cli" -c Release -- `
   development --repo $repo --sandbox-run `
   --source $snapshot --project Demo.csproj --mode run `
@@ -467,9 +468,18 @@ und fortlaufend im Terminal**: Auftrags-ID, VM-Name, Template, Projekt,
 Status der Sicherheits-/SDK-Prüfung, Kopieren, Restore, Build,
 Ausführung und Entfernung der MicroVM. Jede Meldung enthält die seit
 Auftragsbeginn vergangene Zeit; abgeschlossene Phasen zeigen ihre
-Dauer und den Exitcode. Die Ausgaben des generierten Programms werden
-aus Sicherheits- und Platzgründen **nicht** live in die Konsole gestreamt,
-sondern begrenzt in `execution.log` gespeichert.
+Dauer und den Exitcode. **Nach** Abschluss des Auftrags wird
+automatisch eine **begrenzte, entschärfte Vorschau** des relevanten Logs
+im Terminal angezeigt: bei Restore-Fehler `restore.log`, bei
+Compilerfehler `build.log`, ansonsten `execution.log` bzw. im
+Modus `build` `build.log`. Die Vorschau ist auf 4096 Zeichen /
+80 Zeilen begrenzt; ANSI-Steuerzeichen und Unicode-Formatkontrollen
+werden neutralisiert. Die vollständigen, unveränderten Diagnosen
+liegen weiterhin im Ergebnisverzeichnis. Gast-Ausgaben werden
+**nicht live gestreamt**. Bei Timeout ohne abgeschlossenes `sbx exec`
+existiert unter Umständen keine `execution.log`; dies wird angezeigt.
+`Clear-Host` gehört ausschließlich vor den interaktiven
+PowerShell-Aufruf, nicht in den Runner selbst.
 
 Erster echter HaMi11-Realtest (Demo.csproj, Modus run): Restore 0,
 Build 0, Ausführung 0, Timeout false, VM wurde entfernt,
