@@ -7,7 +7,8 @@ Run interactively. Does not modify global policy or existing sandboxes.
 param(
     [string]$ResultsRoot = 'G:\HaMi\Sandbox\PoC\Runs',
     [string]$CandidatesRoot = 'G:\HaMi\Sandbox\Candidates',
-    [ValidateRange(2,10)][int]$Iterations = 3
+    [ValidateRange(2,10)][int]$Iterations = 3,
+    [switch]$SecurityOnly
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -19,6 +20,10 @@ $src = Join-Path $CandidatesRoot ("acceptance-" + $guid)
 $canary = Join-Path $out 'host-canary.txt'
 $checks = New-Object System.Collections.ArrayList
 $start = (Get-Date).ToString('o')
+# The native executable emits UTF-8. Prevent OEM decoding while using Out-Host.
+$previousConsoleOutputEncoding = [Console]::OutputEncoding
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw 'dotnet fehlt.' }
 if (-not (Get-Command sbx -ErrorAction SilentlyContinue)) { throw 'sbx fehlt.' }
 New-Item -ItemType Directory -Path $out,$src -Force | Out-Null
@@ -104,6 +109,7 @@ try {
         $guestLog.Contains('SECURITY_STATUS=PASS')
     Add-Result 'Host-Canary, Mounts, Secrets und Gastlimits' $securityOk ('CLI Exit={0}; SecurityPass={1}' -f $security.Exit,$guestLog.Contains('SECURITY_STATUS=PASS'))
 
+    if (-not $SecurityOnly) {
     $compiler = Invoke-Case 'compile-fail' $badSrc
     $buildLog = Get-TestLog $compiler 'build.log'
     $compilerOk = $compiler.Exit -ne 0 -and $null -ne $compiler.Report -and
@@ -130,6 +136,7 @@ try {
         $elapsed = if ($run.Report) { $run.Report.totalMilliseconds } else { 'kein Report' }
         Add-Result ('Wiederholung {0}/{1}' -f $i,$Iterations) $ok ('Gesamtzeit={0} ms' -f $elapsed)
     }
+    } # End of optional full-suite tests; -SecurityOnly only runs the host/secret probe.
 }
 finally {
     if ($null -ne $job) {
@@ -170,6 +177,7 @@ if (Test-Path -LiteralPath $memoryCsv) {
 $failCount = @($checks | Where-Object { $_.Status -eq 'FAIL' }).Count
 $summary = [ordered]@{
     schemaVersion = 1
+    mode = if ($SecurityOnly) { 'security-only' } else { 'full' }
     outcome = if ($failCount -eq 0) { 'PASS' } else { 'FAIL' }
     started = $start
     completed = (Get-Date).ToString('o')
@@ -178,7 +186,11 @@ $summary = [ordered]@{
     performance = $performance
     hostRam = $hostRam
     canary = $canary
-    note = 'Prior timeout/Internet/LAN policy tests remain separate evidence in PR #35.'
+    note = if ($SecurityOnly) {
+        'Partial diagnostic: only host/secret security probe repeated; prior tests remain in their original reports.'
+    } else {
+        'Prior timeout/Internet/LAN policy tests remain separate evidence in PR #35.'
+    }
 }
 $summaryPath = Join-Path $out 'acceptance-summary.json'
 $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
@@ -193,5 +205,10 @@ if ($hostRam) {
 } else { Write-Warning 'Host-RAM-Messung fehlt; Ressourcennachweis nur teilweise.' }
 Write-Host ('Gesamtbericht: ' + $summaryPath)
 Write-Host ('Fehlgeschlagene Pruefungen: ' + $failCount)
+[Console]::OutputEncoding = $previousConsoleOutputEncoding
 if ($failCount -gt 0) { throw 'Die Sammelabnahme ist fehlgeschlagen. Siehe Gesamtbericht.' }
-Write-Host 'Sammeltests bestanden. Produktiver Einsatz / PR-Merge nur nach gesonderter menschlicher Freigabe.' -ForegroundColor Green
+if ($SecurityOnly) {
+    Write-Host 'Security-Teilpruefung bestanden; die Gesamtbewertung bleibt im vorherigen Bericht dokumentiert.' -ForegroundColor Green
+} else {
+    Write-Host 'Sammeltests bestanden. Produktiver Einsatz / PR-Merge nur nach gesonderter menschlicher Freigabe.' -ForegroundColor Green
+}
