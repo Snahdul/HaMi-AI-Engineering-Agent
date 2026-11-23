@@ -462,6 +462,22 @@ Auf dem Host entstehen unter `reports/hami-code-<id>/` die Dateien
 Timeout-/Cleanup-Status und Phasenzeiten. Logs sind unvertrauenswürdige
 Diagnosen und werden niemals auf dem Host ausgeführt.
 
-Die CI prüft Eingabe-/Pfad-/Netzwerk-Guards ohne echte MicroVM. Der reale
-HaMi11-Durchstich mit beliebigem C# und Abbruch-/Isolationstests steht
-vor der Mergefreigabe noch aus. Kein automatischer PR-Merge.
+Während der Ausführung meldet der Runner seinen Fortschritt **direkt
+und fortlaufend im Terminal**: Auftrags-ID, VM-Name, Template, Projekt,
+Status der Sicherheits-/SDK-Prüfung, Kopieren, Restore, Build,
+Ausführung und Entfernung der MicroVM. Jede Meldung enthält die seit
+Auftragsbeginn vergangene Zeit; abgeschlossene Phasen zeigen ihre
+Dauer und den Exitcode. Die Ausgaben des generierten Programms werden
+aus Sicherheits- und Platzgründen **nicht** live in die Konsole gestreamt,
+sondern begrenzt in `execution.log` gespeichert.
+
+Erster echter HaMi11-Realtest (Demo.csproj, Modus run): Restore 0,
+Build 0, Ausführung 0, Timeout false, VM wurde entfernt,
+`totalMilliseconds=11527`. Davon VM-Erstellung 6998 ms,
+Dateiübertragung 321 ms, Restore 910 ms, Build 1173 ms,
+Ausführung 528 ms und Bereinigung 556 ms. Das ist **ein**
+Messwert und noch kein Performance-Benchmark.
+
+Die CI prüft Eingabe-/Pfad-/Netzwerk-Guards ohne echte MicroVM. Der
+Timeout-/Abbruch- sowie Isolationstest mit beliebigem C# steht vor
+der Mergefreigabe noch aus. Kein automatischer PR-Merge.
