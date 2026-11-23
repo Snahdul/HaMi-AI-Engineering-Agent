@@ -259,6 +259,11 @@ internal static class AgentLoggingSelfTest
         Ensure(files.Length == 2 && files.All(f => new FileInfo(f).Length
                 <= smallFiles.FileSizeLimitBytes + 4096),
             "Serilog size rollover and retention did not enforce the configured limits.");
+        string[] narrativeFiles = Directory.GetFiles(Path.Combine(temp,
+            smallFiles.RelativeDirectory), "agent-*.log");
+        Ensure(narrativeFiles.Length == 2 && narrativeFiles.All(f => new FileInfo(f).Length
+                <= smallFiles.FileSizeLimitBytes + 4096),
+            "Readable narrative rollover or retention is not bounded.");
         EnsureFileHandlesReleased(Directory.GetFiles(Path.Combine(temp,
             smallFiles.RelativeDirectory), "agent-*.*"));
     }
@@ -301,6 +306,13 @@ internal static class AgentLoggingSelfTest
         Ensure(files.Length > 0, "No log file was emitted.");
         EnsureFileHandlesReleased(Directory.GetFiles(Path.Combine(temp,
             settings.RelativeDirectory), "agent-*.*"));
+        string[] readableFiles = Directory.GetFiles(Path.Combine(temp, settings.RelativeDirectory),
+            "agent-*.log");
+        Ensure(readableFiles.Length > 0, "Readable narrative file is missing.");
+        string readable = string.Join("\n", readableFiles.SelectMany(File.ReadAllLines));
+        Ensure(readable.Contains("DecisionRecorded", StringComparison.Ordinal)
+            || !settings.LogDecisionSummaries,
+            "Readable narrative omitted an enabled decision.");
         string all = string.Join("\n", files.SelectMany(File.ReadAllLines));
         foreach (string line in all.Split('\n', StringSplitOptions.RemoveEmptyEntries))
         {
