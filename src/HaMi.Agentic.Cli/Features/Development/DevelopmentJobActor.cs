@@ -54,6 +54,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
 
     private readonly string jobId;
     private readonly ILogger? logger;
+    private readonly bool logSuccessfulSteps;
+    private readonly bool logDecisionSummaries;
     private long generationStarted;
     private long sandboxStarted;
     private IActorRef? requester;
@@ -67,13 +69,16 @@ internal sealed class DevelopmentJobActor : ReceiveActor
 
     public DevelopmentJobActor(DevelopmentAgentContract contract,
         IDevelopmentCandidateGenerator generator,
-        IDevelopmentIsolatedRunner isolatedRunner, ILogger? logger = null, string? requestedJobId = null)
+        IDevelopmentIsolatedRunner isolatedRunner, ILogger? logger = null, string? requestedJobId = null,
+        bool logSuccessfulSteps = true, bool logDecisionSummaries = true)
     {
         this.contract = contract;
         this.generator = generator;
         this.isolatedRunner = isolatedRunner;
         this.logger = logger;
         this.jobId = requestedJobId ?? Guid.NewGuid().ToString("N");
+        this.logSuccessfulSteps = logSuccessfulSteps;
+        this.logDecisionSummaries = logDecisionSummaries;
 
         Receive<Start>(_ =>
         {
@@ -101,7 +106,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 return;
             }
             modelCalls++;
-            if (logger is not null)
+            if (logger is not null && logSuccessfulSteps)
                 DevelopmentLogEvents.GenerationFinished(logger, jobId, attempt,
                     message.Source?.Length ?? 0, (long)Stopwatch.GetElapsedTime(generationStarted).TotalMilliseconds);
             if (string.IsNullOrWhiteSpace(message.Source) || message.Source.Length > 16 * 1024)
@@ -117,7 +122,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
 
             stage = Stage.Executing;
             sandboxStarted = Stopwatch.GetTimestamp();
-            if (logger is not null) DevelopmentLogEvents.SandboxStarted(logger, jobId, attempt);
+            if (logger is not null && logSuccessfulSteps) DevelopmentLogEvents.SandboxStarted(logger, jobId, attempt);
             int current = attempt;
             IActorRef self = Self;
             Task<DevelopmentSandboxAttempt> task;
@@ -149,7 +154,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             // sbx/preflight/restore failures have -1 phase codes and MUST NOT
             // be mistaken for ordinary C# compiler diagnostics.
             string status = ClassifyResult(result);
-            if (logger is not null)
+            if (logger is not null && logSuccessfulSteps)
                 DevelopmentLogEvents.SandboxFinished(logger, jobId, attempt, status,
                     result.RestoreExitCode, result.BuildExitCode, result.RunExitCode,
                     result.TimedOut, result.CleanupSucceeded,
@@ -222,7 +227,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
         {
             if (stage == Stage.Finished) return;
             cancelRequested = true;
-            if (logger is not null)
+            if (logger is not null && logDecisionSummaries)
                 DevelopmentLogEvents.DecisionRecorded(logger, jobId, attempt,
                     "CANCEL_REQUESTED", "HOST_CANCEL_OR_JOB_DEADLINE");
             cancellation.Cancel();
@@ -259,7 +264,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
     {
         stage = Stage.Generating;
         generationStarted = Stopwatch.GetTimestamp();
-        if (logger is not null)
+        if (logger is not null && logSuccessfulSteps)
             DevelopmentLogEvents.GenerationStarted(logger, jobId, attempt,
                 !string.IsNullOrEmpty(feedback));
         int current = attempt;
@@ -293,7 +298,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             return;
         }
 
-        if (logger is not null)
+        if (logger is not null && logDecisionSummaries)
             DevelopmentLogEvents.DecisionRecorded(logger, jobId, attempt,
                 "RETRY_APPROVED", reasonCode);
         attempt++;
@@ -322,14 +327,16 @@ internal static class DevelopmentActorCoordinator
         ActorSystem system, DevelopmentAgentContract contract,
         IDevelopmentCandidateGenerator generator, IDevelopmentIsolatedRunner sandbox,
         CancellationToken cancellationToken = default, TimeSpan? jobTimeout = null,
-        ILogger? logger = null, string? jobId = null)
+        ILogger? logger = null, string? jobId = null,
+        bool logSuccessfulSteps = true, bool logDecisionSummaries = true)
     {
         TimeSpan deadline = jobTimeout ?? TimeSpan.FromMinutes(12);
         if (deadline <= TimeSpan.Zero || deadline > TimeSpan.FromMinutes(12))
             throw new ArgumentOutOfRangeException(nameof(jobTimeout));
 
         IActorRef actor = system.ActorOf(
-            Props.Create(() => new DevelopmentJobActor(contract, generator, sandbox, logger, jobId)),
+            Props.Create(() => new DevelopmentJobActor(contract, generator, sandbox,
+                logger, jobId, logSuccessfulSteps, logDecisionSummaries)),
             "coding-" + Guid.NewGuid().ToString("N"));
 
         // Do NOT cancel/timeout Ask at the job deadline: doing so would tear
