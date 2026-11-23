@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "logSuccessfulSteps": false,
+  "logSuccessfulSteps": true,
   "logDecisionSummaries": true,
   "minimumLevel": "Information",
   "relativeDirectory": "hami-agent-logs",
