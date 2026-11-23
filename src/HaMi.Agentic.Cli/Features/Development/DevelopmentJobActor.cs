@@ -54,6 +54,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
     private string feedback = "";
     private int attempt;
     private int modelCalls;
+    private bool cancelRequested;
     private Stage stage = Stage.Idle;
 
     private enum Stage { Idle, Generating, Executing, Finished }
@@ -75,6 +76,11 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             }
 
             requester = Sender;
+            if (cancelRequested)
+            {
+                Finish("cancelled", "Cancelled before job start.");
+                return;
+            }
             attempt = 1;
             BeginGeneration();
         });
@@ -124,6 +130,16 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 result.RestoreExitCode, result.BuildExitCode, result.RunExitCode,
                 result.TimedOut, result.CleanupSucceeded, result.ReportPath));
 
+            // A coordinator deadline stops NEW attempts, but must not stop the
+            // actor or its host until the already-running sbx task has returned
+            // from its own bounded cleanup/finally.
+            if (cancelRequested)
+            {
+                Finish(result.CleanupSucceeded ? "cancelled" : "failed",
+                    result.CleanupSucceeded ? "Cancelled after sandbox cleanup." : "cleanup-failed");
+                return;
+            }
+
             if (status == "passed")
             {
                 Finish("passed", null);
@@ -149,16 +165,20 @@ internal sealed class DevelopmentJobActor : ReceiveActor
         Receive<Faulted>(message =>
         {
             if (message.Attempt != attempt || stage == Stage.Finished) return;
-            Finish("failed", message.Stage + ":" + message.FailureType);
+            Finish(cancelRequested ? "cancelled" : "failed",
+                message.Stage + ":" + message.FailureType);
         });
 
         Receive<Cancel>(_ =>
         {
-            if (stage != Stage.Finished)
-            {
-                cancellation.Cancel();
-                Finish("cancelled", "Cancelled by caller.");
-            }
+            if (stage == Stage.Finished) return;
+            cancelRequested = true;
+            cancellation.Cancel();
+            // During a sandbox execution wait for Executed/Faulted: stopping
+            // the ActorSystem now could abandon the in-flight MicroVM cleanup.
+            if (stage == Stage.Generating)
+                Finish("cancelled", "Cancelled during generation.");
+            // In Idle, Start must first capture the Ask reply sender.
         });
     }
 
@@ -236,27 +256,29 @@ internal sealed class DevelopmentJobActor : ReceiveActor
 
 internal static class DevelopmentActorCoordinator
 {
-    public static Task<DevelopmentJobReport> RunAsync(
+    public static async Task<DevelopmentJobReport> RunAsync(
         ActorSystem system, DevelopmentAgentContract contract,
         IDevelopmentCandidateGenerator generator, IDevelopmentIsolatedRunner sandbox,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, TimeSpan? jobTimeout = null)
     {
+        TimeSpan deadline = jobTimeout ?? TimeSpan.FromMinutes(12);
+        if (deadline <= TimeSpan.Zero || deadline > TimeSpan.FromMinutes(12))
+            throw new ArgumentOutOfRangeException(nameof(jobTimeout));
+
         IActorRef actor = system.ActorOf(
             Props.Create(() => new DevelopmentJobActor(contract, generator, sandbox)),
             "coding-" + Guid.NewGuid().ToString("N"));
 
-        // The actor owns this job; a Cancel message prevents later model retries.
-        CancellationTokenRegistration registration = cancellationToken.Register(
+        // Do NOT cancel/timeout Ask at the job deadline: doing so would tear
+        // down Akka.Hosting before the in-flight sandbox has reached its
+        // finally/cleanup. Deliver Cancel to the actor, then await its
+        // terminal report. The underlying sbx operations have phase limits.
+        Task<DevelopmentJobReport> completed = actor.Ask<DevelopmentJobReport>(
+            new DevelopmentJobActor.Start(), TimeSpan.FromMinutes(45));
+        using var combined = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using CancellationTokenRegistration registration = combined.Token.Register(
             () => actor.Tell(new DevelopmentJobActor.Cancel()));
-        return AwaitAndDisposeAsync(
-            actor.Ask<DevelopmentJobReport>(new DevelopmentJobActor.Start(),
-                TimeSpan.FromMinutes(12), cancellationToken), registration);
-    }
-
-    private static async Task<DevelopmentJobReport> AwaitAndDisposeAsync(
-        Task<DevelopmentJobReport> work, CancellationTokenRegistration registration)
-    {
-        try { return await work; }
-        finally { registration.Dispose(); }
+        combined.CancelAfter(deadline);
+        return await completed;
     }
 }
