@@ -18,6 +18,11 @@ $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 $project = Join-Path $repo 'src\HaMi.Agentic.Cli'
 $head = (& git -C $repo rev-parse HEAD)
 if ($LASTEXITCODE -ne 0) { throw 'Git checkout unavailable.' }
+$expected = (& git -C $repo rev-parse origin/feature/issue36-commandline-akka-sandbox-flow-20261123)
+if ($LASTEXITCODE -ne 0 -or $head -ne $expected) {
+    throw 'Review worktree is not on the latest fetched PR #37 branch. Fetch/switch first.'
+}
+if (-not (Get-Command sbx -ErrorAction SilentlyContinue)) { throw 'Docker sbx CLI fehlt.' }
 $before = @(& git -C $repo status --porcelain=v1)
 if ($LASTEXITCODE -ne 0) { throw 'Cannot capture current Git changes.' }
 
@@ -60,11 +65,45 @@ if ($report.status -ne 'passed' -or $report.modelCalls -ne 2 -or
     $report.attempts[1].status -ne 'passed') {
     throw 'Agent result does not prove a failed build followed by successful correction.'
 }
+$microVmReports = @()
 foreach ($entry in @($report.attempts)) {
     if ($entry.cleanupSucceeded -ne $true -or
         -not (Test-Path -LiteralPath $entry.reportPath)) {
         throw ('MicroVM cleanup/report missing on attempt {0}.' -f $entry.number)
     }
+    $vm = Get-Content -LiteralPath $entry.reportPath -Raw | ConvertFrom-Json
+    if ($vm.runId -notmatch '^[a-f0-9]{32}
+$after = @(& git -C $repo status --porcelain=v1)
+if ($LASTEXITCODE -ne 0 -or (Compare-Object $before $after)) {
+    throw 'The source Git checkout changed during the agent run.'
+}
+$lastHead = (& git -C $repo rev-parse HEAD)
+if ($lastHead -ne $head) {
+    throw 'The source Git HEAD changed during the agent run.'
+}
+Write-Host 'PASS: CLI/parser + Akka host, compiler fail/correct, 2 MicroVM cleanups, unchanged Git.' -ForegroundColor Green
+Write-Host ('Model calls (scripted, no API charges): ' + $report.modelCalls)
+Write-Host ('Current HEAD: ' + $head)
+Write-Host ('Full acceptance report: ' + $reportPath)
+ -or
+        $vm.sandboxRemovalSucceeded -ne $true -or
+        $vm.restoreExitCode -ne 0 -or $vm.timedOut -ne $false) {
+        throw ('Invalid or unclean MicroVM report on attempt {0}.' -f $entry.number)
+    }
+    $microVmReports += $vm
+    $sandboxName = 'hami-code-' + $vm.runId.Substring(0, 12)
+    $inspect = (& sbx inspect $sandboxName 2>&1 | Out-String)
+    $inspectExit = $LASTEXITCODE
+    if ($inspectExit -eq 0 -or $inspect -notmatch '(?i)sandbox not found') {
+        throw ('Cleanup could not be independently confirmed for {0}: {1}' -f $sandboxName, $inspect.Trim())
+    }
+    Write-Host ('PASS: ' + $sandboxName + ' was removed (independent sbx inspect).')
+}
+if ($microVmReports[0].buildExitCode -eq 0 -or
+    $microVmReports[0].executionExitCode -ne -1 -or
+    $microVmReports[1].buildExitCode -ne 0 -or
+    $microVmReports[1].executionExitCode -ne 0) {
+    throw 'Expected first failed compiler phase, then clean build+run in second isolated VM.'
 }
 $after = @(& git -C $repo status --porcelain=v1)
 if ($LASTEXITCODE -ne 0 -or (Compare-Object $before $after)) {
