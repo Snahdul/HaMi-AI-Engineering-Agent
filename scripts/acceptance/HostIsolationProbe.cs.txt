@@ -42,10 +42,13 @@ string[] sensitiveEnvNames = {
     "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AZURE_CLIENT_SECRET",
     "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK"
 };
-int sensitiveEnvCount = sensitiveEnvNames.Count(
-    name => Environment.GetEnvironmentVariable(name) != null);
-Console.WriteLine("SENSITIVE_ENV_COUNT=" + sensitiveEnvCount);
-if (sensitiveEnvCount > 0) failures.Add("SENSITIVE_ENV_PRESENT");
+// Print only predefined variable NAMES, never values, paths or token contents.
+string[] presentSensitiveEnvNames = sensitiveEnvNames.Where(
+    name => Environment.GetEnvironmentVariable(name) != null).ToArray();
+Console.WriteLine("SENSITIVE_ENV_COUNT=" + presentSensitiveEnvNames.Length);
+Console.WriteLine("SENSITIVE_ENV_NAMES=" +
+    (presentSensitiveEnvNames.Length == 0 ? "none" : string.Join(",", presentSensitiveEnvNames)));
+if (presentSensitiveEnvNames.Length > 0) failures.Add("SENSITIVE_ENV_PRESENT");
 
 foreach (string line in File.ReadLines("/proc/self/mountinfo"))
 {
