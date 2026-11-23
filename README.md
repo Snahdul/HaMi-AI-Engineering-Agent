@@ -431,9 +431,9 @@ Voraussetzung: lokale Vorlage `hami-dotnet11:0.1` mit .NET 11.0.100 und ICU,
 `sbx` installiert und globale Netzwerkpolicy default deny.
 
 ```powershell
+Clear-Host
 $repo = 'I:\git\HaMi\HaMi-AI-Engineering-Agent'
 $snapshot = 'G:\HaMi\Sandbox\Candidates\demo-console'
-Clear-Host
 dotnet run --project "$repo\src\HaMi.Agentic.Cli" -c Release -- `
   development --repo $repo --sandbox-run `
   --source $snapshot --project Demo.csproj --mode run `
@@ -488,6 +488,46 @@ Dateiübertragung 321 ms, Restore 910 ms, Build 1173 ms,
 Ausführung 528 ms und Bereinigung 556 ms. Das ist **ein**
 Messwert und noch kein Performance-Benchmark.
 
-Die CI prüft Eingabe-/Pfad-/Netzwerk-Guards ohne echte MicroVM. Der
-Timeout-/Abbruch- sowie Isolationstest mit beliebigem C# steht vor
-der Mergefreigabe noch aus. Kein automatischer PR-Merge.
+Auf HaMi11 wurden Timeout und anschließende MicroVM-Entfernung,
+Netzwerk-Default-Deny für einen Internet-HTTPS- und einen Management-LAN-HTTP-
+Kontakt sowie die fehlenden typischen Host-Mountpfade praktisch geprüft.
+Die Einzelbelege stehen in Issue #33 / PR #35. Weitere Ressourcenmessungen,
+Secret-/Host-Canary-Prüfung und menschliche Mergefreigabe bleiben erforderlich.
+
+### HaMi11-Sammelabnahme – ein Durchlauf statt vieler Einzelbefehle
+
+Das versionierte Skript `scripts/acceptance/Invoke-HaMiSandboxAcceptance.ps1`
+erzeugt **eigene** kurzlebige C#-Snapshots und eine ausschließlich auf dem
+Host gespeicherte Dummy-Canary-Datei. Es prüft Hostpfade, leeren
+Secret-Mount, ausgewählte sicherheitsrelevante Umgebungsvariablen,
+Gast-CPU/-RAM, erwarteten Compilerfehler samt Log, Ablehnung einer
+`.env`-Datei **vor** Erzeugung einer MicroVM und drei vollständige
+Restore-/Build-/Run-Lebenszyklen. Der Runner bereinigt weiterhin nur
+seine selbst erzeugten Sandboxes. Die globalen Docker-Regeln werden
+nicht verändert, produktive Daten werden nicht gelesen.
+
+Aus dem separaten **Review-Worktree** auf dem aktuellen PR-Branch
+`feature/issue33-general-csharp-sandbox-runner-20261120`:
+
+```powershell
+Clear-Host
+git fetch origin
+git switch --detach origin/feature/issue33-general-csharp-sandbox-runner-20261120
+& .\scripts\acceptance\Invoke-HaMiSandboxAcceptance.ps1
+```
+
+Das Skript zeigt jeden Test live und schreibt
+`G:\HaMi\Sandbox\PoC\Runs\acceptance-<ID>\acceptance-summary.json`
+inklusive PASS/FAIL, Phasen-/Lebenszyklusmessungen und gesammelter
+Host-RAM-Stichproben. Letztere zeigen **systemweit verfügbaren RAM**,
+nicht den isolierten RAM-Verbrauch einer einzelnen MicroVM.
+Test-Snapshots bleiben für die Nachvollziehbarkeit unter
+`G:\HaMi\Sandbox\Candidates\acceptance-<ID>\` liegen.
+Ergebnisse der zuvor bestandenen Internet-/LAN-/Timeout-Negativtests
+werden referenziert, **nicht erneut ausgeführt**.
+
+Das Batch-Ergebnis liefert einen reproduzierbaren Sicherheits- und
+Leistungsbefund. Ein `PASS` bedeutet **keine Freigabe aller denkbaren
+Zugriffswege** und führt weder zu produktivem KI-Code-Lauf noch zum
+automatischen PR-Merge. Der Benutzer entscheidet über den Go/No-Go-
+Einsatz des begrenzten Offline-Runners nach gemeinsamer Auswertung.
