@@ -420,3 +420,159 @@ Test-Sandbox nicht; Kaltstart-/Lebenszyklusmessung und die
 Freigabe für beliebigen generierten Code stehen noch aus.
 Die CI testet den festen Guard und das Report-Schema ohne Docker.
 
+## HaMi Developer: beliebiger generierter C#-Code in frischer MicroVM (Issue #33)
+
+Der neue Modus `development --sandbox-run` akzeptiert ein vorbereitetes C#-Projekt,
+nicht nur den RetryBudget-PoC. Der beliebige Projektcode wird **nur innerhalb**
+einer frischen, lokalen Docker-MicroVM gebaut und ausgeführt; keine Host-Shell,
+keine Modell-Keys, kein Repo-Mount und kein GitHub-Schreibzugriff im Gast.
+
+Voraussetzung: lokale Vorlage `hami-dotnet11:0.1` mit .NET 11.0.100 und ICU,
+`sbx` installiert und globale Netzwerkpolicy default deny.
+
+```powershell
+Clear-Host
+$repo = 'I:\git\HaMi\HaMi-AI-Engineering-Agent'
+$snapshot = 'G:\HaMi\Sandbox\Candidates\demo-console'
+dotnet run --project "$repo\src\HaMi.Agentic.Cli" -c Release -- `
+  development --repo $repo --sandbox-run `
+  --source $snapshot --project Demo.csproj --mode run `
+  --results-dir 'G:\HaMi\Sandbox\PoC\Runs'
+```
+
+Modi: `build` (nur Restore/Build), `run` (zusätzlich `dotnet run`),
+`test` (zusätzlich `dotnet test`). Unterprojekte als relativen
+Projektpfad angeben, z. B. `src/App/App.csproj`.
+
+Der Runner überträgt einen Snapshot mit höchstens **512 Dateien / 16 MiB**.
+Metadaten-/Credential-Dateien, Symlinks und Junctions sind gesperrt.
+Restore erfolgt **offline** aus einem leeren Gast-Paketverzeichnis.
+Externe NuGet-Pakete benötigen später einen separat bereitgestellten
+geprüften Offline-Cache. Es gibt keine vom Modell gewählten Shell-Kommandos.
+
+Pro Auftrag wird eine neue mountlose MicroVM mit 4 vCPU / 4 GiB RAM
+erstellt. Workspace, Host-Mounts, Secrets, MCP-Server, Ports und drei
+Netzwerkziele werden vor der Codeausführung kontrolliert. Zeitlimits
+gelten pro Phase (Restore 75 s, Build 120 s, Ausführung 60 s).
+Im `finally` wird die **vom Runner selbst erzeugte** Sandbox mit
+`sbx rm --force` entfernt. Der bisherige PoC bleibt unverändert.
+
+Auf dem Host entstehen unter `reports/hami-code-<id>/` die Dateien
+`report.json`, `restore.log`, `build.log` und bei Ausführung
+`execution.log`. Der JSON-Bericht enthält getrennte Exitcodes,
+Timeout-/Cleanup-Status und Phasenzeiten. Logs sind unvertrauenswürdige
+Diagnosen und werden niemals auf dem Host ausgeführt.
+
+Während der Ausführung meldet der Runner seinen Fortschritt **direkt
+und fortlaufend im Terminal**: Auftrags-ID, VM-Name, Template, Projekt,
+Status der Sicherheits-/SDK-Prüfung, Kopieren, Restore, Build,
+Ausführung und Entfernung der MicroVM. Jede Meldung enthält die seit
+Auftragsbeginn vergangene Zeit; abgeschlossene Phasen zeigen ihre
+Dauer und den Exitcode. **Nach** Abschluss des Auftrags wird
+automatisch eine **begrenzte, entschärfte Vorschau** des relevanten Logs
+im Terminal angezeigt: bei Restore-Fehler `restore.log`, bei
+Compilerfehler `build.log`, ansonsten `execution.log` bzw. im
+Modus `build` `build.log`. Die Vorschau ist auf 4096 Zeichen /
+80 Zeilen begrenzt; ANSI-Steuerzeichen und Unicode-Formatkontrollen
+werden neutralisiert. Die vollständigen, unveränderten Diagnosen
+liegen weiterhin im Ergebnisverzeichnis. Gast-Ausgaben werden
+**nicht live gestreamt**. Bei Timeout ohne abgeschlossenes `sbx exec`
+existiert unter Umständen keine `execution.log`; dies wird angezeigt.
+`Clear-Host` gehört ausschließlich vor den interaktiven
+PowerShell-Aufruf, nicht in den Runner selbst.
+
+Erster echter HaMi11-Realtest (Demo.csproj, Modus run): Restore 0,
+Build 0, Ausführung 0, Timeout false, VM wurde entfernt,
+`totalMilliseconds=11527`. Davon VM-Erstellung 6998 ms,
+Dateiübertragung 321 ms, Restore 910 ms, Build 1173 ms,
+Ausführung 528 ms und Bereinigung 556 ms. Das ist **ein**
+Messwert und noch kein Performance-Benchmark.
+
+Auf HaMi11 wurden Timeout und anschließende MicroVM-Entfernung,
+Netzwerk-Default-Deny für einen Internet-HTTPS- und einen Management-LAN-HTTP-
+Kontakt sowie die fehlenden typischen Host-Mountpfade praktisch geprüft.
+Die Einzelbelege stehen in Issue #33 / PR #35. Weitere Ressourcenmessungen,
+Secret-/Host-Canary-Prüfung und menschliche Mergefreigabe bleiben erforderlich.
+
+### Credential-Vorprüfung für die Sandbox (Issue #33)
+
+Der erste echte Host-/Secret-Test fand im Gast den Namen `GH_TOKEN`.
+Damit war **noch kein Tokenwert** nachgewiesen: Docker kann einen
+deklarierten, aber leeren Variablennamen bereitstellen. Bei der
+Abnahme wird daher **leer** von **nicht leer** unterschieden; Werte
+werden niemals protokolliert.
+
+Der allgemeine Runner entfernt die sechs überwachten Credential-
+Variablen (`OPENAI_API_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`,
+`AZURE_CLIENT_SECRET`, `AWS_SECRET_ACCESS_KEY`, `SSH_AUTH_SOCK`)
+aus der Prozessumgebung jeder `sbx`-Invocation, setzt sie beim
+Erstellen der MicroVM explizit leer und führt **vor** SDK-Check und
+Snapshot-Kopie eine feste Gast-Prüfung durch. Ein nichtleerer Wert
+führt zum Abbruch und zur anschließenden VM-Bereinigung. Gastcode
+wird in diesem Fall nicht übertragen oder ausgeführt.
+
+Die Gast-Diagnose nennt ausschließlich den Variablennamen, niemals
+einen geheimen Wert. Dies schützt die ausdrücklich überwachten
+Variablen, ist aber kein formaler Beweis für die Abwesenheit jeder
+denkbaren anderen Secret-Quelle.
+
+Der gezielte erneute Realtest erfolgt ohne Wiederholung der übrigen
+fünf bereits bestandenen Checks:
+
+```powershell
+Clear-Host
+$review = 'G:\HaMi\Sandbox\PoC\Runner-PR35'
+git -C $review fetch origin
+if ($LASTEXITCODE -ne 0) { throw 'Git fetch fehlgeschlagen.' }
+git -C $review switch --detach origin/feature/issue33-general-csharp-sandbox-runner-20261120
+if ($LASTEXITCODE -ne 0) { throw 'Git switch fehlgeschlagen.' }
+& "$review\scripts\acceptance\Invoke-HaMiSandboxAcceptance.ps1" -SecurityOnly
+```
+
+### HaMi11-Sammelabnahme – ein Durchlauf statt vieler Einzelbefehle
+
+Das versionierte Skript `scripts/acceptance/Invoke-HaMiSandboxAcceptance.ps1`
+erzeugt **eigene** kurzlebige C#-Snapshots und eine ausschließlich auf dem
+Host gespeicherte Dummy-Canary-Datei. Es prüft Hostpfade, leeren
+Secret-Mount, ausgewählte sicherheitsrelevante Umgebungsvariablen,
+Gast-CPU/-RAM, erwarteten Compilerfehler samt Log, Ablehnung einer
+`.env`-Datei **vor** Erzeugung einer MicroVM und drei vollständige
+Restore-/Build-/Run-Lebenszyklen. Der Runner bereinigt weiterhin nur
+seine selbst erzeugten Sandboxes. Die globalen Docker-Regeln werden
+nicht verändert, produktive Daten werden nicht gelesen.
+
+Aus dem separaten **Review-Worktree** auf dem aktuellen PR-Branch
+`feature/issue33-general-csharp-sandbox-runner-20261120`:
+
+```powershell
+Clear-Host
+git fetch origin
+git switch --detach origin/feature/issue33-general-csharp-sandbox-runner-20261120
+& .\scripts\acceptance\Invoke-HaMiSandboxAcceptance.ps1
+```
+
+Falls **nur** ein Sicherheitsbefund erneut geprüft werden muss, ist
+`-SecurityOnly` verfügbar: Dieser Modus wiederholt lediglich den
+Host-/Secret-/Gastressourcentest und erstellt einen gesonderten
+Teilprüfbericht. Vorhandene Compiler-/Snapshot-/Performancetests werden
+**nicht** wiederholt. Für die Diagnose werden bei gesetzten
+sicherheitsrelevanten Umgebungsvariablen ausschließlich **vordefinierte
+Variablennamen** protokolliert, niemals deren Werte. Solange eine
+unerklärte Variable im Gast vorhanden ist, schlägt die Teilprüfung
+vorsätzlich fehl; es gibt keine automatische Freigabe.
+
+Das Skript zeigt jeden Test live und schreibt
+`G:\HaMi\Sandbox\PoC\Runs\acceptance-<ID>\acceptance-summary.json`
+inklusive PASS/FAIL, Phasen-/Lebenszyklusmessungen und gesammelter
+Host-RAM-Stichproben. Letztere zeigen **systemweit verfügbaren RAM**,
+nicht den isolierten RAM-Verbrauch einer einzelnen MicroVM.
+Test-Snapshots bleiben für die Nachvollziehbarkeit unter
+`G:\HaMi\Sandbox\Candidates\acceptance-<ID>\` liegen.
+Ergebnisse der zuvor bestandenen Internet-/LAN-/Timeout-Negativtests
+werden referenziert, **nicht erneut ausgeführt**.
+
+Das Batch-Ergebnis liefert einen reproduzierbaren Sicherheits- und
+Leistungsbefund. Ein `PASS` bedeutet **keine Freigabe aller denkbaren
+Zugriffswege** und führt weder zu produktivem KI-Code-Lauf noch zum
+automatischen PR-Merge. Der Benutzer entscheidet über den Go/No-Go-
+Einsatz des begrenzten Offline-Runners nach gemeinsamer Auswertung.
