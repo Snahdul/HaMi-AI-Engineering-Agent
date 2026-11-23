@@ -1,0 +1,79 @@
+// Copy into a fresh temporary snapshot; substitute the three placeholders.
+// Only a disposable dummy canary file on the host may be targeted.
+using System;
+using System.IO;
+using System.Linq;
+using System.Collections.Generic;
+using System.Globalization;
+
+var failures = new List<string>();
+string drive = "__DRIVE__";
+string relative = "__RELATIVE__";
+string hostWindowsPath = __WINJSON__;
+string[] canaryCandidates = {
+    "/mnt/" + drive + "/" + relative,
+    "/mnt/host/" + drive + "/" + relative,
+    "/host_mnt/" + drive + "/" + relative,
+    "/run/desktop/mnt/host/" + drive + "/" + relative,
+    "/run/host/" + drive + "/" + relative,
+    hostWindowsPath
+};
+foreach (string path in canaryCandidates)
+    if (File.Exists(path)) failures.Add("HOST_CANARY_ACCESSIBLE");
+
+string[] commonHostMounts = {
+    "/mnt/c", "/mnt/g", "/mnt/host", "/host_mnt",
+    "/run/desktop/mnt/host", "/run/host"
+};
+foreach (string path in commonHostMounts)
+{
+    bool present = Directory.Exists(path);
+    Console.WriteLine("HOST_MOUNT " + path + ": " + (present ? "PRESENT" : "absent"));
+    if (present) failures.Add("HOST_MOUNT_PRESENT");
+}
+
+if (Directory.Exists("/run/secrets"))
+{
+    bool populated = Directory.EnumerateFileSystemEntries("/run/secrets").Any();
+    Console.WriteLine("SECRETS_POPULATED=" + populated);
+    if (populated) failures.Add("GUEST_SECRETS_PRESENT");
+}
+string[] sensitiveEnvNames = {
+    "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AZURE_CLIENT_SECRET",
+    "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK"
+};
+int sensitiveEnvCount = sensitiveEnvNames.Count(
+    name => Environment.GetEnvironmentVariable(name) != null);
+Console.WriteLine("SENSITIVE_ENV_COUNT=" + sensitiveEnvCount);
+if (sensitiveEnvCount > 0) failures.Add("SENSITIVE_ENV_PRESENT");
+
+foreach (string line in File.ReadLines("/proc/self/mountinfo"))
+{
+    string[] halves = line.Split(new[] { " - " }, 2, StringSplitOptions.None);
+    if (halves.Length != 2) continue;
+    string[] mountFields = halves[0].Split(' ');
+    string[] fsFields = halves[1].Split(' ');
+    if (mountFields.Length < 5 || fsFields.Length == 0) continue;
+    string mount = mountFields[4], fileSystem = fsFields[0];
+    Console.WriteLine("MOUNT " + mount + ": " + fileSystem);
+    if (fileSystem == "virtiofs" && mount != "/etc/resolv.conf")
+        failures.Add("UNEXPECTED_VIRTIOFS");
+}
+int cpus = Environment.ProcessorCount;
+Console.WriteLine("GUEST_CPU_COUNT=" + cpus);
+if (cpus is < 1 or > 4) failures.Add("CPU_LIMIT_NOT_CONFIRMED");
+
+string memLine = File.ReadLines("/proc/meminfo")
+    .First(x => x.StartsWith("MemTotal:", StringComparison.Ordinal));
+long kib = long.Parse(
+    memLine.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)[1],
+    CultureInfo.InvariantCulture);
+Console.WriteLine("GUEST_MEMORY_MIB=" + (kib / 1024));
+if (kib < 512L * 1024 || kib > 5L * 1024 * 1024)
+    failures.Add("GUEST_RAM_LIMIT_NOT_CONFIRMED");
+Console.WriteLine("HOST_CANARY=" +
+    (failures.Contains("HOST_CANARY_ACCESSIBLE") ? "ACCESSIBLE" : "not accessible"));
+Console.WriteLine("SECURITY_STATUS=" + (failures.Count == 0 ? "PASS" : "FAIL"));
+foreach (string failure in failures.Distinct())
+    Console.WriteLine("VIOLATION=" + failure);
+return failures.Count == 0 ? 0 : 1;
