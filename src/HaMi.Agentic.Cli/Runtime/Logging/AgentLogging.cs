@@ -80,7 +80,7 @@ internal sealed class AgentLoggingSession : IDisposable
     public AgentLoggingSettings Settings { get; }
     public string LogDirectory { get; }
 
-    private AgentLoggingSession(AgentLoggingSettings settings, string root)
+    private AgentLoggingSession(AgentLoggingSettings settings, string root, bool includeConsole = false)
     {
         Settings = settings;
         LogDirectory = Path.Combine(Path.GetFullPath(root), settings.RelativeDirectory);
@@ -105,11 +105,18 @@ internal sealed class AgentLoggingSession : IDisposable
             // factory. AddProvider(instance) leaves the externally created
             // singleton undisposed; on Windows the .clef file then remains locked.
             builder.AddSerilog(sink, dispose: true);
+            if (includeConsole)
+                builder.AddSimpleConsole(options =>
+                {
+                    options.SingleLine = true;
+                    options.TimestampFormat = "HH:mm:ss.fff ";
+                    options.IncludeScopes = false;
+                });
         });
     }
 
-    public static AgentLoggingSession Create(string repository) =>
-        new(AgentLoggingSettings.Load(repository), RuntimeSettings.GetWorktreeRoot(repository));
+    public static AgentLoggingSession Create(string repository, bool includeConsole = false) =>
+        new(AgentLoggingSettings.Load(repository), RuntimeSettings.GetWorktreeRoot(repository), includeConsole);
 
     internal static AgentLoggingSession CreateForTest(
         AgentLoggingSettings settings, string temporaryRoot) =>
