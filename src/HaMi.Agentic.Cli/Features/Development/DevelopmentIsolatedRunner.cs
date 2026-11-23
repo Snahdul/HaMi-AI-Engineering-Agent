@@ -64,17 +64,20 @@ internal sealed class DevelopmentIsolatedRunner(
             && report.ExecutionExitCode == 0
             && !report.TimedOut && report.SandboxRemovalSucceeded;
 
-        string log = report.BuildExitCode != 0 ? "build.log" : "execution.log";
+        // Restore/preflight failures are infrastructure failures, NOT
+        // compiler failures. Return their status explicitly to the actor.
+        string log = report.RestoreExitCode != 0 ? "restore.log"
+            : report.BuildExitCode != 0 ? "build.log" : "execution.log";
         string file = Path.Combine(dirs[0], log);
         string feedback = File.Exists(file)
             ? await File.ReadAllTextAsync(file, cancellationToken) : "No sandbox diagnostics recorded.";
+        string boundedFeedback = DevelopmentSandboxRunner.SafeLogPreview(feedback);
+        if (boundedFeedback.Length > 1200) boundedFeedback = boundedFeedback[..1200];
 
         return new DevelopmentSandboxAttempt(
             passed, report.RestoreExitCode, report.BuildExitCode, report.ExecutionExitCode,
             report.TimedOut, report.SandboxRemovalSucceeded,
-            DevelopmentSandboxRunner.SafeLogPreview(feedback)[..Math.Min(
-                1200, DevelopmentSandboxRunner.SafeLogPreview(feedback).Length)],
-            reportPath);
+            boundedFeedback, reportPath, report.Error);
     }
 
     private static bool IsInside(string parent, string child)
