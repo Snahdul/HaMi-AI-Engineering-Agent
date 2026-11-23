@@ -91,7 +91,9 @@ internal static class CommandLineRouter
             || valid.Parse(["coding", "--repo", ".", "--unattended", "--task", "clamp-kata"]).Errors.Count != 0
             || valid.Parse(["workflow", "--repo", ".", "--manifest", "workflows/mvp02.json", "--validate"]).Errors.Count != 0
             || valid.Parse(["development", "--repo", ".", "--model"]).Errors.Count == 0
-            || valid.Parse(["development", "--unknown-option"]).Errors.Count == 0)
-            throw new InvalidOperationException("CLI parser accepted invalid options or rejected legacy flags.");
+            || valid.Parse(["development", "--unknown-option"]).Errors.Count == 0
+            || valid.Parse(["--check", "."]).Errors.Count == 0
+            || valid.Parse(["--unattended"]).Errors.Count == 0)
+            throw new InvalidOperationException("CLI parser accepted implicit legacy Replay dispatch or rejected a named command.");
     }
 }
