@@ -23,9 +23,7 @@ internal sealed class DevelopmentIsolatedRunner(
         if (generatedSource.Length > 16 * 1024 || string.IsNullOrWhiteSpace(generatedSource))
             throw new InvalidOperationException("Generated source is empty or exceeds the reviewed cap.");
 
-        if (IsInside(repo, root) || IsInside(fixture, root)
-            || IsInside(root, repo) || IsInside(root, fixture))
-            throw new InvalidOperationException("Sandbox reports/staging must be separate from repository and fixture.");
+        ValidateStoragePaths(repo, fixture, root);
 
         string[] files = DevelopmentSandboxRunner.InspectSnapshot(fixture, contract.ProjectFile);
         if (files.Length != 2
@@ -78,6 +76,33 @@ internal sealed class DevelopmentIsolatedRunner(
             passed, report.RestoreExitCode, report.BuildExitCode, report.ExecutionExitCode,
             report.TimedOut, report.SandboxRemovalSucceeded,
             boundedFeedback, reportPath, report.Error);
+    }
+
+    internal static void ValidateStoragePaths(
+        string repository, string trustedFixture, string resultsDirectory)
+    {
+        if (!Path.IsPathFullyQualified(resultsDirectory))
+            throw new InvalidOperationException("Agent results directory must be absolute.");
+
+        string repoPath = Path.GetFullPath(repository);
+        string fixturePath = Path.GetFullPath(trustedFixture);
+        string resultsPath = Path.GetFullPath(resultsDirectory);
+
+        if (IsInside(repoPath, resultsPath) || IsInside(fixturePath, resultsPath)
+            || IsInside(resultsPath, repoPath) || IsInside(resultsPath, fixturePath))
+            throw new InvalidOperationException(
+                "Agent results must be separate from the repository and its fixture.");
+
+        // Prevent a results path outside the checkout from following an
+        // existing junction/symlink back into the protected checkout.
+        for (DirectoryInfo? directory = new(resultsPath);
+             directory is not null; directory = directory.Parent)
+        {
+            if (directory.Exists &&
+                (directory.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException(
+                    "Agent results path may not traverse directory reparse points.");
+        }
     }
 
     private static bool IsInside(string parent, string child)
