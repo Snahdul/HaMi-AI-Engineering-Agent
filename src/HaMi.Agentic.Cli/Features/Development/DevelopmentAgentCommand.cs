@@ -33,6 +33,7 @@ internal static class DevelopmentAgentCommand
             if (logging.Settings.LogSuccessfulSteps)
                 DevelopmentLogEvents.JobRequested(logger, jobId, repo, resultsDirectory,
                     live ? "live" : "offline-scripted",
+                    live ? (requestedModel is { Length: <= 64 } ? requestedModel : "gpt-5.4-mini") : "scripted",
                     contractPath ?? DevelopmentAgentContract.TrustedPath);
 
             phase = "contract";
@@ -275,7 +276,7 @@ internal static class DevelopmentAgentCommand
                 Microsoft.Extensions.Logging.ILogger logger =
                     session.CreateLogger("HaMi.Agentic.Cli.Features.Development");
                 DevelopmentLogEvents.JobRequested(logger, id, repo, temp, "offline-scripted",
-                    DevelopmentAgentContract.TrustedPath);
+                    "scripted", DevelopmentAgentContract.TrustedPath);
                 DevelopmentLogEvents.PreflightAccepted(logger, id, contract.TaskId,
                     contract.ProjectFile, contract.MaxAttempts);
                 DevelopmentJobReport report = await DevelopmentActorCoordinator.RunAsync(
