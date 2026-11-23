@@ -72,20 +72,7 @@ foreach ($entry in @($report.attempts)) {
         throw ('MicroVM cleanup/report missing on attempt {0}.' -f $entry.number)
     }
     $vm = Get-Content -LiteralPath $entry.reportPath -Raw | ConvertFrom-Json
-    if ($vm.runId -notmatch '^[a-f0-9]{32}
-$after = @(& git -C $repo status --porcelain=v1)
-if ($LASTEXITCODE -ne 0 -or (Compare-Object $before $after)) {
-    throw 'The source Git checkout changed during the agent run.'
-}
-$lastHead = (& git -C $repo rev-parse HEAD)
-if ($lastHead -ne $head) {
-    throw 'The source Git HEAD changed during the agent run.'
-}
-Write-Host 'PASS: CLI/parser + Akka host, compiler fail/correct, 2 MicroVM cleanups, unchanged Git.' -ForegroundColor Green
-Write-Host ('Model calls (scripted, no API charges): ' + $report.modelCalls)
-Write-Host ('Current HEAD: ' + $head)
-Write-Host ('Full acceptance report: ' + $reportPath)
- -or
+    if ($vm.runId -notmatch '^[a-f0-9]{32}$' -or
         $vm.sandboxRemovalSucceeded -ne $true -or
         $vm.restoreExitCode -ne 0 -or $vm.timedOut -ne $false) {
         throw ('Invalid or unclean MicroVM report on attempt {0}.' -f $entry.number)
