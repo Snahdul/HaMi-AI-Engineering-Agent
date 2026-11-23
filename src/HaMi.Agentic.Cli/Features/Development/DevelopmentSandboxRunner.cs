@@ -16,6 +16,8 @@ internal static class DevelopmentSandboxRunner
     private const int MaxFiles = 512;
     private const long MaxBytes = 16 * 1024 * 1024;
     private const int MaxOutputChars = 256 * 1024;
+    private const int MaxLogPreviewChars = 4096;
+    private const int MaxLogPreviewLines = 80;
 
     internal sealed record SandboxRunReport(
         int SchemaVersion, string RunId, string Project, string Mode,
@@ -219,6 +221,7 @@ internal static class DevelopmentSandboxRunner
         Console.WriteLine($"Sandbox report: {reportPath}");
         Console.WriteLine($"Restore: {restore}; build: {build}; {mode}: {execution}; timeout: {timedOut}");
         if (error is not null) Console.Error.WriteLine(error);
+        ShowResultLog(reportDir, mode, restore, build, timedOut);
         return error is null && sandboxRemovalSucceeded && restore == 0 && build == 0
             && (mode == "build" || execution == 0) ? 0 : 1;
     }
@@ -227,6 +230,73 @@ internal static class DevelopmentSandboxRunner
     {
         Console.WriteLine($"[HaMi Sandbox +{elapsed.Elapsed.TotalSeconds:F2}s] {message}");
         Console.Out.Flush();
+    }
+
+    // Guest programs and compiler diagnostics are untrusted. Display only a
+    // bounded and control-character-safe preview; retain the full log on disk.
+    private static void ShowResultLog(string directory, string mode,
+        int restoreExit, int buildExit, bool timedOut)
+    {
+        string logName = restoreExit != 0 ? "restore.log"
+            : buildExit != 0 || mode == "build" ? "build.log"
+            : "execution.log";
+        string logPath = Path.Combine(directory, logName);
+        if (!File.Exists(logPath))
+        {
+            if (timedOut)
+                Console.WriteLine("Keine Ausführungsdiagnose gespeichert (sbx exec durch Timeout abgebrochen).");
+            return;
+        }
+
+        try
+        {
+            string contents = File.ReadAllText(logPath);
+            Console.WriteLine($"--- Sandbox-Ergebnis ({logName}, begrenzte Vorschau) ---");
+            Console.WriteLine(string.IsNullOrWhiteSpace(contents)
+                ? "(keine Ausgabe)" : SafeLogPreview(contents));
+            Console.WriteLine($"Vollständiges Log: {logPath}");
+        }
+        catch (IOException ex)
+        {
+            Console.Error.WriteLine($"Log-Vorschau nicht verfügbar: {ex.GetType().Name}");
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.Error.WriteLine($"Log-Vorschau nicht verfügbar: {ex.GetType().Name}");
+        }
+    }
+
+    internal static string SafeLogPreview(string text)
+    {
+        var buffer = new StringBuilder(Math.Min(text.Length, MaxLogPreviewChars));
+        int lines = 0;
+        bool truncated = false;
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (c == '\r')
+            {
+                if (i + 1 < text.Length && text[i + 1] == '\n') continue;
+                c = '\n';
+            }
+            if (buffer.Length >= MaxLogPreviewChars ||
+                (c == '\n' && lines >= MaxLogPreviewLines))
+            {
+                truncated = true;
+                break;
+            }
+            if (c == '\n') lines++;
+            // Avoid terminal escape sequences, carriage-return overwrites,
+            // Unicode direction overrides and other formatting controls.
+            if ((char.IsControl(c) && c is not ('\n' or '\t')) ||
+                char.GetUnicodeCategory(c) == System.Globalization.UnicodeCategory.Format ||
+                c is '\u2028' or '\u2029')
+                c = '?';
+            buffer.Append(c);
+        }
+        if (truncated)
+            buffer.Append("\n[Ausgabe gekürzt; vollständige Diagnose in der Logdatei]");
+        return buffer.ToString();
     }
 
     private static async Task WriteOutputAsync(string dir, string filename, SandboxProcess process)
@@ -439,6 +509,19 @@ internal static class DevelopmentSandboxRunner
         {
             Directory.Delete(root, recursive: true);
         }
+
+        string sanitized = SafeLogPreview("Hello\r\n\u001b[31mFAIL\u001b[0m\roverride\u202e");
+        if (sanitized.Contains('\u001b') || sanitized.Contains('\r')
+            || sanitized.Contains('\u202e')
+            || !sanitized.Contains("Hello\n?[31mFAIL?[0m\noverride?", StringComparison.Ordinal))
+            throw new InvalidOperationException("Untrusted log control characters were not neutralized.");
+        string oversized = SafeLogPreview(new string('x', MaxLogPreviewChars + 10));
+        if (!oversized.Contains("[Ausgabe gekürzt;", StringComparison.Ordinal)
+            || oversized.Length > MaxLogPreviewChars + 100)
+            throw new InvalidOperationException("Log preview character limit is not enforced.");
+        string tooManyLines = SafeLogPreview(string.Concat(Enumerable.Repeat("line\n", MaxLogPreviewLines + 3)));
+        if (!tooManyLines.Contains("[Ausgabe gekürzt;", StringComparison.Ordinal))
+            throw new InvalidOperationException("Log preview line limit is not enforced.");
 
         ValidateDeny(new SandboxProcess(1,
             "Denied: api.github.com:443\nReason: no matching allow rule (default deny)", ""),
