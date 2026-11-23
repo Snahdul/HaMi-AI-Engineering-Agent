@@ -19,7 +19,8 @@ internal interface IDevelopmentIsolatedRunner
 
 internal sealed record DevelopmentSandboxAttempt(
     bool Succeeded, int RestoreExitCode, int BuildExitCode, int RunExitCode,
-    bool TimedOut, bool CleanupSucceeded, string Feedback, string? ReportPath);
+    bool TimedOut, bool CleanupSucceeded, string Feedback, string? ReportPath,
+    string? InfrastructureError = null);
 
 internal sealed record DevelopmentJobAttempt(
     int Number, string Status, int RestoreExitCode, int BuildExitCode,
@@ -115,10 +116,10 @@ internal sealed class DevelopmentJobActor : ReceiveActor
         {
             if (stage != Stage.Executing || message.Attempt != attempt) return;
             DevelopmentSandboxAttempt result = message.Result;
-            string status = result.Succeeded && result.CleanupSucceeded
-                ? "passed" : result.TimedOut ? "timed-out"
-                : !result.CleanupSucceeded ? "cleanup-failed"
-                : result.BuildExitCode != 0 ? "build-failed" : "run-failed";
+            // Retry ONLY an observed compiler or program failure. In particular,
+            // sbx/preflight/restore failures have -1 phase codes and MUST NOT
+            // be mistaken for ordinary C# compiler diagnostics.
+            string status = ClassifyResult(result);
             attempts.Add(new DevelopmentJobAttempt(attempt, status,
                 result.RestoreExitCode, result.BuildExitCode, result.RunExitCode,
                 result.TimedOut, result.CleanupSucceeded, result.ReportPath));
@@ -129,9 +130,10 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 return;
             }
 
-            // A timeout or unconfirmed VM deletion is not an ordinary compiler
-            // failure; never retry these potentially side-effecting outcomes.
-            if (result.TimedOut || !result.CleanupSucceeded)
+            // No automatic retry after infrastructure, restore, timeout or
+            // unconfirmed cleanup failure. The next attempt may run ONLY after
+            // a completed isolated compiler/program failure with confirmed cleanup.
+            if (status is not ("build-failed" or "run-failed"))
             {
                 Finish("failed", status);
                 return;
@@ -158,6 +160,27 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 Finish("cancelled", "Cancelled by caller.");
             }
         });
+    }
+
+    private static string ClassifyResult(DevelopmentSandboxAttempt result)
+    {
+        if (!result.CleanupSucceeded) return "cleanup-failed";
+        if (result.TimedOut) return "timed-out";
+        if (result.InfrastructureError is not null || result.RestoreExitCode != 0
+            || result.BuildExitCode < 0)
+            return "infrastructure-failed";
+        if (result.Succeeded && result.BuildExitCode == 0 && result.RunExitCode == 0)
+            return "passed";
+
+        // Only C# compiler diagnostics from the completed build are eligible
+        // for a repair attempt. sbx failures without a compiler diagnostic
+        // must fail closed, not spend an additional MicroVM attempt.
+        if (result.BuildExitCode > 0 && result.RunExitCode == -1
+            && result.Feedback.Contains("error CS", StringComparison.OrdinalIgnoreCase))
+            return "build-failed";
+        if (result.BuildExitCode == 0 && result.RunExitCode > 0)
+            return "run-failed";
+        return "infrastructure-failed";
     }
 
     private void BeginGeneration()
