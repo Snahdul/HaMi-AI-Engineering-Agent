@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Runtime.CompilerServices;
 using HaMi.Agentic.Cli.Features.Coding;
 using Microsoft.Extensions.AI;
 using OpenAI.Responses;
@@ -78,6 +79,78 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
         {
             throw new InvalidOperationException("AI did not return the required structured source JSON.");
         }
+    }
+
+    internal static async Task SelfTestAsync(DevelopmentAgentContract contract)
+    {
+        const string validJson = """{"source":"Console.WriteLine(\"HaMi test\");"}""";
+        using var fake = new ScriptedChatClient(validJson);
+        string result = await new DevelopmentAiGenerator(fake, "fake-model")
+            .GenerateAsync(contract, "error CS0103: untrusted input", 2,
+                CancellationToken.None);
+#pragma warning disable OPENAI001
+        if (result != "Console.WriteLine(\"HaMi test\");"
+            || fake.Calls != 1 || fake.Options?.ModelId != "fake-model"
+            || fake.Options.MaxOutputTokens != 1800
+            || fake.Options.ResponseFormat is not ChatResponseFormatJson
+            || fake.Options.ToolMode is not NoneChatToolMode
+            || fake.Options.Tools?.Count != 0
+            || fake.Options.AllowBackgroundResponses != false
+            || fake.Options.RawRepresentationFactory?.Invoke(fake) is not CreateResponseOptions
+                { StoredOutputEnabled: false }
+            || fake.UserText?.Contains("CS0103", StringComparison.Ordinal) != true
+            || fake.UserText?.Contains("DATA ONLY", StringComparison.Ordinal) != true)
+            throw new InvalidOperationException(
+                "Agent AI adapter failed schema, no-tool, storage or feedback controls.");
+#pragma warning restore OPENAI001
+
+        using var invalid = new ScriptedChatClient("not structured JSON");
+        try
+        {
+            await new DevelopmentAiGenerator(invalid, "fake-model")
+                .GenerateAsync(contract, "", 1, CancellationToken.None);
+            throw new InvalidOperationException("Agent AI adapter accepted malformed JSON.");
+        }
+        catch (InvalidOperationException ex) when (
+            ex.Message == "AI did not return the required structured source JSON.")
+        {
+            // Expected fail-closed.
+        }
+    }
+
+    private sealed class ScriptedChatClient(string answer) : IChatClient
+    {
+        public int Calls { get; private set; }
+        public ChatOptions? Options { get; private set; }
+        public string? UserText { get; private set; }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ChatMessage prompt = messages.Single();
+            if (prompt.Role != ChatRole.User)
+                throw new InvalidOperationException("Expected one bounded user prompt.");
+            Calls++;
+            Options = options;
+            UserText = prompt.Text;
+            return Task.FromResult(new ChatResponse(
+                new ChatMessage(ChatRole.Assistant, answer)));
+        }
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.CompletedTask;
+            yield break;
+        }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) =>
+            serviceKey is null && serviceType.IsInstanceOfType(this) ? this : null;
+
+        public void Dispose() { }
     }
 
     public static IChatClient CreateClient(string key) => CodingAiClient.CreateOpenAi(key);
