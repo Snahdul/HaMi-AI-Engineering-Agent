@@ -576,3 +576,61 @@ Leistungsbefund. Ein `PASS` bedeutet **keine Freigabe aller denkbaren
 Zugriffswege** und führt weder zu produktivem KI-Code-Lauf noch zum
 automatischen PR-Merge. Der Benutzer entscheidet über den Go/No-Go-
 Einsatz des begrenzten Offline-Runners nach gemeinsamer Auswertung.
+
+
+## HaMi Developer: CommandLine + Akka-gesteuerter Coding-Retry (Issue #36)
+
+Der erste agentische Vertical Slice verbindet den bereits abgenommenen lokalen
+Docker-Sandbox-Runner mit dem durch Akka.Hosting gesteuerten Coding-Job.
+Die CLI verwendet System.CommandLine 3.0.0 für benannte Befehle; die
+historischen Replay-Aufrufe bleiben erhalten.
+
+**Offline-Selbsttest ohne Docker und ohne Modellaufruf:**
+
+~~~powershell
+Clear-Host
+
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- `
+    development --repo . --agent-self-test
+~~~
+
+Der Selbsttest prüft die CLI-Verarbeitung, den versionierten Auftrag,
+einen Compilerfehler mit erfolgreichem Retry, ein ausgeschöpftes
+Modellbudget und einen Timeout ohne erneuten Sandbox-Start.
+
+**Realer End-to-End-Durchstich auf HaMi11:**
+
+~~~powershell
+Clear-Host
+
+$repo = 'G:\HaMi\Sandbox\PoC\Runner-Issue36'
+$results = 'G:\HaMi\Sandbox\PoC\Runs'
+
+dotnet run --project "$repo\src\HaMi.Agentic.Cli" -c Release -- `
+    development --repo $repo `
+    --agent-run `
+    --results-dir $results
+~~~
+
+Vorher den Branch aus Draft-PR #37 in einem getrennten Review-Worktree
+unter dem angegebenen Pfad auschecken; alternativ den tatsächlichen
+Review-Checkoutpfad als $repo verwenden.
+
+Der deterministische Generator erzeugt zunächst absichtlich den
+Compilerfehler CS0103, wertet dessen Sandbox-Diagnose aus und erzeugt
+einen korrigierten Program.cs-Kandidaten. **Jeder Versuch läuft in einer
+eigenen MicroVM.** Ein JSON-Jobbericht und getrennte MicroVM-Berichte
+dokumentieren die Ergebnisse. Kein generierter Code wird auf HaMi11
+gebaut oder gestartet.
+
+**Modellaufruf (nur explizit, kann Gebühren verursachen):** Dasselbe
+Kommando um --live --model gpt-5.4-mini ergänzen. Ohne --live erfolgt
+kein Modellaufruf. Die Ausgabe darf nur Program.cs in einem
+temporären Snapshot ersetzen; die Default-deny-Netzwerkpolicy und
+Credential-Isolation aus PR #35 bleiben unverändert.
+
+Der Auftrag ist bewusst auf den versionierten Vertrag
+contracts/development/agent-console-retry.json und ein .NET-11-
+Konsolenprogramm begrenzt. Andere Projektdateien, Online-NuGet,
+Windows-/WPF-Builds und GitHub-Schreibzugriffe bleiben unzulässig.
+Architektur: docs/decisions/0001-commandline-akka-isolated-coding.md.
