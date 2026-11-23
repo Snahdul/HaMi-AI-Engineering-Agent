@@ -137,7 +137,7 @@ internal static class AgentLoggingSelfTest
     public static void Run(string repository)
     {
         AgentLoggingSettings defaults = AgentLoggingSettings.Load(repository);
-        if (defaults.LogSuccessfulSteps || !defaults.LogDecisionSummaries
+        if (!defaults.LogSuccessfulSteps || !defaults.LogDecisionSummaries
             || defaults.MinimumLevel != "Information")
             throw new InvalidOperationException("Logging default flags differ from the agreed policy.");
 
@@ -153,36 +153,39 @@ internal static class AgentLoggingSelfTest
             Ensure(baseline.Contains("ExpressionRejected", StringComparison.Ordinal)
                 && baseline.Contains("CodingRunFailed", StringComparison.Ordinal)
                 && baseline.Contains("DecisionRecorded", StringComparison.Ordinal)
-                && !baseline.Contains("AttemptSucceeded", StringComparison.Ordinal)
-                && !baseline.Contains("RunSucceeded", StringComparison.Ordinal),
-                "Default must retain errors and decisions, but suppress successful steps.");
+                && baseline.Contains("AttemptSucceeded", StringComparison.Ordinal)
+                && baseline.Contains("RunSucceeded", StringComparison.Ordinal),
+                "Default must capture the complete success/failure/decision narrative.");
 
-            AgentLoggingSettings successes = AgentLoggingSettings.Parse(
-                original.Replace("\"logSuccessfulSteps\": false",
-                    "\"logSuccessfulSteps\": true", StringComparison.Ordinal));
-            string successText = Emit(successes, Path.Combine(temp, "successes"));
-            Ensure(successText.Contains("AttemptSucceeded", StringComparison.Ordinal)
-                && successText.Contains("DecisionRecorded", StringComparison.Ordinal),
-                "Success logging did not enable independently of decision logging.");
+            AgentLoggingSettings quietSuccesses = AgentLoggingSettings.Parse(
+                original.Replace("\"logSuccessfulSteps\": true",
+                    "\"logSuccessfulSteps\": false", StringComparison.Ordinal));
+            string quietText = Emit(quietSuccesses, Path.Combine(temp, "quiet-successes"));
+            Ensure(quietText.Contains("DecisionRecorded", StringComparison.Ordinal)
+                && quietText.Contains("ExpressionRejected", StringComparison.Ordinal)
+                && !quietText.Contains("AttemptSucceeded", StringComparison.Ordinal)
+                && !quietText.Contains("RunSucceeded", StringComparison.Ordinal),
+                "Disabling successful steps must not suppress errors or decisions.");
 
             AgentLoggingSettings noDecisions = AgentLoggingSettings.Parse(
                 original.Replace("\"logDecisionSummaries\": true",
                     "\"logDecisionSummaries\": false", StringComparison.Ordinal));
             string noDecisionText = Emit(noDecisions, Path.Combine(temp, "no-decisions"));
             Ensure(noDecisionText.Contains("ExpressionRejected", StringComparison.Ordinal)
+                && noDecisionText.Contains("AttemptSucceeded", StringComparison.Ordinal)
                 && !noDecisionText.Contains("DecisionRecorded", StringComparison.Ordinal),
-                "Disabling decisions must not suppress failures or warnings.");
+                "Disabling decisions must not suppress errors or successful steps.");
 
-            AgentLoggingSettings onlySuccesses = AgentLoggingSettings.Parse(
-                original.Replace("\"logSuccessfulSteps\": false",
-                    "\"logSuccessfulSteps\": true", StringComparison.Ordinal)
+            AgentLoggingSettings quietBoth = AgentLoggingSettings.Parse(
+                original.Replace("\"logSuccessfulSteps\": true",
+                    "\"logSuccessfulSteps\": false", StringComparison.Ordinal)
                 .Replace("\"logDecisionSummaries\": true",
                     "\"logDecisionSummaries\": false", StringComparison.Ordinal));
-            string successOnly = Emit(onlySuccesses, Path.Combine(temp, "success-only"));
-            Ensure(successOnly.Contains("AttemptSucceeded", StringComparison.Ordinal)
-                && !successOnly.Contains("DecisionRecorded", StringComparison.Ordinal)
-                && successOnly.Contains("ExpressionRejected", StringComparison.Ordinal),
-                "Success=true and decisions=false must work independently.");
+            string quietBothText = Emit(quietBoth, Path.Combine(temp, "quiet-both"));
+            Ensure(quietBothText.Contains("ExpressionRejected", StringComparison.Ordinal)
+                && !quietBothText.Contains("AttemptSucceeded", StringComparison.Ordinal)
+                && !quietBothText.Contains("DecisionRecorded", StringComparison.Ordinal),
+                "Disabling both switches must retain failures.");
 
             TestRotation(original, Path.Combine(temp, "rotation"));
 
@@ -212,7 +215,7 @@ internal static class AgentLoggingSelfTest
             }
 
             Console.WriteLine("Structured logging self-test passed: "
-                + "defaults success=false/decisions=true, all four toggle combinations, "
+                + "defaults success=true/decisions=true, all four toggle combinations, "
                 + "correlated failure events, configured rollover/retention and safe paths.");
         }
         finally
