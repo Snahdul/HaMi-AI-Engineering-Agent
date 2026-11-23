@@ -576,3 +576,118 @@ Leistungsbefund. Ein `PASS` bedeutet **keine Freigabe aller denkbaren
 Zugriffswege** und führt weder zu produktivem KI-Code-Lauf noch zum
 automatischen PR-Merge. Der Benutzer entscheidet über den Go/No-Go-
 Einsatz des begrenzten Offline-Runners nach gemeinsamer Auswertung.
+
+
+## HaMi Developer: CommandLine + Akka-gesteuerter Coding-Retry (Issue #36)
+
+Der erste agentische Vertical Slice verbindet den bereits abgenommenen lokalen
+Docker-Sandbox-Runner mit dem durch Akka.Hosting gesteuerten Coding-Job.
+Die CLI verwendet System.CommandLine 3.0.0 für benannte Befehle; die
+historischen Replay-Aufrufe bleiben erhalten.
+
+**Offline-Selbsttest ohne Docker und ohne Modellaufruf:**
+
+~~~powershell
+Clear-Host
+
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- `
+    development --repo . --agent-self-test
+~~~
+
+Der Selbsttest prüft die CLI-Verarbeitung, den versionierten Auftrag,
+einen Compilerfehler mit erfolgreichem Retry, ein ausgeschöpftes
+Modellbudget und einen Timeout ohne erneuten Sandbox-Start.
+
+**Realer End-to-End-Durchstich auf HaMi11:**
+
+~~~powershell
+Clear-Host
+
+$repo = 'G:\HaMi\Sandbox\PoC\Runner-PR35'
+$results = 'G:\HaMi\Sandbox\PoC\Runs'
+
+dotnet run --project "$repo\src\HaMi.Agentic.Cli" -c Release -- `
+    development --repo $repo `
+    --agent-run `
+    --results-dir $results
+~~~
+
+Zuvor den bestehenden Review-Worktree Runner-PR35 kontrolliert auf
+Branch feature/issue36-commandline-akka-sandbox-flow-20261123
+aktualisieren. Ein zusätzlicher Worktree ist nicht erforderlich.
+
+Der deterministische Generator erzeugt zunächst absichtlich den
+Compilerfehler CS0103, wertet dessen Sandbox-Diagnose aus und erzeugt
+einen korrigierten Program.cs-Kandidaten. **Jeder Versuch läuft in einer
+eigenen MicroVM.** Ein JSON-Jobbericht und getrennte MicroVM-Berichte
+dokumentieren die Ergebnisse. Kein generierter Code wird auf HaMi11
+gebaut oder gestartet.
+
+**Modellaufruf (nur explizit, kann Gebühren verursachen):** Dasselbe
+Kommando um --live --model gpt-5.4-mini ergänzen. Ohne --live erfolgt
+kein Modellaufruf. Die Ausgabe darf nur Program.cs in einem
+temporären Snapshot ersetzen; die Default-deny-Netzwerkpolicy und
+Credential-Isolation aus PR #35 bleiben unverändert.
+
+Der Auftrag ist bewusst auf den versionierten Vertrag
+contracts/development/agent-console-retry.json und ein .NET-11-
+Konsolenprogramm begrenzt. Andere Projektdateien, Online-NuGet,
+Windows-/WPF-Builds und GitHub-Schreibzugriffe bleiben unzulässig.
+Architektur: docs/decisions/0001-commandline-akka-isolated-coding.md.
+
+
+**Empfohlene gebündelte HaMi11-Abnahme für PR #37:**
+
+~~~powershell
+Clear-Host
+
+$review = 'G:\HaMi\Sandbox\PoC\Runner-PR35'
+git -C $review fetch origin
+if ($LASTEXITCODE -ne 0) { throw 'Fetch fehlgeschlagen.' }
+git -C $review switch --detach origin/feature/issue36-commandline-akka-sandbox-flow-20261123
+if ($LASTEXITCODE -ne 0) { throw 'Worktree-Aktualisierung fehlgeschlagen.' }
+
+& "$review\scripts\acceptance\Invoke-HaMiDeveloperAcceptance.ps1"
+~~~
+
+Das Skript führt ohne Modellkosten nacheinander CLI-/Akka-Selbsttests
+und zwei echte frische MicroVM-Versuche (Compilerfehler, Korrektur)
+durch. Es prüft beide Cleanup-Nachweise, das neue Agent-JSON und dass
+Git-Status und HEAD des Review-Checkouts unverändert geblieben sind.
+Bestehende untracked Dateien werden weder gelöscht noch zurückgesetzt.
+Kein Git-Merge erfolgt automatisch.
+
+
+**Abschlussprüfung eines bereits ausgeführten Jobs ohne erneute MicroVMs**
+
+Beim HaMi11-Reallauf vom 23.11.2026 sind beide Gäste laut Runner
+erfolgreich entfernt worden. Das ursprüngliche Abnahmeskript
+scheiterte lediglich daran, dass die Antwort von `sbx inspect`
+die Wörter `sandbox` und `not found` auf zwei
+Zeilen verteilte. Die korrigierte Auswertung akzeptiert eine solche
+mehrzeilige Meldung, verlangt weiterhin Nichtnull-Exitcode und den
+konkreten Sandboxnamen.
+
+Dafür gibt es `-VerifyOnly -ReportPath`. Es werden
+**keine** Agent-, Modell-, Build-, Restore- oder MicroVM-Aufträge
+gestartet; nur die bereits erzeugten Berichte und die Abwesenheit der
+beiden Sandboxnamen werden geprüft.
+
+~~~powershell
+Clear-Host
+
+$review = 'G:\HaMi\Sandbox\PoC\Runner-PR35'
+git -C $review fetch origin
+if ($LASTEXITCODE -ne 0) { throw 'Fetch fehlgeschlagen.' }
+git -C $review switch --detach origin/feature/issue36-commandline-akka-sandbox-flow-20261123
+if ($LASTEXITCODE -ne 0) { throw 'Worktree-Aktualisierung fehlgeschlagen.' }
+
+$existingReport = 'G:\HaMi\Sandbox\PoC\Runs\agent-job-1763b445d24a427f8ee487149fd5eb4a\agent-report.json'
+
+& "$review\scripts\acceptance\Invoke-HaMiDeveloperAcceptance.ps1" `
+    -VerifyOnly -ReportPath $existingReport
+~~~
+
+Der Verify-Only-Modus prüft nur den **aktuellen Zustand der verfolgten
+Git-Dateien**; der frühere Status bereits vorhandener untracked Dateien
+kann nachträglich nicht unabhängig bewiesen werden.

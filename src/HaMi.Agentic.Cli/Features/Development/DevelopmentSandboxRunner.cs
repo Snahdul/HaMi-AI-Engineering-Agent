@@ -23,7 +23,10 @@ internal static class DevelopmentSandboxRunner
     private static readonly string[] SensitiveEnvNames =
     [
         "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AZURE_CLIENT_SECRET",
-        "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK"
+        "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK",
+        // Windows User API-key alias; not a POSIX shell identifier.
+        // Remove only from the sbx CHILD process environment.
+        "HaMi-AI-Engineering-Agent-Key"
     ];
 
     private const string GuestEnvCheckScript =

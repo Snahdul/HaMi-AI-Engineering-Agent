@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "taskId": "sandbox-console-retry",
+  "description": "Create a minimal .NET 11 console application that prints HaMi isolated correction passed and exits with status zero. Only Program.cs can be generated. Build and run only inside a fresh offline Docker MicroVM.",
+  "targetFramework": "net11.0",
+  "projectFile": "Demo.csproj",
+  "sourceFile": "Program.cs",
+  "mode": "run",
+  "maxAttempts": 2,
+  "acceptanceCriteria": [
+    "Restore and build succeed in an offline .NET 11 sandbox.",
+    "Program exits with code zero.",
+    "No changes to the production checkout, GitHub or host execution."
+  ]
+}
