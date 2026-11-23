@@ -603,7 +603,7 @@ Modellbudget und einen Timeout ohne erneuten Sandbox-Start.
 ~~~powershell
 Clear-Host
 
-$repo = 'G:\HaMi\Sandbox\PoC\Runner-Issue36'
+$repo = 'G:\HaMi\Sandbox\PoC\Runner-PR35'
 $results = 'G:\HaMi\Sandbox\PoC\Runs'
 
 dotnet run --project "$repo\src\HaMi.Agentic.Cli" -c Release -- `
@@ -612,9 +612,9 @@ dotnet run --project "$repo\src\HaMi.Agentic.Cli" -c Release -- `
     --results-dir $results
 ~~~
 
-Vorher den Branch aus Draft-PR #37 in einem getrennten Review-Worktree
-unter dem angegebenen Pfad auschecken; alternativ den tatsächlichen
-Review-Checkoutpfad als $repo verwenden.
+Zuvor den bestehenden Review-Worktree Runner-PR35 kontrolliert auf
+Branch feature/issue36-commandline-akka-sandbox-flow-20261123
+aktualisieren. Ein zusätzlicher Worktree ist nicht erforderlich.
 
 Der deterministische Generator erzeugt zunächst absichtlich den
 Compilerfehler CS0103, wertet dessen Sandbox-Diagnose aus und erzeugt
