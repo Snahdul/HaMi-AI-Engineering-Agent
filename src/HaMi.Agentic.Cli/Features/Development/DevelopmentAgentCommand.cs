@@ -92,6 +92,7 @@ internal static class DevelopmentAgentCommand
         CommandLineRouter.SelfTest();
         DevelopmentAgentContract.SelfTest();
         DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, null);
+        await DevelopmentAiGenerator.SelfTestAsync(contract);
         // Use the same Akka.Hosting composition root in CI as in the real
         // agent command; this catches DI/host startup errors without Docker.
         HostApplicationBuilder builder = Host.CreateApplicationBuilder();
