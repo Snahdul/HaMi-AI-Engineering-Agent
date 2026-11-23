@@ -155,13 +155,62 @@ internal static class DevelopmentAgentCommand
                         "Actor retried an infrastructure or unconfirmed-cleanup error: " + failure);
             }
 
+            // A coordinator deadline must NOT complete the job or shut down
+            // its ActorSystem while the sandbox task is still running.
+            var deferredCleanup = new DelayedIsolatedRunner();
+            Task<DevelopmentJobReport> deadlineJob =
+                DevelopmentActorCoordinator.RunAsync(system, contract,
+                    new DevelopmentScriptedGenerator(), deferredCleanup,
+                    jobTimeout: TimeSpan.FromMilliseconds(100));
+            await deferredCleanup.Started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await deferredCleanup.CancelObserved.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            if (deadlineJob.IsCompleted || deferredCleanup.Calls != 1)
+                throw new InvalidOperationException(
+                    "Coordinator completed before active sandbox cleanup finished.");
+            deferredCleanup.Finish(new DevelopmentSandboxAttempt(false, 0, 1, -1,
+                false, true, "error CS0103: expected", null));
+            DevelopmentJobReport cancelled = await deadlineJob.WaitAsync(TimeSpan.FromSeconds(10));
+            if (cancelled.Status != "cancelled" || cancelled.ModelCalls != 1
+                || cancelled.Attempts.Length != 1 || deferredCleanup.Calls != 1
+                || !cancelled.Attempts[0].CleanupSucceeded)
+                throw new InvalidOperationException(
+                    "Coordinator did not await cleanup or incorrectly restarted cancelled job.");
+
             Console.WriteLine("Akka development offline self-test passed: fail/correct, "
-                + "retry budget, timeout, preflight, restore, build-exec and cleanup fail-closed.");
+                + "retry budget, timeout, preflight, restore, build-exec, cleanup "
+                + "and deadline-awaited sandbox cleanup.");
         }
         finally
         {
             await host.StopAsync();
         }
+    }
+
+    private sealed class DelayedIsolatedRunner : IDevelopmentIsolatedRunner
+    {
+        private readonly TaskCompletionSource<DevelopmentSandboxAttempt> finished =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource<bool> Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> CancelObserved { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int Calls { get; private set; }
+
+        public Task<DevelopmentSandboxAttempt> ExecuteAsync(
+            DevelopmentAgentContract contract, string generatedSource, int attempt,
+            CancellationToken cancellationToken)
+        {
+            Calls++;
+            cancellationToken.Register(() => CancelObserved.TrySetResult(true));
+            Started.TrySetResult(true);
+            // Simulate a real sbx invocation: cancellation requests do not
+            // bypass the VM's in-flight cleanup/finally.
+            return finished.Task;
+        }
+
+        public void Finish(DevelopmentSandboxAttempt result) =>
+            finished.TrySetResult(result);
     }
 
     private sealed class SimulatedIsolatedRunner(bool timeout = false, string? failure = null)
