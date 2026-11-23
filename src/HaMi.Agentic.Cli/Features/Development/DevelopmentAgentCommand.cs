@@ -23,8 +23,9 @@ internal static class DevelopmentAgentCommand
             DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, contractPath);
             if (!Path.IsPathFullyQualified(resultsDirectory))
                 throw new InvalidOperationException("Agent results directory must be absolute.");
-            string source = sourceDirectory
-                ?? Path.Combine(repo, "samples", "SandboxCoding");
+            if (sourceDirectory is not null)
+                throw new InvalidOperationException("First actor slice cannot override the human-reviewed source fixture.");
+            string source = Path.Combine(repo, "samples", "SandboxCoding");
             if (!Path.IsPathFullyQualified(source))
                 throw new InvalidOperationException("Agent source snapshot must be absolute.");
             // Verify snapshot (including symlink/junction/credential restrictions)
