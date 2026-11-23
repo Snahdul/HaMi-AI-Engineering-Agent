@@ -291,7 +291,7 @@ kompakten rotierenden JSON-Dateien ein.
 In der versionierten [`config/logging.json`](config/logging.json) gelten
 folgende **unabhängigen Defaults**:
 
-- `logSuccessfulSteps: false`: Nur Fehler/Warnungen, keine normalen Erfolgseinträge.
+- `logSuccessfulSteps: true`: Auch die wesentlichen Erfolge und Statusschritte protokollieren.
 - `logDecisionSummaries: true`: Kurze, ausdrücklich verfasste
   Annahmen, Entscheidungen und Begründungen zusätzlich protokollieren.
 - `minimumLevel: Information`: Entscheidungslogs werden nicht weggefiltert.
@@ -583,7 +583,7 @@ Einsatz des begrenzten Offline-Runners nach gemeinsamer Auswertung.
 Der erste agentische Vertical Slice verbindet den bereits abgenommenen lokalen
 Docker-Sandbox-Runner mit dem durch Akka.Hosting gesteuerten Coding-Job.
 Die CLI verwendet System.CommandLine 3.0.0 für benannte Befehle; die
-historischen Replay-Aufrufe bleiben erhalten.
+Replay wird nur noch als ausdruecklicher Unterbefehl `replay` aufgerufen.
 
 **Offline-Selbsttest ohne Docker und ohne Modellaufruf:**
 
@@ -691,3 +691,16 @@ $existingReport = 'G:\HaMi\Sandbox\PoC\Runs\agent-job-1763b445d24a427f8ee487149f
 Der Verify-Only-Modus prüft nur den **aktuellen Zustand der verfolgten
 Git-Dateien**; der frühere Status bereits vorhandener untracked Dateien
 kann nachträglich nicht unabhängig bewiesen werden.
+
+
+### Agent-Logging und CLI-Bereinigung (Issue #38)
+
+Der Development-Agent schreibt korrelierte `ILogger`-Events gleichzeitig als
+lesbare Konsolenausgabe und in die bestehende rotierende Serilog-
+`.clef`-Datei unter `HAMI_AGENT_WORKTREE_ROOT/hami-agent-logs`.
+`JobId`, Versuchsnummer, Preflight-/Sandbox-Phase, Restore-/Build-/Run-
+Exitcodes, Cleanup-Status und Retry-Entscheidung sind darin nachvollziehbar.
+Terminale Fehler nennen einen geprueften Grundcode und eine Massnahme.
+Ein Report wird nur dann angegeben, wenn er wirklich geschrieben wurde.
+Die historischen impliziten Option-first-Aufrufe sind entfernt:
+`replay --check .` verwenden, nicht `--check .`.
