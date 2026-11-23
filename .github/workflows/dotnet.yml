@@ -182,6 +182,31 @@ jobs:
         with:
           global-json-file: global.json
 
+      - name: Validate HaMi11 acceptance PowerShell syntax (offline)
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $issues = $null
+          $path = Join-Path $PWD 'scripts/acceptance/Invoke-HaMiSandboxAcceptance.ps1'
+          [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$issues) | Out-Null
+          if ($issues.Count -gt 0) {
+            $issues | ForEach-Object { Write-Host "::error::$($_.Message)" }
+            exit 1
+          }
+          Write-Host 'Acceptance script syntax valid'
+
+      - name: Compile guest security probe source without running it (offline)
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'hami-guest-probe-check'
+          New-Item -ItemType Directory -Path $target | Out-Null
+          $template = Get-Content 'scripts/acceptance/HostIsolationProbe.cs.txt' -Raw
+          $program = $template.Replace('__DRIVE__', 'g').Replace('__RELATIVE__', 'dummy.txt').Replace('__WINJSON__', '"G:\\dummy.txt"')
+          [IO.File]::WriteAllText((Join-Path $target 'Program.cs'), $program)
+          [IO.File]::WriteAllText((Join-Path $target 'GuestProbe.csproj'), '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net11.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>')
+          dotnet build (Join-Path $target 'GuestProbe.csproj') -c Release -p:NuGetAudit=false --nologo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Restore
         run: dotnet restore src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj
 
