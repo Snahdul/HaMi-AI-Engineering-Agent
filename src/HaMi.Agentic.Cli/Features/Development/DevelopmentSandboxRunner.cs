@@ -22,7 +22,7 @@ internal static class DevelopmentSandboxRunner
         int RestoreExitCode, int BuildExitCode, int ExecutionExitCode,
         bool TimedOut, long CreateMilliseconds, long CopyMilliseconds,
         long RestoreMilliseconds, long BuildMilliseconds, long ExecutionMilliseconds,
-        long CleanupMilliseconds, long TotalMilliseconds, string? Error);
+        long CleanupMilliseconds, long TotalMilliseconds, bool SandboxRemovalSucceeded, string? Error);
 
     public static async Task<int> RunAsync(
         string repo, string source, string project, string mode, string resultsDirectory)
@@ -53,6 +53,7 @@ internal static class DevelopmentSandboxRunner
         Directory.CreateDirectory(reportDir);
 
         bool createAttempted = false;
+        bool sandboxRemovalSucceeded = false;
         bool timedOut = false;
         int restore = -1, build = -1, execution = -1;
         long createMs = 0, copyMs = 0, restoreMs = 0, buildMs = 0, executionMs = 0;
@@ -153,9 +154,17 @@ internal static class DevelopmentSandboxRunner
                 string[] arguments = mode == "run"
                     ? ["run", "--project", guestProject, "-c", "Release", "--no-restore", "--no-build"]
                     : ["test", guestProject, "-c", "Release", "--no-restore", "--no-build", "--nologo"];
-                SandboxProcess checkedCode = await SbxAsync(TimeSpan.FromSeconds(60),
-                    ["exec", "--workdir", guest, sandbox, "/home/agent/bin/dotnet", .. arguments]);
-                executionMs = watch.ElapsedMilliseconds;
+                SandboxProcess checkedCode;
+                try
+                {
+                    checkedCode = await SbxAsync(TimeSpan.FromSeconds(60),
+                        ["exec", "--workdir", guest, sandbox, "/home/agent/bin/dotnet", .. arguments]);
+                }
+                finally
+                {
+                    // Also capture the elapsed execution time when sbx exec times out.
+                    executionMs = watch.ElapsedMilliseconds;
+                }
                 execution = checkedCode.ExitCode;
                 await WriteOutputAsync(reportDir, "execution.log", checkedCode);
                 Progress(lifecycle, $"Ausführung beendet: Exitcode {execution} ({executionMs / 1000.0:F2} s).");
@@ -182,6 +191,7 @@ internal static class DevelopmentSandboxRunner
                 {
                     EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(90),
                         "rm", "--force", sandbox), "Remove ephemeral sandbox");
+                    sandboxRemovalSucceeded = true;
                 }
                 catch (Exception ex)
                 {
@@ -191,13 +201,14 @@ internal static class DevelopmentSandboxRunner
             cleanupMs = cleanup.ElapsedMilliseconds;
             if (Directory.Exists(stage))
                 Directory.Delete(stage, recursive: true);
-            Progress(lifecycle, error is null
-                ? $"Bereinigung abgeschlossen ({cleanupMs / 1000.0:F2} s)."
-                : $"Bereinigung abgeschlossen oder fehlgeschlagen ({cleanupMs / 1000.0:F2} s).");
+            Progress(lifecycle, sandboxRemovalSucceeded
+                ? $"MicroVM entfernt: sbx rm Exitcode 0 ({cleanupMs / 1000.0:F2} s)."
+                : $"ACHTUNG: MicroVM-Entfernung nicht bestätigt ({cleanupMs / 1000.0:F2} s).");
         }
 
         var report = new SandboxRunReport(1, id, guestProject, mode, restore, build,
-            execution, timedOut, createMs, copyMs, restoreMs, buildMs, executionMs, cleanupMs, lifecycle.ElapsedMilliseconds, error);
+            execution, timedOut, createMs, copyMs, restoreMs, buildMs, executionMs, cleanupMs, lifecycle.ElapsedMilliseconds,
+            sandboxRemovalSucceeded, error);
         string reportPath = Path.Combine(reportDir, "report.json");
         await File.WriteAllTextAsync(reportPath,
             JsonSerializer.Serialize(report, new JsonSerializerOptions(JsonSerializerDefaults.Web)
@@ -208,7 +219,7 @@ internal static class DevelopmentSandboxRunner
         Console.WriteLine($"Sandbox report: {reportPath}");
         Console.WriteLine($"Restore: {restore}; build: {build}; {mode}: {execution}; timeout: {timedOut}");
         if (error is not null) Console.Error.WriteLine(error);
-        return error is null && restore == 0 && build == 0
+        return error is null && sandboxRemovalSucceeded && restore == 0 && build == 0
             && (mode == "build" || execution == 0) ? 0 : 1;
     }
 
