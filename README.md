@@ -494,6 +494,41 @@ Kontakt sowie die fehlenden typischen Host-Mountpfade praktisch geprüft.
 Die Einzelbelege stehen in Issue #33 / PR #35. Weitere Ressourcenmessungen,
 Secret-/Host-Canary-Prüfung und menschliche Mergefreigabe bleiben erforderlich.
 
+### Credential-Vorprüfung für die Sandbox (Issue #33)
+
+Der erste echte Host-/Secret-Test fand im Gast den Namen `GH_TOKEN`.
+Damit war **noch kein Tokenwert** nachgewiesen: Docker kann einen
+deklarierten, aber leeren Variablennamen bereitstellen. Bei der
+Abnahme wird daher **leer** von **nicht leer** unterschieden; Werte
+werden niemals protokolliert.
+
+Der allgemeine Runner entfernt die sechs überwachten Credential-
+Variablen (`OPENAI_API_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`,
+`AZURE_CLIENT_SECRET`, `AWS_SECRET_ACCESS_KEY`, `SSH_AUTH_SOCK`)
+aus der Prozessumgebung jeder `sbx`-Invocation, setzt sie beim
+Erstellen der MicroVM explizit leer und führt **vor** SDK-Check und
+Snapshot-Kopie eine feste Gast-Prüfung durch. Ein nichtleerer Wert
+führt zum Abbruch und zur anschließenden VM-Bereinigung. Gastcode
+wird in diesem Fall nicht übertragen oder ausgeführt.
+
+Die Gast-Diagnose nennt ausschließlich den Variablennamen, niemals
+einen geheimen Wert. Dies schützt die ausdrücklich überwachten
+Variablen, ist aber kein formaler Beweis für die Abwesenheit jeder
+denkbaren anderen Secret-Quelle.
+
+Der gezielte erneute Realtest erfolgt ohne Wiederholung der übrigen
+fünf bereits bestandenen Checks:
+
+```powershell
+Clear-Host
+$review = 'G:\HaMi\Sandbox\PoC\Runner-PR35'
+git -C $review fetch origin
+if ($LASTEXITCODE -ne 0) { throw 'Git fetch fehlgeschlagen.' }
+git -C $review switch --detach origin/feature/issue33-general-csharp-sandbox-runner-20261120
+if ($LASTEXITCODE -ne 0) { throw 'Git switch fehlgeschlagen.' }
+& "$review\scripts\acceptance\Invoke-HaMiSandboxAcceptance.ps1" -SecurityOnly
+```
+
 ### HaMi11-Sammelabnahme – ein Durchlauf statt vieler Einzelbefehle
 
 Das versionierte Skript `scripts/acceptance/Invoke-HaMiSandboxAcceptance.ps1`
