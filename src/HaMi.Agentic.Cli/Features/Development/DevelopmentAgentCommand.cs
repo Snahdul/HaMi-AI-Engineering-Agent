@@ -33,7 +33,7 @@ internal static class DevelopmentAgentCommand
             if (logging.Settings.LogSuccessfulSteps)
                 DevelopmentLogEvents.JobRequested(logger, jobId, repo, resultsDirectory,
                     live ? "live" : "offline-scripted",
-                    live ? (requestedModel is { Length: <= 64 } ? requestedModel : "gpt-5.4-mini") : "scripted",
+                    live ? requestedModel switch { null => "gpt-5.4-mini", { Length: > 64 } => "invalid-model-name", _ => requestedModel } : "scripted",
                     contractPath ?? DevelopmentAgentContract.TrustedPath);
 
             phase = "contract";
