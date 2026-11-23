@@ -54,6 +54,9 @@ jobs:
       - name: Exercise detached multi-file development scope guard (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --self-test
 
+      - name: Validate System.CommandLine and actor-driven retry workflow (offline)
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
+
       - name: Validate general C# sandbox runner input isolation (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-run-self-test
 
@@ -215,6 +218,9 @@ jobs:
 
       - name: Validate development task and detached worktree scope on Windows
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --self-test
+
+      - name: Validate System.CommandLine and Akka retry on Windows (offline)
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
 
       - name: Validate general C# sandbox runner input isolation on Windows (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-run-self-test
