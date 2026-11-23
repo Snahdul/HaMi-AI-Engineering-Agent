@@ -233,6 +233,8 @@ internal static class DevelopmentAgentCommand
                 throw new InvalidOperationException(
                     "Coordinator did not await cleanup or incorrectly restarted cancelled job.");
 
+            await VerifyNarrativeLoggingAsync(system, contract, repo);
+
             Console.WriteLine("Akka development offline self-test passed: fail/correct, "
                 + "retry budget, timeout, preflight, restore, build-exec, cleanup "
                 + "and deadline-awaited sandbox cleanup.");
@@ -240,6 +242,62 @@ internal static class DevelopmentAgentCommand
         finally
         {
             await host.StopAsync();
+        }
+    }
+
+    private static async Task VerifyNarrativeLoggingAsync(
+        ActorSystem system, DevelopmentAgentContract contract, string repo)
+    {
+        string id = "offline-selftest-development-001";
+        string temp = Path.Combine(Path.GetTempPath(), "hami-development-log-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temp);
+        try
+        {
+            AgentLoggingSettings settings = AgentLoggingSettings.Load(repo);
+            using (var session = AgentLoggingSession.CreateForTest(settings, temp))
+            {
+                Microsoft.Extensions.Logging.ILogger logger =
+                    session.CreateLogger("HaMi.Agentic.Cli.Features.Development");
+                DevelopmentLogEvents.JobRequested(logger, id, repo, temp, "offline-scripted",
+                    DevelopmentAgentContract.TrustedPath);
+                DevelopmentLogEvents.PreflightAccepted(logger, id, contract.TaskId,
+                    contract.ProjectFile, contract.MaxAttempts);
+                DevelopmentJobReport report = await DevelopmentActorCoordinator.RunAsync(
+                    system, contract, new DevelopmentScriptedGenerator(),
+                    new SimulatedIsolatedRunner(), logger: logger, jobId: id);
+                if (report.Status != "passed" || report.JobId != id || report.Attempts.Length != 2)
+                    throw new InvalidOperationException("Development log test actor report differs.");
+                DevelopmentLogEvents.JobFinished(logger, id, report.Status,
+                    report.ModelCalls, report.Attempts.Length, "selftest-report.json");
+            }
+
+            string folder = Path.Combine(temp, settings.RelativeDirectory);
+            string[] logFiles = Directory.GetFiles(folder, "agent-*.clef");
+            if (logFiles.Length == 0)
+                throw new InvalidOperationException("Development narrative file log is missing.");
+
+            string combined = string.Join("\n", logFiles.SelectMany(File.ReadAllLines));
+            foreach (string eventLine in combined.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                using JsonDocument document = JsonDocument.Parse(eventLine);
+                if (!document.RootElement.TryGetProperty("JobId", out JsonElement jobProperty)
+                    || jobProperty.GetString() != id)
+                    throw new InvalidOperationException("Uncorrelated development log event.");
+            }
+
+            foreach (string expected in new[] { "JobRequested", "PreflightAccepted",
+                "GenerationStarted", "GenerationFinished", "SandboxStarted", "SandboxFinished",
+                "AttemptFailed", "DecisionRecorded", "JobFinished", "CS0103" })
+                if (!combined.Contains(expected, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        "Development log is missing the expected event: " + expected);
+            if (combined.Contains("UnknownIdentifier", StringComparison.Ordinal)
+                || combined.Contains("OPENAI_API_KEY", StringComparison.Ordinal))
+                throw new InvalidOperationException("Unsafe raw data entered development logs.");
+        }
+        finally
+        {
+            Directory.Delete(temp, recursive: true);
         }
     }
 
