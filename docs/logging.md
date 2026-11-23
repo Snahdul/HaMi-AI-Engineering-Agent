@@ -10,7 +10,7 @@ streng validierte Laufzeitkonfiguration:
 ```json
 {
   "version": 1,
-  "logSuccessfulSteps": false,
+  "logSuccessfulSteps": true,
   "logDecisionSummaries": true,
   "minimumLevel": "Information",
   "relativeDirectory": "hami-agent-logs",
@@ -21,8 +21,7 @@ streng validierte Laufzeitkonfiguration:
 
 **Die Schalter sind unabhängig voneinander:**
 
-- `logSuccessfulSteps=false` (Standard): erfolgreiche Versuche und erfolgreiche
-  Gesamtaufträge werden **nicht** protokolliert. Fehler und Warnungen bleiben im Log.
+- `logSuccessfulSteps=true` (Standard): erfolgreiche Schritte und Abschlüsse werden zusammen mit Warnungen, Fehlern und Entscheidungen protokolliert. Mit `false` können optionale Erfolgsereignisse deaktiviert werden.
 - `logDecisionSummaries=true` (Standard): ausdrücklich erzeugte, knappe
   **Entscheidungszusammenfassungen** als `Information` loggen.
 - Bei `logDecisionSummaries=false` bleiben Fehlereinträge erhalten.
@@ -85,11 +84,29 @@ dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test-log
 ```
 
 Dieser Test benötigt weder Modell noch API-Schlüssel. Er prüft, dass die
-Default-Konfiguration **Fehler und Decision-Summaries**, aber **keine
-positiven Schritte** speichert. Danach werden beide Schalter unabhängig
+Default-Konfiguration **Fehler, Decision-Summaries und positive Schritte** speichert. Danach werden beide Schalter unabhängig
 variiert. Außerdem werden korrumpierte Konfigurationen (unbekannte Keys,
 ungültige Levels, Path Traversal, absolute Pfade und überzogene
 Dateigrößen-/Retention-Limits) abgewiesen.
 
 Die Logdateien sind ein **technisches Auditmedium**, kein Ersatz für den
 stabilen, lokalen fachlichen `report.json`-Bericht.
+
+
+## Development-Agent (Issue #38)
+
+`development --agent-run` nutzt dieselbe `ILogger`-/Serilog-Session, nun mit
+**Console-Provider und unveraenderter rollierender Compact-JSON-Datei**.
+EventIds 3600–3610 beschreiben Startparameter, Preflight, Generierung,
+MicroVM-Phasen, Retry-Entscheidungen, klassifizierte Compilerfehler und
+abschliessenden Bericht. Die eindeutige `JobId` korreliert Actor,
+`agent-job-<JobId>`-Verzeichnis und JSON-Report.
+
+`Information`: lebenszyklusrelevante Erfolge und Entscheidungen;
+`Warning`: korrekturfahige Fehler; `Error`: terminale Fehler mit
+Phase, Ursache und Handlungsempfehlung; `Debug`: verworfene/stale Nachrichten.
+Weder Rohausgaben des Modells noch Sandboxtests, Secrets oder
+unbereinigte Exceptiontexte landen in den Betriebslogs.
+
+Der CLI-Aufruf muss einen benannten Unterbefehl verwenden, z. B.
+`replay --check .` statt veraltetes `--check .`.
