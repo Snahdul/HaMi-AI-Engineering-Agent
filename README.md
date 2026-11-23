@@ -656,3 +656,38 @@ durch. Es prüft beide Cleanup-Nachweise, das neue Agent-JSON und dass
 Git-Status und HEAD des Review-Checkouts unverändert geblieben sind.
 Bestehende untracked Dateien werden weder gelöscht noch zurückgesetzt.
 Kein Git-Merge erfolgt automatisch.
+
+
+**Abschlussprüfung eines bereits ausgeführten Jobs ohne erneute MicroVMs**
+
+Beim HaMi11-Reallauf vom 23.11.2026 sind beide Gäste laut Runner
+erfolgreich entfernt worden. Das ursprüngliche Abnahmeskript
+scheiterte lediglich daran, dass die Antwort von `sbx inspect`
+die Wörter `sandbox` und `not found` auf zwei
+Zeilen verteilte. Die korrigierte Auswertung akzeptiert eine solche
+mehrzeilige Meldung, verlangt weiterhin Nichtnull-Exitcode und den
+konkreten Sandboxnamen.
+
+Dafür gibt es `-VerifyOnly -ReportPath`. Es werden
+**keine** Agent-, Modell-, Build-, Restore- oder MicroVM-Aufträge
+gestartet; nur die bereits erzeugten Berichte und die Abwesenheit der
+beiden Sandboxnamen werden geprüft.
+
+~~~powershell
+Clear-Host
+
+$review = 'G:\HaMi\Sandbox\PoC\Runner-PR35'
+git -C $review fetch origin
+if ($LASTEXITCODE -ne 0) { throw 'Fetch fehlgeschlagen.' }
+git -C $review switch --detach origin/feature/issue36-commandline-akka-sandbox-flow-20261123
+if ($LASTEXITCODE -ne 0) { throw 'Worktree-Aktualisierung fehlgeschlagen.' }
+
+$existingReport = 'G:\HaMi\Sandbox\PoC\Runs\agent-job-1763b445d24a427f8ee487149fd5eb4a\agent-report.json'
+
+& "$review\scripts\acceptance\Invoke-HaMiDeveloperAcceptance.ps1" `
+    -VerifyOnly -ReportPath $existingReport
+~~~
+
+Der Verify-Only-Modus prüft nur den **aktuellen Zustand der verfolgten
+Git-Dateien**; der frühere Status bereits vorhandener untracked Dateien
+kann nachträglich nicht unabhängig bewiesen werden.
