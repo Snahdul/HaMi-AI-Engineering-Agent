@@ -9,9 +9,9 @@ namespace HaMi.Agentic.Cli.Features.Development;
 internal static partial class DevelopmentLogEvents
 {
     [LoggerMessage(EventId = 3600, Level = LogLevel.Information,
-        Message = "JobRequested job={JobId} repo={Repository} results={ResultsDirectory} generation={GenerationMode} contract={ContractPath}")]
+        Message = "JobRequested job={JobId} repo={Repository} results={ResultsDirectory} generation={GenerationMode} model={Model} contract={ContractPath}")]
     internal static partial void JobRequested(ILogger logger, string jobId,
-        string repository, string resultsDirectory, string generationMode, string contractPath);
+        string repository, string resultsDirectory, string generationMode, string model, string contractPath);
 
     [LoggerMessage(EventId = 3601, Level = LogLevel.Information,
         Message = "PreflightAccepted job={JobId} task={TaskId} project={Project} maxAttempts={MaxAttempts} guestIsolation=microvm")]
