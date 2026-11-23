@@ -95,6 +95,14 @@ internal sealed class AgentLoggingSession : IDisposable
                 fileSizeLimitBytes: settings.FileSizeLimitBytes,
                 rollOnFileSizeLimit: true,
                 retainedFileCountLimit: settings.RetainedFileCountLimit)
+            // The same structured ILogger events also form a directly readable
+            // chronological narrative; no second set of log calls is needed.
+            .WriteTo.File(Path.Combine(LogDirectory, "agent-.log"),
+                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}",
+                rollingInterval: Serilog.RollingInterval.Day,
+                fileSizeLimitBytes: settings.FileSizeLimitBytes,
+                rollOnFileSizeLimit: true,
+                retainedFileCountLimit: settings.RetainedFileCountLimit)
             .CreateLogger();
 
         _factory = LoggerFactory.Create(builder =>
@@ -251,7 +259,8 @@ internal static class AgentLoggingSelfTest
         Ensure(files.Length == 2 && files.All(f => new FileInfo(f).Length
                 <= smallFiles.FileSizeLimitBytes + 4096),
             "Serilog size rollover and retention did not enforce the configured limits.");
-        EnsureFileHandlesReleased(files);
+        EnsureFileHandlesReleased(Directory.GetFiles(Path.Combine(temp,
+            smallFiles.RelativeDirectory), "agent-*.*"));
     }
 
     private static string Emit(AgentLoggingSettings settings, string temp)
@@ -290,7 +299,8 @@ internal static class AgentLoggingSelfTest
         string[] files = Directory.GetFiles(Path.Combine(temp, settings.RelativeDirectory),
             "agent-*.clef");
         Ensure(files.Length > 0, "No log file was emitted.");
-        EnsureFileHandlesReleased(files);
+        EnsureFileHandlesReleased(Directory.GetFiles(Path.Combine(temp,
+            settings.RelativeDirectory), "agent-*.*"));
         string all = string.Join("\n", files.SelectMany(File.ReadAllLines));
         foreach (string line in all.Split('\n', StringSplitOptions.RemoveEmptyEntries))
         {
