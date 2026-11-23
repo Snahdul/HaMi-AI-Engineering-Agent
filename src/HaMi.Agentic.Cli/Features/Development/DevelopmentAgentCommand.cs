@@ -40,6 +40,7 @@ internal static class DevelopmentAgentCommand
             phase = "results";
             if (!Path.IsPathFullyQualified(resultsDirectory))
                 throw new InvalidOperationException("Agent results directory must be absolute.");
+            phase = "source-override";
             if (sourceDirectory is not null)
                 throw new InvalidOperationException("First actor slice cannot override the human-reviewed source fixture.");
 
@@ -105,24 +106,32 @@ internal static class DevelopmentAgentCommand
             }
             finally
             {
+                phase = "host-shutdown";
                 await host.StopAsync();
             }
         }
-        catch (Exception ex) when (ex is IOException or ArgumentException
-            or InvalidOperationException or UnauthorizedAccessException or JsonException
-            or TimeoutException)
+        catch (Exception ex)
         {
             // Never emit raw model/sandbox data or untrusted exception messages.
             string reason = phase switch
             {
                 "logging" => "LOG_CONFIGURATION_INVALID",
                 "contract" => "CONTRACT_REJECTED",
-                "results" or "storage" => "RESULTS_PATH_REJECTED",
+                "results" => "RESULTS_PATH_NOT_ABSOLUTE",
+                "source-override" => "SOURCE_OVERRIDE_NOT_ALLOWED",
+                "storage" when ex is InvalidOperationException &&
+                    ex.Message == "Agent results must be separate from the repository and its fixture."
+                    => "RESULTS_PATH_OVERLAPS_REPOSITORY",
+                "storage" when ex is InvalidOperationException &&
+                    ex.Message == "Agent results path may not traverse directory reparse points."
+                    => "RESULTS_PATH_REPARSE_POINT",
+                "storage" => "RESULTS_PATH_REJECTED",
                 "snapshot" => "SNAPSHOT_REJECTED",
                 "api-key" => "API_KEY_INVALID",
                 "results-allocation" => "RESULTS_DIRECTORY_UNWRITABLE",
                 "generator" => "GENERATOR_INITIALIZATION_FAILED",
                 "host" => "HOST_START_FAILED",
+                "host-shutdown" => "HOST_STOP_FAILED",
                 "report" => "REPORT_WRITE_FAILED",
                 _ => "JOB_EXECUTION_FAILED"
             };
@@ -130,12 +139,14 @@ internal static class DevelopmentAgentCommand
             {
                 "logging" => "config/logging.json und den externen Logpfad pruefen.",
                 "contract" => "Den versionierten, geprueften Agent-Auftrag pruefen.",
-                "results" or "storage" => "--results-dir absolut und getrennt vom Git-Repository angeben.",
+                "results" or "storage" => "--results-dir absolut, ausserhalb des Repository und ohne Junctions/Symlinks angeben.",
+                "source-override" => "--source entfernen; der gepruefte Agent-Contract bestimmt die einzige Fixture.",
                 "snapshot" => "Die freigegebene Demo-Fixture und erlaubte Dateien kontrollieren.",
                 "api-key" => "Host-API-Schluessel pruefen.",
                 "results-allocation" or "report" => "Dateiberechtigungen und freien Speicher im Ergebnisverzeichnis pruefen.",
                 "generator" => "Modell-/Provider-Konfiguration pruefen.",
                 "host" => "Akka.Hosting-Konfiguration und DI pruefen.",
+                "host-shutdown" => "Akka-CoordinatedShutdown und vorhandene Job-Reports pruefen.",
                 _ => "Status der MicroVM und vorhandene Teilberichte pruefen; kein automatischer Neustart."
             };
             if (logger is not null)
