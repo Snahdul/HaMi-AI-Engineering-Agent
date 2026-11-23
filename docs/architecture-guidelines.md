@@ -188,7 +188,7 @@ Der Agent trennt **fachliche Ereigniserzeugung** (`ILogger`) und
 Die versionierte [Logging-Konfiguration](../config/logging.json) legt
 zwei **unabhängige Defaults** fest:
 
-- `logSuccessfulSteps=false`: Positive Versuche/Abschlüsse unterdrücken.
+- `logSuccessfulSteps=true`: Positive Versuche/Abschlüsse als nachvollziehbare Ereignisse mitprotokollieren; per Konfiguration abschaltbar.
 - `logDecisionSummaries=true`: Explizite, kurze Annahmen,
   Entscheidungen und Begründungen protokollieren.
 
