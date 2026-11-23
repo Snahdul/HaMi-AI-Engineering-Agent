@@ -17,7 +17,8 @@ errors and decisions but did not cover Development.
 1. `Microsoft.Extensions.Logging.ILogger` with source-generated
    `[LoggerMessage]` methods is the single application-facing event API.
    The logging session routes the same events to a readable single-line Console
-   provider and Serilog Compact JSON with rotation and bounded retention.
+   provider, a readable rolling Serilog text file and Serilog Compact JSON
+   with rotation and bounded retention.
 2. Event IDs 3600–3610 form a small chronological narrative:
    requested parameters, approved contract and safety preflight, generation,
    MicroVM build/run/cleanup classification, bounded retry decision,
