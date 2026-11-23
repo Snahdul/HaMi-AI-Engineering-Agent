@@ -59,6 +59,9 @@ internal static class DevelopmentSandboxRunner
         long cleanupMs = 0;
         string? error = null;
 
+        Progress(lifecycle, $"Auftrag {id[..12]} | Projekt: {guestProject} | Modus: {mode}");
+        Progress(lifecycle, $"Snapshot: {sourceFiles.Length} Dateien | Ziel: {sandbox}");
+
         try
         {
             foreach (string relative in sourceFiles)
@@ -70,13 +73,16 @@ internal static class DevelopmentSandboxRunner
             }
 
             Stopwatch watch = Stopwatch.StartNew();
+            Progress(lifecycle, $"Erstelle MicroVM {sandbox} aus {Template} (4 vCPU, 4 GiB) ...");
             createAttempted = true;
             EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(90),
                 "create", "--name", sandbox, "--template", Template,
                 "--pull", "never", "--cpus", "4", "--memory", "4g",
                 "--skills", "off", "--static-mcp", "none", "shell"), "Create sandbox");
             createMs = watch.ElapsedMilliseconds;
+            Progress(lifecycle, $"MicroVM bereit ({createMs / 1000.0:F2} s).");
 
+            Progress(lifecycle, "Prüfe Isolation: Mounts, Secrets, MCP, Ports, Netzwerk ...");
             SandboxProcess inspect = await SbxAsync(TimeSpan.FromSeconds(30),
                 "inspect", sandbox);
             ValidateInspect(inspect, sandbox);
@@ -88,13 +94,17 @@ internal static class DevelopmentSandboxRunner
                 ValidateDeny(policy, endpoint);
             }
 
+            Progress(lifecycle, "Isolation bestätigt: kein Host-Mount, keine Secrets, Netzwerk gesperrt.");
+            Progress(lifecycle, "Prüfe .NET SDK 11.0.100 im Gast ...");
             SandboxProcess sdk = await SbxAsync(TimeSpan.FromSeconds(40),
                 "exec", sandbox, "/home/agent/bin/dotnet", "--version");
             if (sdk.ExitCode != 0
                 || !sdk.Output.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
                     .Contains("11.0.100", StringComparer.Ordinal))
                 throw new InvalidOperationException("Expected offline .NET SDK 11.0.100 in template.");
+            Progress(lifecycle, ".NET SDK 11.0.100 einsatzbereit.");
 
+            Progress(lifecycle, $"Übertrage {sourceFiles.Length} Snapshot-Dateien in die MicroVM ...");
             watch.Restart();
             EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(75),
                 "cp", stage, sandbox + ":/home/agent/workspace/"), "Transfer snapshot");
@@ -102,6 +112,7 @@ internal static class DevelopmentSandboxRunner
                 "exec", "--user", "root", sandbox, "chown", "-R", "agent:agent", guest),
                 "Set guest snapshot owner");
             copyMs = watch.ElapsedMilliseconds;
+            Progress(lifecycle, $"Snapshot übertragen und Rechte gesetzt ({copyMs / 1000.0:F2} s).");
 
             // No shell interpolation: the project name is a validated relative
             // path and each component of the dotnet command is a fixed argv item.
@@ -109,6 +120,7 @@ internal static class DevelopmentSandboxRunner
                 "exec", sandbox, "mkdir", "-p", "/home/agent/empty-nuget-source"),
                 "Prepare offline NuGet source");
 
+            Progress(lifecycle, "Offline-Restore gestartet ...");
             watch.Restart();
             SandboxProcess restored = await SbxAsync(TimeSpan.FromSeconds(75),
                 "exec", "--workdir", guest, sandbox, "/home/agent/bin/dotnet",
@@ -117,9 +129,11 @@ internal static class DevelopmentSandboxRunner
             restoreMs = watch.ElapsedMilliseconds;
             restore = restored.ExitCode;
             await WriteOutputAsync(reportDir, "restore.log", restored);
+            Progress(lifecycle, $"Restore beendet: Exitcode {restore} ({restoreMs / 1000.0:F2} s).");
 
             if (restore == 0)
             {
+                Progress(lifecycle, "Release-Build gestartet ...");
                 watch.Restart();
                 SandboxProcess built = await SbxAsync(TimeSpan.FromSeconds(120),
                     "exec", "--workdir", guest, sandbox, "/home/agent/bin/dotnet",
@@ -127,10 +141,14 @@ internal static class DevelopmentSandboxRunner
                 buildMs = watch.ElapsedMilliseconds;
                 build = built.ExitCode;
                 await WriteOutputAsync(reportDir, "build.log", built);
+                Progress(lifecycle, $"Build beendet: Exitcode {build} ({buildMs / 1000.0:F2} s).");
             }
 
             if (build == 0 && mode != "build")
             {
+                Progress(lifecycle, mode == "run"
+                    ? "Starte das C#-Programm im Gast (max. 60 s) ..."
+                    : "Starte Tests im Gast (max. 60 s) ...");
                 watch.Restart();
                 string[] arguments = mode == "run"
                     ? ["run", "--project", guestProject, "-c", "Release", "--no-restore", "--no-build"]
@@ -140,19 +158,23 @@ internal static class DevelopmentSandboxRunner
                 executionMs = watch.ElapsedMilliseconds;
                 execution = checkedCode.ExitCode;
                 await WriteOutputAsync(reportDir, "execution.log", checkedCode);
+                Progress(lifecycle, $"Ausführung beendet: Exitcode {execution} ({executionMs / 1000.0:F2} s).");
             }
         }
         catch (TimeoutException ex)
         {
             timedOut = true;
             error = ex.Message;
+            Progress(lifecycle, "Timeout: " + ex.Message);
         }
         catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
         {
             error = ex.Message;
+            Progress(lifecycle, "Fehler: " + ex.Message);
         }
         finally
         {
+            Progress(lifecycle, $"Bereinige MicroVM {sandbox} und lokale Staging-Dateien ...");
             Stopwatch cleanup = Stopwatch.StartNew();
             if (createAttempted)
             {
@@ -169,6 +191,9 @@ internal static class DevelopmentSandboxRunner
             cleanupMs = cleanup.ElapsedMilliseconds;
             if (Directory.Exists(stage))
                 Directory.Delete(stage, recursive: true);
+            Progress(lifecycle, error is null
+                ? $"Bereinigung abgeschlossen ({cleanupMs / 1000.0:F2} s)."
+                : $"Bereinigung abgeschlossen oder fehlgeschlagen ({cleanupMs / 1000.0:F2} s).");
         }
 
         var report = new SandboxRunReport(1, id, guestProject, mode, restore, build,
@@ -179,11 +204,18 @@ internal static class DevelopmentSandboxRunner
             {
                 WriteIndented = true
             }));
+        Progress(lifecycle, $"Auftrag beendet ({report.TotalMilliseconds / 1000.0:F2} s), Bericht erstellt.");
         Console.WriteLine($"Sandbox report: {reportPath}");
         Console.WriteLine($"Restore: {restore}; build: {build}; {mode}: {execution}; timeout: {timedOut}");
         if (error is not null) Console.Error.WriteLine(error);
         return error is null && restore == 0 && build == 0
             && (mode == "build" || execution == 0) ? 0 : 1;
+    }
+
+    private static void Progress(Stopwatch elapsed, string message)
+    {
+        Console.WriteLine($"[HaMi Sandbox +{elapsed.Elapsed.TotalSeconds:F2}s] {message}");
+        Console.Out.Flush();
     }
 
     private static async Task WriteOutputAsync(string dir, string filename, SandboxProcess process)
