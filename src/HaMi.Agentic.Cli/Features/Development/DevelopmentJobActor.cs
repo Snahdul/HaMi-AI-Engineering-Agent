@@ -67,13 +67,13 @@ internal sealed class DevelopmentJobActor : ReceiveActor
 
     public DevelopmentJobActor(DevelopmentAgentContract contract,
         IDevelopmentCandidateGenerator generator,
-        IDevelopmentIsolatedRunner isolatedRunner, ILogger? logger = null, string? jobId = null)
+        IDevelopmentIsolatedRunner isolatedRunner, ILogger? logger = null, string? requestedJobId = null)
     {
         this.contract = contract;
         this.generator = generator;
         this.isolatedRunner = isolatedRunner;
         this.logger = logger;
-        this.jobId = jobId ?? Guid.NewGuid().ToString("N");
+        this.jobId = requestedJobId ?? Guid.NewGuid().ToString("N");
 
         Receive<Start>(_ =>
         {
@@ -103,7 +103,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             modelCalls++;
             if (logger is not null)
                 DevelopmentLogEvents.GenerationFinished(logger, jobId, attempt,
-                    message.Source.Length, (long)Stopwatch.GetElapsedTime(generationStarted).TotalMilliseconds);
+                    message.Source?.Length ?? 0, (long)Stopwatch.GetElapsedTime(generationStarted).TotalMilliseconds);
             if (string.IsNullOrWhiteSpace(message.Source) || message.Source.Length > 16 * 1024)
             {
                 attempts.Add(new DevelopmentJobAttempt(attempt, "source-rejected", -1, -1, -1,
