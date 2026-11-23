@@ -516,6 +516,16 @@ git switch --detach origin/feature/issue33-general-csharp-sandbox-runner-2026112
 & .\scripts\acceptance\Invoke-HaMiSandboxAcceptance.ps1
 ```
 
+Falls **nur** ein Sicherheitsbefund erneut geprüft werden muss, ist
+`-SecurityOnly` verfügbar: Dieser Modus wiederholt lediglich den
+Host-/Secret-/Gastressourcentest und erstellt einen gesonderten
+Teilprüfbericht. Vorhandene Compiler-/Snapshot-/Performancetests werden
+**nicht** wiederholt. Für die Diagnose werden bei gesetzten
+sicherheitsrelevanten Umgebungsvariablen ausschließlich **vordefinierte
+Variablennamen** protokolliert, niemals deren Werte. Solange eine
+unerklärte Variable im Gast vorhanden ist, schlägt die Teilprüfung
+vorsätzlich fehl; es gibt keine automatische Freigabe.
+
 Das Skript zeigt jeden Test live und schreibt
 `G:\HaMi\Sandbox\PoC\Runs\acceptance-<ID>\acceptance-summary.json`
 inklusive PASS/FAIL, Phasen-/Lebenszyklusmessungen und gesammelter
