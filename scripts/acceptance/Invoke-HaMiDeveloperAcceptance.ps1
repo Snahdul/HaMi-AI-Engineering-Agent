@@ -74,11 +74,12 @@ if ($VerifyOnly) {
 $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
 
 Write-Host ''
-Write-Host '=== 3/3 Verify two isolated attempts and unchanged Git checkout ===' -ForegroundColor Cyan
+Write-Host '=== 3/3 Verify isolated attempts, exact stdout and unchanged Git checkout ===' -ForegroundColor Cyan
 if ($report.status -ne 'passed' -or $report.modelCalls -ne 2 -or
     @($report.attempts).Count -ne 2 -or
     $report.attempts[0].status -ne 'build-failed' -or
-    $report.attempts[1].status -ne 'passed') {
+    $report.attempts[1].status -ne 'passed' -or
+    $report.attempts[1].outputAccepted -ne $true) {
     throw 'Agent result does not prove a failed build followed by successful correction.'
 }
 $microVmReports = @()
@@ -113,6 +114,22 @@ if ($microVmReports[0].buildExitCode -eq 0 -or
     $microVmReports[1].executionExitCode -ne 0) {
     throw 'Expected first failed compiler phase, then clean build+run in second isolated VM.'
 }
+# Semantic acceptance must be based on the actual guest execution
+# report, never merely on a successful exit code or a model claim.
+$successReportDir = [IO.Path]::GetDirectoryName($report.attempts[1].reportPath)
+$executionLog = Join-Path $successReportDir 'execution.log'
+if (-not (Test-Path -LiteralPath $executionLog)) {
+    throw 'Successful sandbox attempt is missing execution.log.'
+}
+$actual = [IO.File]::ReadAllText($executionLog).Replace("`r`n", "`n").Replace("`r", "`n")
+if ($actual.EndsWith("`n", [StringComparison]::Ordinal)) {
+    $actual = $actual.Substring(0, $actual.Length - 1)
+}
+if ($actual -cne 'HaMi isolated correction passed') {
+    throw 'Semantic acceptance failed: guest stdout differs from the reviewed contract.'
+}
+Write-Host 'PASS: exact reviewed console output verified from guest execution.log.'
+
 $after = @(& git -C $repo status --porcelain=v1)
 if ($LASTEXITCODE -ne 0) { throw 'Could not read Git checkout status.' }
 if ($VerifyOnly) {
@@ -132,9 +149,9 @@ if ($lastHead -ne $head) {
     throw 'The source Git HEAD changed during the agent run.'
 }
 if ($VerifyOnly) {
-    Write-Host 'PASS: Stored agent report, compiler fail/correct and 2 independently removed MicroVMs.' -ForegroundColor Green
+    Write-Host 'PASS: Stored report, semantic stdout, compiler fail/correct and 2 independently removed MicroVMs.' -ForegroundColor Green
 } else {
-    Write-Host 'PASS: CLI/parser + Akka host, compiler fail/correct, 2 MicroVM cleanups, unchanged Git.' -ForegroundColor Green
+    Write-Host 'PASS: CLI/Akka, exact semantic stdout, compiler correction, 2 MicroVM cleanups, unchanged Git.' -ForegroundColor Green
 }
 Write-Host ('Generator invocations (scripted offline, no API charges): ' + $report.modelCalls)
 Write-Host ('Current HEAD: ' + $head)
