@@ -58,6 +58,8 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         private readonly FileStream handle;
         private readonly string statePath;
         private readonly string nextPath;
+        private readonly string legacyPath;
+        private byte[]? legacyClaim;
         private readonly int issue;
         private readonly Action<string, bool>? validatePrivateEntry;
         private bool disposed;
@@ -68,6 +70,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             this.validatePrivateEntry = validatePrivateEntry;
             statePath = prefix + ".json";
             nextPath = prefix + ".next";
+            legacyPath = prefix + ".legacy-active";
             string lockPath = prefix + ".lock";
             bool lockExists = RegularFileExists(lockPath);
             if (lockExists)
@@ -83,6 +86,8 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 // Preserve it for explicit reconciliation; no automatic deletion.
                 if (RegularFileExists(nextPath))
                     throw new InvalidOperationException("Uncommitted recovery state requires reconciliation.");
+                if (RegularFileExists(legacyPath))
+                    throw new InvalidOperationException("Previous non-recoverable issue execution requires reconciliation.");
                 Current = Read();
             }
             catch
@@ -116,10 +121,43 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         {
             CheckOpen();
             initial.Validate();
-            if (Current is not null || initial.Stage != DevelopmentJobState.Accepted
+            if (legacyClaim is not null || RegularFileExists(legacyPath)
+                || Current is not null || initial.Stage != DevelopmentJobState.Accepted
                 || initial.Identity.IssueNumber != issue || Read() is not null)
                 throw new InvalidOperationException("An existing recovery claim cannot be replaced.");
             Write(initial, replace: false);
+        }
+
+        // Existing issue-journal/non-publication paths do not acquire recovery
+        // authority. They still use the very same issue lease, and leave a
+        // durable blocker on interruption rather than bypassing ownership.
+        internal void ClaimLegacy(string jobId)
+        {
+            CheckOpen();
+            if (!DevelopmentPublicationPolicy.IsSha(jobId, 32)
+                || legacyClaim is not null || Current is not null || Read() is not null
+                || RegularFileExists(legacyPath))
+                throw new InvalidOperationException("Existing issue claim cannot be replaced.");
+            byte[] bytes = System.Text.Encoding.ASCII.GetBytes("v1:" + jobId);
+            using (var stream = OpenPrivateFile(legacyPath, FileMode.CreateNew, FileOptions.WriteThrough))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+            validatePrivateEntry?.Invoke(legacyPath, false);
+            legacyClaim = bytes;
+        }
+
+        internal void CompleteLegacy()
+        {
+            CheckOpen();
+            if (legacyClaim is null || !RegularFileExists(legacyPath))
+                throw new InvalidOperationException("Non-recoverable issue claim missing.");
+            validatePrivateEntry?.Invoke(legacyPath, false);
+            if (!legacyClaim.SequenceEqual(DevelopmentJobEvidence.ReadBoundedFile(legacyPath, 64)))
+                throw new InvalidOperationException("Non-recoverable issue claim changed.");
+            File.Delete(legacyPath);
+            legacyClaim = null;
         }
 
         internal void Commit(DevelopmentJobState next)
