@@ -57,7 +57,8 @@ internal sealed class DevelopmentIsolatedRunner(
             {
                 if (logSuccessfulSteps)
                     DevelopmentLogEvents.SandboxPhase(logger, jobId ?? "uncorrelated",
-                        attempt, sandboxName, phaseCode, elapsedMs, exitCode);
+                        attempt, DescribePhase(phaseCode, exitCode),
+                        sandboxName, phaseCode, elapsedMs, exitCode);
             };
         int cliExit = await DevelopmentSandboxRunner.RunAsync(
             repo, dir, contract.ProjectFile, contract.Mode, sandboxDir, progress);
@@ -93,6 +94,23 @@ internal sealed class DevelopmentIsolatedRunner(
             report.TimedOut, report.SandboxRemovalSucceeded,
             boundedFeedback, reportPath, report.Error);
     }
+
+    // Phase descriptions are trusted host-owned vocabulary, not guest text.
+    private static string DescribePhase(string code, int exitCode) => code switch
+    {
+        "MICROVM_READY" => "MicroVM erstellt",
+        "ISOLATION_VERIFIED" => "Isolation, Credentials und Netzwerksperre bestaetigt",
+        "DOTNET_SDK_READY" => ".NET 11 im Gast einsatzbereit",
+        "SNAPSHOT_TRANSFERRED" => "Freigegebenen Snapshot uebertragen",
+        "RESTORE_COMPLETED" => exitCode == 0 ? "Offline-Restore erfolgreich" : "Offline-Restore fehlgeschlagen",
+        "BUILD_COMPLETED" => exitCode == 0 ? "Release-Build erfolgreich" : "Release-Build fehlgeschlagen",
+        "EXECUTION_COMPLETED" => exitCode == 0 ? "Ausfuehrung erfolgreich" : "Ausfuehrung fehlgeschlagen",
+        "OPERATION_TIMEOUT" => "Zeitlimit erreicht, Bereinigung wird versucht",
+        "OPERATION_FAULT" => "Sandbox-Operation fehlgeschlagen, Bereinigung wird versucht",
+        "CLEANUP_CONFIRMED" => "MicroVM laut Runner entfernt",
+        "CLEANUP_UNCONFIRMED" => "ACHTUNG: MicroVM-Entfernung nicht bestaetigt",
+        _ => "Unbekannter Sandbox-Zustand"
+    };
 
     internal static void ValidateStoragePaths(
         string repository, string trustedFixture, string resultsDirectory)
