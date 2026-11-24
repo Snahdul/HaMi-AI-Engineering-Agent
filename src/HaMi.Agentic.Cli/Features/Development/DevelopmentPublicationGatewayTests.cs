@@ -62,15 +62,20 @@ internal static class DevelopmentPublicationGatewayTests
             Task<int> Publish(bool allowed = true) => publisher.PublishAsync(repo, results,
                 job, 77, baseline, allowed, CancellationToken.None);
             await RejectAsync(() => Publish(false));
-            // A clean status is insufficient if Git smudged baseline bytes.
-            string baselineFile = Local(repo, sourcePath);
-            await Git(repo, "config", "core.autocrlf", "true");
-            await File.WriteAllTextAsync(baselineFile, original.Replace("\n", "\r\n", StringComparison.Ordinal));
-            if ((await Git(repo, "status", "--porcelain")).Length != 0)
-                throw new InvalidOperationException("Line ending regression fixture is not clean.");
-            await RejectAsync(() => Publish());
-            await File.WriteAllTextAsync(baselineFile, original);
-            await Git(repo, "config", "core.autocrlf", "false");
+            // A fresh filtered checkout has a clean index but different bytes.
+            // Do not change autocrlf on an already populated worktree.
+            string filteredRepo = Path.Combine(root, "filtered-repo");
+            await Git(repo, "clone", "--local", "--no-hardlinks", "-c",
+                "core.autocrlf=true", repo, filteredRepo);
+            await Git(filteredRepo, "remote", "set-url", "origin",
+                "https://github.com/" + GitHubIssueGateway.Repository + ".git");
+            if ((await Git(filteredRepo, "status", "--porcelain")).Length != 0
+                || (await Git(filteredRepo, "hash-object", "--no-filters", "--", sourcePath)).Trim()
+                    == (await Git(filteredRepo, "rev-parse", baseline + ":" + sourcePath)).Trim())
+                throw new InvalidOperationException("Line ending regression fixture lacks a clean transformed checkout.");
+            await RejectAsync(() => publisher.PublishAsync(filteredRepo, results,
+                job, 77, baseline, true, CancellationToken.None),
+                "Publication requires byte-identical baseline checkout; review Git checkout filters.");
             await File.AppendAllTextAsync(patch, "tampered");
             await RejectAsync(() => Publish());
             await File.WriteAllTextAsync(patch, diff);
@@ -127,10 +132,10 @@ internal static class DevelopmentPublicationGatewayTests
     private static string Local(string root, string path) =>
         Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar));
 
-    private static async Task RejectAsync(Func<Task<int>> action)
+    private static async Task RejectAsync(Func<Task<int>> action, string? expectedMessage = null)
     {
         try { await action(); }
-        catch (InvalidOperationException) { return; }
+        catch (InvalidOperationException ex) when (expectedMessage is null || ex.Message == expectedMessage) { return; }
         throw new InvalidOperationException("Unsafe publication was accepted.");
     }
 
