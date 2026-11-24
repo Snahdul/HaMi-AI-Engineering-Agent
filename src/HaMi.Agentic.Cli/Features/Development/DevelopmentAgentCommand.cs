@@ -223,6 +223,7 @@ internal static class DevelopmentAgentCommand
     {
         CommandLineRouter.SelfTest();
         DevelopmentAgentContract.SelfTest();
+        DevelopmentPublicationPolicy.SelfTest();
         DevelopmentProductionExpression.SelfTest();
         await DevelopmentProductionVerifier.ScopeSelfTestAsync(repo);
         DevelopmentOutputAcceptance.SelfTest();
