@@ -42,9 +42,29 @@ internal static class RuntimeSettings
         if (args.Contains("--help", StringComparer.Ordinal))
         {
             Console.WriteLine("Usage: config --check [--repo <local-checkout>] (offline; no key value printed)");
+            Console.WriteLine("       config --store-github-issues-token (Windows Credential Manager, masked prompt)");
+            Console.WriteLine("       config --check-github-issues-token (presence only, no secret output)");
             Console.WriteLine("       config --self-test (offline; no API or Git access)");
             Console.WriteLine("Windows User settings: HaMi-AI-Engineering-Agent-Key and HAMI_AGENT_WORKTREE_ROOT.");
             return 0;
+        }
+
+        if (args.SequenceEqual(["--store-github-issues-token"]))
+            return WindowsIssueCredentialStore.StoreInteractive();
+
+        if (args.SequenceEqual(["--check-github-issues-token"]))
+        {
+            try
+            {
+                Console.WriteLine("Dedicated GitHub Issues credential: "
+                    + (WindowsIssueCredentialStore.Exists() ? "available" : "missing"));
+                return WindowsIssueCredentialStore.Exists() ? 0 : 1;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("Credential inspection failed: " + ex.GetType().Name);
+                return 2;
+            }
         }
 
         if (args.SequenceEqual(["--self-test"]))
