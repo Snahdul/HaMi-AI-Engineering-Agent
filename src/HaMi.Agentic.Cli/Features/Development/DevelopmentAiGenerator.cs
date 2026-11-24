@@ -7,8 +7,9 @@ using OpenAI.Responses;
 namespace HaMi.Agentic.Cli.Features.Development;
 
 /// <summary>
-/// Opt-in, tool-free structured generation. Model output is ONLY Program.cs
-/// contents and may never change the task, project, source path or policy.
+/// Opt-in, tool-free structured generation. Model output can supply only
+/// reviewed source contents or a bounded production expression, never paths
+/// outside the contract, host commands, project or execution policy.
 /// </summary>
 internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
     : IDevelopmentCandidateGenerator
