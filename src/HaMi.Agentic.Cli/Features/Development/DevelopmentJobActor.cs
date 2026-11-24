@@ -23,12 +23,14 @@ internal interface IDevelopmentIsolatedRunner
 internal sealed record DevelopmentSandboxAttempt(
     bool Succeeded, int RestoreExitCode, int BuildExitCode, int RunExitCode,
     bool TimedOut, bool CleanupSucceeded, string Feedback, string? ReportPath,
-    string? InfrastructureError = null, bool? OutputAccepted = null);
+    string? InfrastructureError = null, bool? OutputAccepted = null,
+    string? CandidateWorktree = null, string? DiffPath = null);
 
 internal sealed record DevelopmentJobAttempt(
     int Number, string Status, int RestoreExitCode, int BuildExitCode,
     int RunExitCode, bool TimedOut, bool CleanupSucceeded, string? ReportPath,
-    bool? OutputAccepted = null);
+    bool? OutputAccepted = null,
+    string? CandidateWorktree = null, string? DiffPath = null);
 
 internal sealed record DevelopmentJobReport(
     string JobId, string Status, int ModelCalls, DevelopmentJobAttempt[] Attempts,
@@ -124,6 +126,26 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 return;
             }
 
+            if (contract.IsProduction)
+            {
+                try
+                {
+                    _ = DevelopmentProductionExpression.Parse(message.Source);
+                }
+                catch (InvalidOperationException)
+                {
+                    attempts.Add(new DevelopmentJobAttempt(attempt, "source-rejected",
+                        -1, -1, -1, false, true, null));
+                    feedback = "Return only a valid bounded JSON object with one C# expression, "
+                        + "using attempt and maxCalls with approved operators.";
+                    if (logger is not null)
+                        DevelopmentLogEvents.AttemptFailed(logger, jobId, attempt,
+                            "source-rejected", "PRODUCTION_EXPRESSION_INVALID");
+                    RetryOrFinish("SOURCE_REJECTED");
+                    return;
+                }
+            }
+
             stage = Stage.Executing;
             sandboxStarted = Stopwatch.GetTimestamp();
             if (logger is not null && logSuccessfulSteps) DevelopmentLogEvents.SandboxStarted(logger, jobId, attempt);
@@ -168,7 +190,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 result.TimedOut, result.CleanupSucceeded, result.ReportPath,
                 result.BuildExitCode == 0 && result.RunExitCode == 0
                     && result.CleanupSucceeded && result.InfrastructureError is null
-                    ? result.OutputAccepted : null));
+                    ? result.OutputAccepted : null,
+                result.CandidateWorktree, result.DiffPath));
 
             // A coordinator deadline stops NEW attempts, but must not stop the
             // actor or its host until the already-running sbx task has returned
