@@ -93,7 +93,7 @@ internal static class DevelopmentIssueWorkflowTests
     private sealed class MemoryIssueGateway : IDevelopmentIssueGateway
     {
         private readonly Dictionary<string, int> followUps = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, int> comments = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, long> comments = new(StringComparer.Ordinal);
         public int CreatedComments { get; private set; }
         public int UpdatedComments { get; private set; }
         public int CreatedFollowUps { get; private set; }
@@ -102,17 +102,17 @@ internal static class DevelopmentIssueWorkflowTests
 
         public Task<JsonDocument> GetIssueAsync(int number, CancellationToken ct) =>
             throw new InvalidOperationException("Offline selftest must not fetch GitHub.");
-        public Task<int?> FindJobCommentAsync(int number, string marker, CancellationToken ct) =>
-            Task.FromResult(comments.TryGetValue(marker, out int id) ? (int?)id : null);
-        public Task<int> CreateCommentAsync(int number, string body, CancellationToken ct)
+        public Task<long?> FindJobCommentAsync(int number, string marker, CancellationToken ct) =>
+            Task.FromResult(comments.TryGetValue(marker, out long id) ? (long?)id : null);
+        public Task<long> CreateCommentAsync(int number, string body, CancellationToken ct)
         {
             string marker = body.Split('\n')[0];
             CreatedComments++;
             comments[marker] = CreatedComments;
             CommentBody = body;
-            return Task.FromResult(CreatedComments);
+            return Task.FromResult((long)CreatedComments);
         }
-        public Task UpdateCommentAsync(int id, string body, CancellationToken ct)
+        public Task UpdateCommentAsync(long id, string body, CancellationToken ct)
         {
             UpdatedComments++;
             CommentBody = body;
