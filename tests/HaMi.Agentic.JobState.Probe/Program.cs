@@ -10,6 +10,32 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
+        // Explicit operator acceptance only. The default CI probe stays
+        // entirely offline and never accesses the real account state root.
+        if (args.Length == 5 && args[0] == "host-check")
+        {
+            string repo = Path.GetFullPath(args[1]);
+            string results = Path.GetFullPath(args[2]);
+            string[] runIds = args[3..];
+            if (runIds.Any(id => !DevelopmentPublicationPolicy.IsSha(id, 32)
+                || id != id.ToLowerInvariant())
+                || runIds[0][..12] == runIds[1][..12])
+                throw new InvalidOperationException("Two distinct historical sandbox identities required.");
+
+            await DevelopmentIssueWorkflow.VerifyOriginAsync(repo);
+            DevelopmentIsolatedRunner.ValidateStoragePaths(repo,
+                Path.Combine(repo, "samples", "RetryBudget"), results);
+            _ = DevelopmentJobStateRoot.Open(repo, results);
+            Console.WriteLine("PASS: actual private account recovery root validated.");
+            foreach (string id in runIds)
+            {
+                await DevelopmentSandboxRunner.RequireRemovedAsync(id);
+                Console.WriteLine("PASS: read-only absence check hami-code-" + id[..12]);
+            }
+            Console.WriteLine("PASS: HaMi11 recovery host prerequisites; no claim, model, guest or GitHub write.");
+            return 0;
+        }
+
         if (args.Length == 2 && args[0] is "hold" or "probe")
         {
             string root = args[1];
