@@ -11,9 +11,9 @@ namespace HaMi.Agentic.Cli.Features.Development;
 internal interface IDevelopmentIssueGateway
 {
     Task<JsonDocument> GetIssueAsync(int issueNumber, CancellationToken ct);
-    Task<int?> FindJobCommentAsync(int issueNumber, string marker, CancellationToken ct);
-    Task<int> CreateCommentAsync(int issueNumber, string body, CancellationToken ct);
-    Task UpdateCommentAsync(int commentId, string body, CancellationToken ct);
+    Task<long?> FindJobCommentAsync(int issueNumber, string marker, CancellationToken ct);
+    Task<long> CreateCommentAsync(int issueNumber, string body, CancellationToken ct);
+    Task UpdateCommentAsync(long commentId, string body, CancellationToken ct);
     Task<int?> FindFollowUpAsync(string marker, CancellationToken ct);
     Task<int> CreateFollowUpAsync(string title, string body, CancellationToken ct);
     Task MarkReviewAsync(int issueNumber, CancellationToken ct);
@@ -67,7 +67,7 @@ internal sealed class GitHubIssueGateway : IDevelopmentIssueGateway, IDisposable
     public Task<JsonDocument> GetIssueAsync(int issueNumber, CancellationToken ct) =>
         SendAsync(HttpMethod.Get, "issues/" + issueNumber, null, ct);
 
-    public async Task<int?> FindJobCommentAsync(int issueNumber, string marker, CancellationToken ct)
+    public async Task<long?> FindJobCommentAsync(int issueNumber, string marker, CancellationToken ct)
     {
         for (int page = 1; page <= 10; page++)
         {
@@ -80,21 +80,21 @@ internal sealed class GitHubIssueGateway : IDevelopmentIssueGateway, IDisposable
                 if (entry.TryGetProperty("body", out JsonElement body)
                     && body.ValueKind == JsonValueKind.String
                     && (body.GetString() ?? "").Contains(marker, StringComparison.Ordinal))
-                    return entry.GetProperty("id").GetInt32();
+                    return entry.GetProperty("id").GetInt64();
             if (array.GetArrayLength() < 100) return null;
         }
         throw new InvalidOperationException("GitHub comment pagination limit reached; no duplicate write attempted.");
     }
 
-    public async Task<int> CreateCommentAsync(int issueNumber, string body, CancellationToken ct)
+    public async Task<long> CreateCommentAsync(int issueNumber, string body, CancellationToken ct)
     {
         RequireWriteAccess();
         using JsonDocument result = await SendAsync(HttpMethod.Post,
             "issues/" + issueNumber + "/comments", new { body }, ct);
-        return result.RootElement.GetProperty("id").GetInt32();
+        return result.RootElement.GetProperty("id").GetInt64();
     }
 
-    public async Task UpdateCommentAsync(int commentId, string body, CancellationToken ct)
+    public async Task UpdateCommentAsync(long commentId, string body, CancellationToken ct)
     {
         RequireWriteAccess();
         using JsonDocument _ = await SendAsync(new HttpMethod("PATCH"),
