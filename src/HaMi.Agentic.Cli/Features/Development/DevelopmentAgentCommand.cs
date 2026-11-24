@@ -28,7 +28,6 @@ internal static class DevelopmentAgentCommand
         Microsoft.Extensions.Logging.ILogger? logger = null;
         GitHubIssueGateway? issues = null;
         DevelopmentIssueWorkflow? journal = null;
-        DevelopmentPublicationGateway? publisher = null;
         try
         {
             // One ILogger event is sent to both console and the rolling .clef file.
@@ -103,7 +102,6 @@ internal static class DevelopmentAgentCommand
                     throw new InvalidOperationException("Production issue required for publication.");
                 await DevelopmentPublicationPolicy.LoadAsync(repo, resultsDirectory, true,
                     issueNumber.Value, publicationBase!);
-                publisher = new DevelopmentPublicationGateway();
             }
 
             if (logging.Settings.LogSuccessfulSteps)
@@ -159,9 +157,10 @@ internal static class DevelopmentAgentCommand
                 if (logging.Settings.LogSuccessfulSteps)
                     DevelopmentLogEvents.JobFinished(logger, jobId, result.Status,
                         result.ModelCalls, result.Attempts.Length, jsonPath);
-                if (publisher is not null && result.Status == "passed")
+                if (publishDraft && result.Status == "passed")
                 {
                     phase = "draft-publication";
+                    using var publisher = new DevelopmentPublicationGateway();
                     int pull = await publisher.PublishAsync(repo, resultsDirectory, result,
                         issueNumber!.Value, publicationBase!, true, CancellationToken.None);
                     result = result with { DraftPullRequestNumber = pull };
@@ -239,7 +238,6 @@ internal static class DevelopmentAgentCommand
         }
         finally
         {
-            publisher?.Dispose();
             issues?.Dispose();
             logging?.Dispose();
         }
