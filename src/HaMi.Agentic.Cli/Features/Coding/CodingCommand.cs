@@ -454,8 +454,11 @@ internal static class CodingCommand
     {
         var info = new ProcessStartInfo("git")
         {
-            WorkingDirectory = directory, RedirectStandardOutput = true,
-            RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+            WorkingDirectory = directory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
         };
         foreach (string arg in args) info.ArgumentList.Add(arg);
         using Process process = Process.Start(info)
@@ -697,14 +700,21 @@ internal static class CodingCommand
                     || retryReport.Attempts.Count != 2
                     || retryReport.Attempts[0].Status != "tests_failed"
                     || retryReport.Attempts[1].Status != "passed"
-                    || await File.ReadAllTextAsync(retrySource) != expectedRetrySource)
+                    || !(await File.ReadAllBytesAsync(retrySource)).SequenceEqual(
+                        Encoding.UTF8.GetBytes(expectedRetrySource)))
                     throw new InvalidOperationException(
                         "Production RetryBudget coding task did not recover using real compiler/tests.");
 
+                // Feed the report writer the status corresponding to the actual
+                // final fixture bytes, rather than inventing a modification.
+                bool changed = !(await File.ReadAllBytesAsync(retrySource)).SequenceEqual(
+                    Encoding.UTF8.GetBytes(pristineRetrySource));
+                if (changed != (baselineExpression != retryExpression))
+                    throw new InvalidOperationException("RetryBudget fixture change classification incorrect.");
                 string reportDir = Path.Combine(retryRoot, "retry-report");
                 Directory.CreateDirectory(reportDir);
                 await WriteReportAsync(reportDir, "offline-stub", "trusted-baseline", retryRoot,
-                    retryResult, " M " + retryTask.TargetPath, "offline-fake",
+                    retryResult, changed ? " M " + retryTask.TargetPath : "", "offline-fake",
                     retryPrompt, retryPolicy, retryTask);
                 using (JsonDocument report = JsonDocument.Parse(
                     await File.ReadAllTextAsync(Path.Combine(reportDir, "report.json"))))
@@ -713,29 +723,12 @@ internal static class CodingCommand
                     if (resultJson.GetProperty("task").GetString() != retryTask.Id
                         || resultJson.GetProperty("promptAsset").GetString() != retryTask.PromptAsset
                         || resultJson.GetProperty("policyAsset").GetString() != retryTask.PolicyAsset
-                        || resultJson.GetProperty("modifiedPath").GetString() != retryTask.TargetPath
+                        || resultJson.GetProperty("modifiedPath").GetString() !=
+                            (changed ? retryTask.TargetPath : null)
                         || resultJson.GetProperty("modelCalls").GetInt32() != 2
                         || resultJson.GetProperty("status").GetString() != "generated"
                         || resultJson.GetProperty("attempts").GetArrayLength() != 2)
                         throw new InvalidOperationException("RetryBudget report task/asset mapping changed.");
-                }
-
-                // A task can pass all tests while proposing an expression already
-                // present in source. In that case no file is modified.
-                string unchangedReportDir = Path.Combine(retryRoot, "retry-unchanged-report");
-                Directory.CreateDirectory(unchangedReportDir);
-                await WriteReportAsync(unchangedReportDir, "offline-stub", "trusted-baseline",
-                    retryRoot, retryResult, "", "offline-fake",
-                    retryPrompt, retryPolicy, retryTask);
-                using (JsonDocument unchangedReport = JsonDocument.Parse(
-                    await File.ReadAllTextAsync(Path.Combine(
-                        unchangedReportDir, "report.json"))))
-                {
-                    JsonElement unchanged = unchangedReport.RootElement;
-                    if (unchanged.GetProperty("modifiedPath").ValueKind != JsonValueKind.Null
-                        || unchanged.GetProperty("status").GetString() != "generated")
-                        throw new InvalidOperationException(
-                            "Unchanged successful coding run incorrectly reports a modified file.");
                 }
 
                 // A hostile/unrelated model expression must not survive a failed run.
@@ -745,7 +738,8 @@ internal static class CodingCommand
                     _ => Task.FromResult(new CodingDraft("Plan",
                         "System.IO.File.Delete(\"anything\")")));
                 if (retryExhausted is not CodingRunExhausted
-                    || await File.ReadAllTextAsync(retrySource) != pristineRetrySource)
+                    || !(await File.ReadAllBytesAsync(retrySource)).SequenceEqual(
+                        Encoding.UTF8.GetBytes(pristineRetrySource)))
                     throw new InvalidOperationException("Retry task did not fail closed and restore source.");
             }
 
