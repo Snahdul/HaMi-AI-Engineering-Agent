@@ -80,6 +80,8 @@ internal static class DevelopmentAgentCommand
                 ApprovedDevelopmentIssue sourceIssue = ApprovedDevelopmentIssue.Parse(
                     issueJson.RootElement, contract);
                 contract = sourceIssue.Bind(contract);
+                if (logging.Settings.LogSuccessfulSteps)
+                    DevelopmentLogEvents.IssueBound(logger, jobId, sourceIssue.Number);
                 if (publishIssue)
                     journal = new DevelopmentIssueWorkflow(issues, sourceIssue, jobId, allowFollowUps);
             }
@@ -94,6 +96,8 @@ internal static class DevelopmentAgentCommand
             {
                 phase = "issue-publish-start";
                 await journal.PublishStartedAsync(CancellationToken.None);
+                if (logging.Settings.LogSuccessfulSteps)
+                    DevelopmentLogEvents.IssueJournalPublished(logger, jobId, issueNumber!.Value, "started");
             }
 
             phase = "generator";
@@ -138,6 +142,8 @@ internal static class DevelopmentAgentCommand
                 {
                     phase = "issue-publish-result";
                     await journal.PublishFinishedAsync(result, CancellationToken.None);
+                    if (logging.Settings.LogSuccessfulSteps)
+                        DevelopmentLogEvents.IssueJournalPublished(logger, jobId, issueNumber!.Value, "completed");
                 }
                 return result.Status == "passed" ? 0 : 1;
             }
