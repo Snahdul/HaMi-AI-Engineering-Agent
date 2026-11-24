@@ -83,7 +83,7 @@ internal static class DevelopmentAgentCommand
                 if (logging.Settings.LogSuccessfulSteps)
                     DevelopmentLogEvents.IssueBound(logger, jobId, sourceIssue.Number);
                 if (publishIssue)
-                    journal = new DevelopmentIssueWorkflow(issues, sourceIssue, jobId, allowFollowUps);
+                    journal = new DevelopmentIssueWorkflow(issues, sourceIssue, jobId, allowFollowUps, live);
             }
 
             if (logging.Settings.LogSuccessfulSteps)
