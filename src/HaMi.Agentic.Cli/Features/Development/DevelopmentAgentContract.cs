@@ -16,8 +16,10 @@ internal sealed record DevelopmentAgentContract(
     string SourceFile,
     string Mode,
     int MaxAttempts,
-    string[] AcceptanceCriteria)
+    string[] AcceptanceCriteria,
+    string ExpectedStdout = "HaMi isolated correction passed")
 {
+    internal const string ReviewedStdout = "HaMi isolated correction passed";
     internal const string TrustedPath = "contracts/development/agent-console-retry.json";
 
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web)
@@ -35,6 +37,10 @@ internal sealed record DevelopmentAgentContract(
         using var document = JsonDocument.Parse(text);
         if (document.RootElement.ValueKind != JsonValueKind.Object)
             throw new InvalidOperationException("Development agent contract must be a JSON object.");
+        if (!document.RootElement.TryGetProperty("expectedStdout", out JsonElement expected)
+            || expected.ValueKind != JsonValueKind.String)
+            throw new InvalidOperationException(
+                "Reviewed agent contract must explicitly declare expectedStdout.");
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (JsonProperty property in document.RootElement.EnumerateObject())
             if (!seen.Add(property.Name))
@@ -49,7 +55,8 @@ internal sealed record DevelopmentAgentContract(
     {
         if (SchemaVersion != 1 || TargetFramework != "net11.0"
             || ProjectFile != "Demo.csproj" || SourceFile != "Program.cs"
-            || Mode != "run" || TaskId != "sandbox-console-retry")
+            || Mode != "run" || TaskId != "sandbox-console-retry"
+            || ExpectedStdout != ReviewedStdout)
             throw new InvalidOperationException("Agent contract scope or version is not approved.");
         if (MaxAttempts is < 1 or > 3)
             throw new InvalidOperationException("Agent retry budget must be between 1 and 3.");
@@ -66,8 +73,17 @@ internal sealed record DevelopmentAgentContract(
             "Demo.csproj", "Program.cs", "run", 2, ["Program exits zero."]);
         test.Validate();
         var invalid = test with { MaxAttempts = 100 };
-        try { invalid.Validate(); }
+        ExpectInvalid(invalid, "Unbounded actor attempts accepted.");
+        ExpectInvalid(test with { ExpectedStdout = "ignored" },
+            "Unreviewed stdout expectation accepted.");
+        ExpectInvalid(test with { ExpectedStdout = "" },
+            "Empty stdout expectation accepted.");
+    }
+
+    private static void ExpectInvalid(DevelopmentAgentContract contract, string message)
+    {
+        try { contract.Validate(); }
         catch (InvalidOperationException) { return; }
-        throw new InvalidOperationException("Unbounded actor attempts accepted.");
+        throw new InvalidOperationException(message);
     }
 }
