@@ -158,6 +158,243 @@ internal static class DevelopmentPublicationGatewayTests
         }
     }
 
+    // Reuse the disposable real Git baseline. Only the external issue,
+    // sandbox inspection and GitHub HTTP boundaries are controlled fixtures.
+    // No real credential, model, build, guest or remote write is involved.
+    private static async Task VerifyRecoveryAsync(string repo, string results, string root,
+        string baseline, string changed)
+    {
+        string jobId = new('a', 32);
+        string runId = new('f', 32);
+        const int issueNumber = 77;
+        string sourcePath = DevelopmentProductionVerifier.SourcePath;
+        bool revoked = false, changedTask = false, unknownCleanup = false;
+        int reads = 0, inspections = 0, publisherStarts = 0;
+
+        Task<JsonDocument> ReadIssue(int number)
+        {
+            if (number != issueNumber)
+                throw new Exception("Recovery used a different issue.");
+            reads++;
+            return Task.FromResult(JsonDocument.Parse(JsonSerializer.Serialize(new
+            {
+                number,
+                state = revoked ? "closed" : "open",
+                user = new { login = "Snahdul" },
+                labels = new[] { new { name = "workflow:in-progress" } },
+                title = "Approved recovery fixture",
+                body = "HaMi-Agent-Task: production-retry-budget\n\n### Ziel und Nutzen\n"
+                    + (changedTask ? "Changed approved business goal." : "Preserve the approved retry behavior.")
+                    + "\n\n### Akzeptanzkriterien\n- Preserve the retry semantics."
+            })));
+        }
+
+        Task Inspect(string id)
+        {
+            if (id != runId)
+                throw new Exception("Recovery inspected the wrong sandbox.");
+            inspections++;
+            if (unknownCleanup)
+                throw new InvalidOperationException("Fixture sandbox absence not confirmed.");
+            return Task.CompletedTask;
+        }
+
+        var contract = DevelopmentAgentContract.Load(repo, DevelopmentAgentContract.ProductionPath);
+        using var approvedJson = await ReadIssue(issueNumber);
+        var issue = ApprovedDevelopmentIssue.Parse(approvedJson.RootElement, contract);
+        var identity = await DevelopmentJobIdentityFactory.CreateAsync(repo, results, jobId, issueNumber,
+            issue, issue.Bind(contract), baseline, false);
+        string jobRoot = DevelopmentJobEvidence.JobRoot(identity);
+        string candidate = Path.Combine(jobRoot, "worktrees", "01");
+        string production = Path.Combine(jobRoot, "evaluations", "01", "production-check-" + new string('e', 32));
+        string sandbox = Path.Combine(production, "sandbox", "reports", "hami-code-" + runId);
+        string patch = Path.Combine(production, "candidate.patch");
+        string sandboxReport = Path.Combine(sandbox, "report.json");
+        string originalPath = Path.Combine(jobRoot, DevelopmentJobEvidence.OriginalReportName);
+        string projection = Path.Combine(jobRoot, "agent-report.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(candidate)!);
+        Directory.CreateDirectory(sandbox);
+        await Git(repo, "worktree", "add", "--detach", candidate, baseline);
+        try
+        {
+            string source = Local(candidate, sourcePath);
+            await File.WriteAllTextAsync(source, changed);
+            await File.WriteAllTextAsync(patch, await Git(candidate, "diff", "--no-ext-diff", "--no-textconv", "--", sourcePath));
+            string snapshot = Local(Path.Combine(production, "snapshot"), sourcePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(snapshot)!);
+            File.Copy(source, snapshot);
+            var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+            var evidence = new DevelopmentProductionVerifier.ProductionReport("passed",
+                baseline, sourcePath, DevelopmentProductionVerifier.FileHash(source), patch, sandboxReport,
+                0, 0, 0, true, true, true, DevelopmentProductionVerifier.FileHash(patch));
+            await File.WriteAllTextAsync(Path.Combine(production, "production-report.json"),
+                JsonSerializer.Serialize(evidence, jsonOptions));
+            await File.WriteAllTextAsync(sandboxReport, JsonSerializer.Serialize(
+                new DevelopmentSandboxRunner.SandboxRunReport(1, runId, "samples/RetryBudget/RetryBudget.csproj",
+                    "run", 0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null), jsonOptions));
+            await File.WriteAllTextAsync(Path.Combine(sandbox, "execution.log"),
+                DevelopmentOutputAcceptance.ReviewedProductionStdout);
+            var attempt = new DevelopmentJobAttempt(1, "passed", 0, 0, 0, false, true,
+                sandboxReport, true, candidate, patch, evidence);
+            var job = new DevelopmentJobReport(jobId, "passed", 1, [attempt], null, issueNumber);
+            string manifestHash = await DevelopmentJobEvidence.SealAsync(repo, identity, job);
+            byte[] original = File.ReadAllBytes(originalPath);
+            byte[] originalManifest = File.ReadAllBytes(Path.Combine(jobRoot, DevelopmentJobEvidence.ManifestName));
+            string[] fullWrites = ["git/blobs", "git/trees", "git/commits", "git/refs", "pulls"];
+
+            int scenario = 0;
+            foreach (string? interrupted in new string?[]
+            {
+                null, "git/blobs", "git/trees", "git/commits", "git/refs", "pulls", "rate-limit"
+            })
+            {
+                string stateRoot = Path.Combine(root, "recovery-state-" + (++scenario));
+                Directory.CreateDirectory(stateRoot);
+                var store = new DevelopmentJobStateStore(stateRoot);
+                var remote = new FakeGitHub(baseline);
+                // Simulate process loss by closing the initial lease. The
+                // durable checkpoint and fake remote effects survive.
+                using (var initial = store.Acquire(issueNumber))
+                {
+                    initial.Claim(DevelopmentJobState.Create(identity));
+                    initial.Commit(initial.RequireCurrent().Start());
+                    initial.Commit(initial.RequireCurrent().Verify(1, 1, manifestHash));
+                    if (interrupted is not null)
+                    {
+                        initial.Commit(initial.RequireCurrent().ReservePublication());
+                        remote.InterruptEndpoint = interrupted;
+                        remote.RateLimited = interrupted == "rate-limit";
+                        using var publisher = remote.OpenPublisher();
+                        await RejectAsync(() => publisher.PublishAsync(repo, results, job, issueNumber,
+                            baseline, true, CancellationToken.None), remote.RateLimited
+                                ? "Publication API rejected request: HTTP 429"
+                                : "Publication API rejected request: HTTP 503");
+                    }
+                }
+
+                remote.InterruptEndpoint = null;
+                remote.RateLimited = false;
+                int previousPosts = remote.Posts;
+                int expectedReservations = interrupted is null ? 1 : 2;
+                using (var owner = store.AcquireJob(jobId))
+                {
+                    Task<int> Resume(string approvedBase = "") =>
+                        DevelopmentRecoveryCommand.ResumeOwnedAsync(repo, owner,
+                            approvedBase == "" ? baseline : approvedBase, ReadIssue, Inspect, () =>
+                            {
+                                publisherStarts++;
+                                var pending = owner.RequireCurrent();
+                                if (pending.Stage != DevelopmentJobState.PublicationPending
+                                    || pending.PublicationAttempts != expectedReservations
+                                    || pending.Identity.JobId != jobId)
+                                    throw new Exception("Publication started before durable reservation.");
+                                return remote.OpenPublisher();
+                            });
+
+                    var before = owner.RequireCurrent();
+                    if (before.Identity != identity || before.ModelCalls != 1 || before.Attempts != 1
+                        || before.PublicationAttempts != expectedReservations - 1)
+                        throw new InvalidOperationException("Original recovery identity or budget was lost.");
+
+                    // The same production reentry use case must reject these
+                    // cases before the publication boundary is constructed.
+                    if (interrupted is null)
+                    {
+                        int beforeStarts = publisherStarts;
+                        await RejectAsync(() => Resume(new string('c', 40)));
+                        changedTask = true;
+                        await RejectAsync(() => Resume());
+                        changedTask = false;
+                        revoked = true;
+                        await RejectAsync(() => Resume());
+                        revoked = false;
+                        unknownCleanup = true;
+                        await RejectAsync(() => Resume());
+                        unknownCleanup = false;
+                        if (publisherStarts != beforeStarts || remote.Calls != 0
+                            || owner.RequireCurrent() != before)
+                            throw new InvalidOperationException("Rejected recovery reached publication or consumed budget.");
+                    }
+
+                    int previousReads = reads, previousInspections = inspections, previousStarts = publisherStarts;
+                    if (await Resume() != 99)
+                        throw new InvalidOperationException("Recovery returned an unexpected PR.");
+                    string[] expectedWrites = interrupted switch
+                    {
+                        "git/refs" => ["pulls"],
+                        "pulls" => [],
+                        _ => fullWrites
+                    };
+                    var final = owner.RequireCurrent();
+                    if (reads != previousReads + 1 || inspections != previousInspections + 1
+                        || publisherStarts != previousStarts + 1
+                        || !remote.PostPaths.Skip(previousPosts).SequenceEqual(expectedWrites)
+                        || remote.BranchCreates != 1 || remote.PullCreates != 1
+                        || final.Stage != DevelopmentJobState.Published || final.PullRequestNumber != 99
+                        || final.Identity != identity || final.ModelCalls != 1 || final.Attempts != 1
+                        || final.PublicationAttempts != expectedReservations
+                        || !File.ReadAllBytes(originalPath).SequenceEqual(original)
+                        || !File.ReadAllBytes(Path.Combine(jobRoot, DevelopmentJobEvidence.ManifestName)).SequenceEqual(originalManifest))
+                        throw new InvalidOperationException("Recovery did not preserve job identity, evidence or exact remote effect count.");
+                }
+
+                // Simulate the report update being lost after a confirmed
+                // remote publication. The next invocation is local only.
+                File.Delete(projection);
+                using (var published = store.AcquireJob(jobId))
+                {
+                    int repair = await DevelopmentRecoveryCommand.ResumeOwnedAsync(repo, published, baseline,
+                        _ => throw new Exception("Published repair read an issue."),
+                        _ => throw new Exception("Published repair inspected a sandbox."),
+                        () => throw new Exception("Published repair constructed a publisher."));
+                    if (repair != 99 || published.RequireCurrent().PublicationAttempts != expectedReservations
+                        || JsonSerializer.Deserialize<DevelopmentJobReport>(File.ReadAllBytes(projection), jsonOptions)?.DraftPullRequestNumber != 99)
+                        throw new InvalidOperationException("Published recovery did not repair the local projection.");
+                }
+                Console.WriteLine("Recovery regression passed: " + (interrupted ?? "before publication"));
+            }
+
+            // Exhausted publication budget and unknown early execution must
+            // not resolve any remote dependency or create a new job.
+            string terminalRoot = Path.Combine(root, "recovery-terminal-state");
+            Directory.CreateDirectory(terminalRoot);
+            var terminalStore = new DevelopmentJobStateStore(terminalRoot);
+            using (var owner = terminalStore.Acquire(issueNumber))
+            {
+                owner.Claim(DevelopmentJobState.Create(identity));
+                owner.Commit(owner.RequireCurrent().Start());
+                await RejectAsync(() => DevelopmentRecoveryCommand.ResumeOwnedAsync(repo, owner, baseline,
+                    _ => throw new Exception("Unknown execution read an issue."),
+                    _ => throw new Exception("Unknown execution inspected a sandbox."),
+                    () => throw new Exception("Unknown execution constructed a publisher.")));
+                if (owner.RequireCurrent().Stage != DevelopmentJobState.RecoveryBlocked)
+                    throw new InvalidOperationException("Unknown execution was not durably blocked.");
+            }
+
+            string exhaustedRoot = Path.Combine(root, "recovery-budget-state");
+            Directory.CreateDirectory(exhaustedRoot);
+            using (var owner = new DevelopmentJobStateStore(exhaustedRoot).Acquire(issueNumber))
+            {
+                owner.Claim(DevelopmentJobState.Create(identity));
+                owner.Commit(owner.RequireCurrent().Start());
+                owner.Commit(owner.RequireCurrent().Verify(1, 1, manifestHash));
+                for (int i = 0; i < identity.MaxPublicationAttempts; i++)
+                    owner.Commit(owner.RequireCurrent().ReservePublication());
+                var exhausted = owner.RequireCurrent();
+                await RejectAsync(() => DevelopmentRecoveryCommand.ResumeOwnedAsync(repo, owner, baseline,
+                    _ => throw new Exception("Exhausted recovery read an issue."),
+                    _ => throw new Exception("Exhausted recovery inspected a sandbox."),
+                    () => throw new Exception("Exhausted recovery constructed a publisher.")));
+                if (owner.RequireCurrent() != exhausted)
+                    throw new InvalidOperationException("Exhausted recovery budget changed.");
+            }
+        }
+        finally
+        {
+            await Git(repo, "worktree", "remove", "--force", candidate);
+        }
+    }
+
     private static Task<string> Git(string path, params string[] args) =>
         DevelopmentWorktreeGuard.GitAsync(path, args);
 
