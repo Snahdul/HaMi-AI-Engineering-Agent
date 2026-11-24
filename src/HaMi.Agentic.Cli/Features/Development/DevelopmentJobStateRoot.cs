@@ -18,7 +18,7 @@ internal static class DevelopmentJobStateRoot
         | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
     private const UnixFileMode PrivateFile = UnixFileMode.UserRead | UnixFileMode.UserWrite;
 
-    internal static DevelopmentJobStateStore Open(string repo, string resultsRoot)
+    internal static DevelopmentJobStateStore Open(string repo, string? resultsRoot)
     {
         if (OperatingSystem.IsWindows())
         {
@@ -66,7 +66,7 @@ internal static class DevelopmentJobStateRoot
         throw new InvalidOperationException("Recovery storage platform not supported.");
     }
 
-    private static string Resolve(string repo, string resultsRoot, string parent, string name)
+    private static string Resolve(string repo, string? resultsRoot, string parent, string name)
     {
         if (string.IsNullOrWhiteSpace(parent) || !Path.IsPathFullyQualified(parent)
             || !Directory.Exists(parent))
@@ -74,7 +74,8 @@ internal static class DevelopmentJobStateRoot
         string root = Path.Combine(Path.TrimEndingDirectorySeparator(Path.GetFullPath(parent)), name);
         // Reuse the existing symmetric overlap and reparse-point gate; the
         // root is checked against all writable job/worktree locations.
-        DevelopmentIsolatedRunner.ValidateStoragePaths(repo, resultsRoot, root);
+        if (resultsRoot is not null)
+            DevelopmentIsolatedRunner.ValidateStoragePaths(repo, resultsRoot, root);
         DevelopmentIsolatedRunner.ValidateStoragePaths(repo, RuntimeSettings.GetWorktreeRoot(repo), root);
         return root;
     }
