@@ -10,7 +10,7 @@ streng validierte Laufzeitkonfiguration:
 ```json
 {
   "version": 1,
-  "logSuccessfulSteps": false,
+  "logSuccessfulSteps": true,
   "logDecisionSummaries": true,
   "minimumLevel": "Information",
   "relativeDirectory": "hami-agent-logs",
@@ -21,8 +21,7 @@ streng validierte Laufzeitkonfiguration:
 
 **Die Schalter sind unabhängig voneinander:**
 
-- `logSuccessfulSteps=false` (Standard): erfolgreiche Versuche und erfolgreiche
-  Gesamtaufträge werden **nicht** protokolliert. Fehler und Warnungen bleiben im Log.
+- `logSuccessfulSteps=true` (Standard): erfolgreiche Schritte und Abschlüsse werden zusammen mit Warnungen, Fehlern und Entscheidungen protokolliert. Mit `false` können optionale Erfolgsereignisse deaktiviert werden.
 - `logDecisionSummaries=true` (Standard): ausdrücklich erzeugte, knappe
   **Entscheidungszusammenfassungen** als `Information` loggen.
 - Bei `logDecisionSummaries=false` bleiben Fehlereinträge erhalten.
@@ -44,7 +43,7 @@ rollierenden `Serilog.Sinks.File`-Sink mit `CompactJsonFormatter`.
 
 Ausgabe unter
 `<HAMI_AGENT_WORKTREE_ROOT>/hami-agent-logs/agent-<Datum>.clef`:
-jede Zeile ist ein einzelnes maschinenlesbares Compact-JSON-Ereignis. Die
+jede Zeile ist ein einzelnes maschinenlesbares Compact-JSON-Ereignis. Zusaetzlich liegt unter demselben Root eine direkt lesbare Datei `agent-<Datum>.log` mit chronologischen Nachrichten, Zeitstempel und Level. Beide Dateien entstehen aus denselben ILogger-Events und sind unabhaengig nach Groesse/Datum rotiert und in ihrer Aufbewahrung begrenzt. Die
 Rotation erfolgt täglich und bei Erreichen des konfigurierten Größenlimits,
 mit begrenzter Dateianzahl. Der Logordner liegt außerhalb des produktiven
 Checkouts. Die Event-Scope-Eigenschaft `RunId` korreliert Ereignisse eines Laufs.
@@ -85,11 +84,49 @@ dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- coding --self-test-log
 ```
 
 Dieser Test benötigt weder Modell noch API-Schlüssel. Er prüft, dass die
-Default-Konfiguration **Fehler und Decision-Summaries**, aber **keine
-positiven Schritte** speichert. Danach werden beide Schalter unabhängig
+Default-Konfiguration **Fehler, Decision-Summaries und positive Schritte** speichert. Danach werden beide Schalter unabhängig
 variiert. Außerdem werden korrumpierte Konfigurationen (unbekannte Keys,
 ungültige Levels, Path Traversal, absolute Pfade und überzogene
 Dateigrößen-/Retention-Limits) abgewiesen.
 
 Die Logdateien sind ein **technisches Auditmedium**, kein Ersatz für den
 stabilen, lokalen fachlichen `report.json`-Bericht.
+
+
+## Development-Agent (Issue #38)
+
+`development --agent-run` nutzt dieselbe `ILogger`-/Serilog-Session, nun mit
+**Console-Provider, lesbarer rotierender .log-Datei und Compact-JSON-Datei**.
+EventIds 3600–3610 beschreiben Startparameter, Preflight, Generierung,
+MicroVM-Phasen, Retry-Entscheidungen, klassifizierte Compilerfehler und
+abschliessenden Bericht. Die eindeutige `JobId` korreliert Actor,
+`agent-job-<JobId>`-Verzeichnis und JSON-Report.
+
+`Information`: lebenszyklusrelevante Erfolge und Entscheidungen;
+`Warning`: korrekturfahige Fehler; `Error`: terminale Fehler mit
+Phase, Ursache und Handlungsempfehlung; `Debug`: verworfene/stale Nachrichten.
+Weder Rohausgaben des Modells noch Sandboxtests, Secrets oder
+unbereinigte Exceptiontexte landen in den Betriebslogs.
+
+Der CLI-Aufruf muss einen benannten Unterbefehl verwenden, z. B.
+`replay --check .` statt veraltetes `--check .`.
+
+
+### Isolierte Sandbox-Phasen im Development-Job
+
+Der Agent uebergibt dem Sandbox-Runner einen typisierten Callback mit
+**hostdefinierten Phasencodes**, generierter Sandbox-ID, Laufzeit und Exitcode.
+Event **3611 `SandboxPhase`** protokolliert MicroVM, Isolation,
+SDK, Snapshot, Offline-Restore, Build, Ausfuehrung und Cleanup.
+Die Haupt-Logs enthalten weder rohe Compilertexte noch fremde
+Exception-Nachrichten. Die vollstaendigen Gast-Diagnosen bleiben in
+den separaten Sandbox-Berichten.
+
+Bei einem Agentenlauf ersetzt dieser Observer die bisherigen separaten
+Konsolentexte und Preview-Ausgaben; ein eigenstaendiger Sandbox-Befehl
+behaelt seine bisherige Konsolendarstellung.
+
+Die Abschlussmeldung verwendet `generatorCalls`; dies sind bei
+`offline-scripted` simulierte Generatoraufrufe, **keine API-Anfragen**.
+Das gespeicherte JSON-Feld `modelCalls` wird aus Gruenden der
+Berichtskompatibilitaet weiterhin verwendet.

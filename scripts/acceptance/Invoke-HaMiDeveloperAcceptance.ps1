@@ -1,7 +1,7 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  Full local HaMi Developer actor/sandbox acceptance (Issue #36).
+  Full local HaMi Developer actor/sandbox and logging acceptance (Issues #36/#38).
 .DESCRIPTION
   Performs offline Akka/CommandLine selftests followed by two genuine
   fresh Docker MicroVM attempts. Does not run the model, merge PRs, change
@@ -10,6 +10,7 @@
 [CmdletBinding()]
 param(
     [string]$ResultsRoot = 'G:\HaMi\Sandbox\PoC\Runs',
+    [string]$ExpectedRef = 'origin/feature/issue38-development-narrative-logging-cleanup',
     [switch]$VerifyOnly,
     [string]$ReportPath
 )
@@ -20,9 +21,9 @@ $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 $project = Join-Path $repo 'src\HaMi.Agentic.Cli'
 $head = (& git -C $repo rev-parse HEAD)
 if ($LASTEXITCODE -ne 0) { throw 'Git checkout unavailable.' }
-$expected = (& git -C $repo rev-parse origin/feature/issue36-commandline-akka-sandbox-flow-20261123)
+$expected = (& git -C $repo rev-parse --verify $ExpectedRef)
 if ($LASTEXITCODE -ne 0 -or $head -ne $expected) {
-    throw 'Review worktree is not on the latest fetched PR #37 branch. Fetch/switch first.'
+    throw ('Worktree HEAD is not equal to {0}. Fetch and update the review worktree first.' -f $ExpectedRef)
 }
 if (-not (Get-Command sbx -ErrorAction SilentlyContinue)) { throw 'Docker sbx CLI fehlt.' }
 $before = @(& git -C $repo status --porcelain=v1)
@@ -135,6 +136,6 @@ if ($VerifyOnly) {
 } else {
     Write-Host 'PASS: CLI/parser + Akka host, compiler fail/correct, 2 MicroVM cleanups, unchanged Git.' -ForegroundColor Green
 }
-Write-Host ('Model calls (scripted, no API charges): ' + $report.modelCalls)
+Write-Host ('Generator invocations (scripted offline, no API charges): ' + $report.modelCalls)
 Write-Host ('Current HEAD: ' + $head)
 Write-Host ('Full acceptance report: ' + $reportPath)

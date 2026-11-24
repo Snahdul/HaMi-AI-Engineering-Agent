@@ -1,4 +1,4 @@
 using HaMi.Agentic.Cli.Runtime;
 
-// System.CommandLine handles named commands; option-first legacy replay remains compatible.
+// The CLI requires named subcommands; no implicit historical replay dispatch.
 return await CommandLineRouter.RunAsync(args);

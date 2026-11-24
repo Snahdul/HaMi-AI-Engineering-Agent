@@ -1,5 +1,8 @@
 using Akka.Actor;
 using Akka.Pattern;
+using Microsoft.Extensions.Logging;
+using System.Diagnostics;
+using System.Text.RegularExpressions;
 
 namespace HaMi.Agentic.Cli.Features.Development;
 
@@ -49,7 +52,12 @@ internal sealed class DevelopmentJobActor : ReceiveActor
     private readonly CancellationTokenSource cancellation = new();
     private readonly List<DevelopmentJobAttempt> attempts = [];
 
-    private readonly string jobId = Guid.NewGuid().ToString("N");
+    private readonly string jobId;
+    private readonly ILogger? logger;
+    private readonly bool logSuccessfulSteps;
+    private readonly bool logDecisionSummaries;
+    private long generationStarted;
+    private long sandboxStarted;
     private IActorRef? requester;
     private string feedback = "";
     private int attempt;
@@ -61,11 +69,16 @@ internal sealed class DevelopmentJobActor : ReceiveActor
 
     public DevelopmentJobActor(DevelopmentAgentContract contract,
         IDevelopmentCandidateGenerator generator,
-        IDevelopmentIsolatedRunner isolatedRunner)
+        IDevelopmentIsolatedRunner isolatedRunner, ILogger? logger = null, string? requestedJobId = null,
+        bool logSuccessfulSteps = true, bool logDecisionSummaries = true)
     {
         this.contract = contract;
         this.generator = generator;
         this.isolatedRunner = isolatedRunner;
+        this.logger = logger;
+        this.jobId = requestedJobId ?? Guid.NewGuid().ToString("N");
+        this.logSuccessfulSteps = logSuccessfulSteps;
+        this.logDecisionSummaries = logDecisionSummaries;
 
         Receive<Start>(_ =>
         {
@@ -87,18 +100,29 @@ internal sealed class DevelopmentJobActor : ReceiveActor
 
         Receive<Generated>(message =>
         {
-            if (stage != Stage.Generating || message.Attempt != attempt) return;
+            if (stage != Stage.Generating || message.Attempt != attempt)
+            {
+                if (logger is not null) DevelopmentLogEvents.MessageIgnored(logger, jobId, message.Attempt, stage.ToString());
+                return;
+            }
             modelCalls++;
+            if (logger is not null && logSuccessfulSteps)
+                DevelopmentLogEvents.GenerationFinished(logger, jobId, attempt,
+                    message.Source?.Length ?? 0, (long)Stopwatch.GetElapsedTime(generationStarted).TotalMilliseconds);
             if (string.IsNullOrWhiteSpace(message.Source) || message.Source.Length > 16 * 1024)
             {
                 attempts.Add(new DevelopmentJobAttempt(attempt, "source-rejected", -1, -1, -1,
                     false, true, null));
                 feedback = "Generated source must be a nonempty C# file, at most 16 KiB.";
-                RetryOrFinish();
+                if (logger is not null)
+                    DevelopmentLogEvents.AttemptFailed(logger, jobId, attempt, "source-rejected", "SOURCE_SIZE_OR_EMPTY");
+                RetryOrFinish("SOURCE_REJECTED");
                 return;
             }
 
             stage = Stage.Executing;
+            sandboxStarted = Stopwatch.GetTimestamp();
+            if (logger is not null && logSuccessfulSteps) DevelopmentLogEvents.SandboxStarted(logger, jobId, attempt);
             int current = attempt;
             IActorRef self = Self;
             Task<DevelopmentSandboxAttempt> task;
@@ -120,12 +144,21 @@ internal sealed class DevelopmentJobActor : ReceiveActor
 
         Receive<Executed>(message =>
         {
-            if (stage != Stage.Executing || message.Attempt != attempt) return;
+            if (stage != Stage.Executing || message.Attempt != attempt)
+            {
+                if (logger is not null) DevelopmentLogEvents.MessageIgnored(logger, jobId, message.Attempt, stage.ToString());
+                return;
+            }
             DevelopmentSandboxAttempt result = message.Result;
             // Retry ONLY an observed compiler or program failure. In particular,
             // sbx/preflight/restore failures have -1 phase codes and MUST NOT
             // be mistaken for ordinary C# compiler diagnostics.
             string status = ClassifyResult(result);
+            if (logger is not null && logSuccessfulSteps)
+                DevelopmentLogEvents.SandboxFinished(logger, jobId, attempt, status,
+                    result.RestoreExitCode, result.BuildExitCode, result.RunExitCode,
+                    result.TimedOut, result.CleanupSucceeded,
+                    (long)Stopwatch.GetElapsedTime(sandboxStarted).TotalMilliseconds);
             attempts.Add(new DevelopmentJobAttempt(attempt, status,
                 result.RestoreExitCode, result.BuildExitCode, result.RunExitCode,
                 result.TimedOut, result.CleanupSucceeded, result.ReportPath));
@@ -151,20 +184,41 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             // a completed isolated compiler/program failure with confirmed cleanup.
             if (status is not ("build-failed" or "run-failed"))
             {
+                if (logger is not null)
+                    DevelopmentLogEvents.JobFailed(logger, jobId, "sandbox", status, "none",
+                        status switch
+                        {
+                            "cleanup-failed" => "MicroVM-Zustand vor einem erneuten Start manuell pruefen.",
+                            "timed-out" => "Zeitlimit und Sandbox-Status kontrollieren; kein automatischer Retry.",
+                            _ => "Sandbox-Phasenreport (restore/build/exec) und Sicherheits-Preflight pruefen."
+                        });
                 Finish("failed", status);
                 return;
+            }
+
+            if (logger is not null)
+            {
+                Match diagnostic = Regex.Match(result.Feedback, @"\bCS\d{4}\b",
+                    RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+                DevelopmentLogEvents.AttemptFailed(logger, jobId, attempt, status,
+                    diagnostic.Success ? diagnostic.Value.ToUpperInvariant() : "EXECUTION_NONZERO");
             }
 
             feedback = DevelopmentSandboxRunner.SafeLogPreview(result.Feedback);
             if (feedback.Length > 1200) feedback = feedback[..1200];
             if (string.IsNullOrWhiteSpace(feedback))
                 feedback = "The isolated build or run failed with a nonzero exit code.";
-            RetryOrFinish();
+            RetryOrFinish(status);
         });
 
         Receive<Faulted>(message =>
         {
             if (message.Attempt != attempt || stage == Stage.Finished) return;
+            if (logger is not null)
+                DevelopmentLogEvents.JobFailed(logger, jobId, message.Stage, "OPERATION_FAULT",
+                    message.FailureType, message.Stage == "generator"
+                        ? "Modell-/Generator-Konfiguration und Auftragsbudget pruefen."
+                        : "Sandbox-Report und lokalen MicroVM-Zustand pruefen.");
             Finish(cancelRequested ? "cancelled" : "failed",
                 message.Stage + ":" + message.FailureType);
         });
@@ -173,6 +227,9 @@ internal sealed class DevelopmentJobActor : ReceiveActor
         {
             if (stage == Stage.Finished) return;
             cancelRequested = true;
+            if (logger is not null && logDecisionSummaries)
+                DevelopmentLogEvents.DecisionRecorded(logger, jobId, attempt,
+                    "CANCEL_REQUESTED", "HOST_CANCEL_OR_JOB_DEADLINE");
             cancellation.Cancel();
             // During a sandbox execution wait for Executed/Faulted: stopping
             // the ActorSystem now could abandon the in-flight MicroVM cleanup.
@@ -206,6 +263,10 @@ internal sealed class DevelopmentJobActor : ReceiveActor
     private void BeginGeneration()
     {
         stage = Stage.Generating;
+        generationStarted = Stopwatch.GetTimestamp();
+        if (logger is not null && logSuccessfulSteps)
+            DevelopmentLogEvents.GenerationStarted(logger, jobId, attempt,
+                !string.IsNullOrEmpty(feedback));
         int current = attempt;
         string currentFeedback = feedback;
         IActorRef self = Self;
@@ -226,14 +287,20 @@ internal sealed class DevelopmentJobActor : ReceiveActor
         }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
-    private void RetryOrFinish()
+    private void RetryOrFinish(string reasonCode)
     {
         if (attempt >= contract.MaxAttempts)
         {
+            if (logger is not null)
+                DevelopmentLogEvents.JobFailed(logger, jobId, "retry", "ATTEMPT_BUDGET_EXHAUSTED",
+                    "none", "Auftragsbudget pruefen; keine automatische Budgeterhoehung.");
             Finish("exhausted", "Approved attempt budget exhausted.");
             return;
         }
 
+        if (logger is not null && logDecisionSummaries)
+            DevelopmentLogEvents.DecisionRecorded(logger, jobId, attempt,
+                "RETRY_APPROVED", reasonCode);
         attempt++;
         BeginGeneration();
     }
@@ -259,14 +326,17 @@ internal static class DevelopmentActorCoordinator
     public static async Task<DevelopmentJobReport> RunAsync(
         ActorSystem system, DevelopmentAgentContract contract,
         IDevelopmentCandidateGenerator generator, IDevelopmentIsolatedRunner sandbox,
-        CancellationToken cancellationToken = default, TimeSpan? jobTimeout = null)
+        CancellationToken cancellationToken = default, TimeSpan? jobTimeout = null,
+        ILogger? logger = null, string? jobId = null,
+        bool logSuccessfulSteps = true, bool logDecisionSummaries = true)
     {
         TimeSpan deadline = jobTimeout ?? TimeSpan.FromMinutes(12);
         if (deadline <= TimeSpan.Zero || deadline > TimeSpan.FromMinutes(12))
             throw new ArgumentOutOfRangeException(nameof(jobTimeout));
 
         IActorRef actor = system.ActorOf(
-            Props.Create(() => new DevelopmentJobActor(contract, generator, sandbox)),
+            Props.Create(() => new DevelopmentJobActor(contract, generator, sandbox,
+                logger, jobId, logSuccessfulSteps, logDecisionSummaries)),
             "coding-" + Guid.NewGuid().ToString("N"));
 
         // Do NOT cancel/timeout Ask at the job deadline: doing so would tear

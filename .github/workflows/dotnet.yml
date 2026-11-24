@@ -64,10 +64,10 @@ jobs:
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-poc-self-test
 
       - name: CLI help smoke test (no API key needed)
-        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --help
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- replay --help
 
       - name: Validate historical templates without model call
-        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --check .
+        run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- replay --check .
 
       - name: Reject premature mandatory result fields (regression)
         shell: bash
@@ -77,7 +77,7 @@ jobs:
           cp .github/ISSUE_TEMPLATE/*.yml "$target/.github/ISSUE_TEMPLATE/"
           cp .github/pull_request_template.md "$target/.github/pull_request_template.md"
           python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]);s=p.read_text();needle="  - type: textarea\n    id: verification\n";assert needle in s;p.write_text(s.replace(needle,"    validations:\n      required: true\n"+needle,1))' "$target/.github/ISSUE_TEMPLATE/task.yml"
-          if dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --check "$target"; then
+          if dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- replay --check "$target"; then
             echo "::error::Validator accepted mandatory result/progress field"
             exit 1
           fi
@@ -87,7 +87,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          output="$(dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --unattended 2>&1)"
+          output="$(dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- replay --unattended 2>&1)"
           result=$?
           set -e
           if [ "$result" -ne 2 ] || ! grep -Fq -- "--unattended requires explicit --repo" <<< "$output"; then
@@ -95,7 +95,7 @@ jobs:
             exit 1
           fi
           set +e
-          output="$(dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- --unattended --check . 2>&1)"
+          output="$(dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- replay --unattended --check . 2>&1)"
           result=$?
           set -e
           if [ "$result" -ne 2 ] || ! grep -Fq -- "cannot be combined with read-only --check" <<< "$output"; then

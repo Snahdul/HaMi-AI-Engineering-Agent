@@ -80,7 +80,7 @@ internal sealed class AgentLoggingSession : IDisposable
     public AgentLoggingSettings Settings { get; }
     public string LogDirectory { get; }
 
-    private AgentLoggingSession(AgentLoggingSettings settings, string root)
+    private AgentLoggingSession(AgentLoggingSettings settings, string root, bool includeConsole = false)
     {
         Settings = settings;
         LogDirectory = Path.Combine(Path.GetFullPath(root), settings.RelativeDirectory);
@@ -95,6 +95,14 @@ internal sealed class AgentLoggingSession : IDisposable
                 fileSizeLimitBytes: settings.FileSizeLimitBytes,
                 rollOnFileSizeLimit: true,
                 retainedFileCountLimit: settings.RetainedFileCountLimit)
+            // The same structured ILogger events also form a directly readable
+            // chronological narrative; no second set of log calls is needed.
+            .WriteTo.File(Path.Combine(LogDirectory, "agent-.log"),
+                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}",
+                rollingInterval: Serilog.RollingInterval.Day,
+                fileSizeLimitBytes: settings.FileSizeLimitBytes,
+                rollOnFileSizeLimit: true,
+                retainedFileCountLimit: settings.RetainedFileCountLimit)
             .CreateLogger();
 
         _factory = LoggerFactory.Create(builder =>
@@ -105,11 +113,18 @@ internal sealed class AgentLoggingSession : IDisposable
             // factory. AddProvider(instance) leaves the externally created
             // singleton undisposed; on Windows the .clef file then remains locked.
             builder.AddSerilog(sink, dispose: true);
+            if (includeConsole)
+                builder.AddSimpleConsole(options =>
+                {
+                    options.SingleLine = true;
+                    options.TimestampFormat = "HH:mm:ss.fff ";
+                    options.IncludeScopes = false;
+                });
         });
     }
 
-    public static AgentLoggingSession Create(string repository) =>
-        new(AgentLoggingSettings.Load(repository), RuntimeSettings.GetWorktreeRoot(repository));
+    public static AgentLoggingSession Create(string repository, bool includeConsole = false) =>
+        new(AgentLoggingSettings.Load(repository), RuntimeSettings.GetWorktreeRoot(repository), includeConsole);
 
     internal static AgentLoggingSession CreateForTest(
         AgentLoggingSettings settings, string temporaryRoot) =>
@@ -130,7 +145,7 @@ internal static class AgentLoggingSelfTest
     public static void Run(string repository)
     {
         AgentLoggingSettings defaults = AgentLoggingSettings.Load(repository);
-        if (defaults.LogSuccessfulSteps || !defaults.LogDecisionSummaries
+        if (!defaults.LogSuccessfulSteps || !defaults.LogDecisionSummaries
             || defaults.MinimumLevel != "Information")
             throw new InvalidOperationException("Logging default flags differ from the agreed policy.");
 
@@ -146,36 +161,39 @@ internal static class AgentLoggingSelfTest
             Ensure(baseline.Contains("ExpressionRejected", StringComparison.Ordinal)
                 && baseline.Contains("CodingRunFailed", StringComparison.Ordinal)
                 && baseline.Contains("DecisionRecorded", StringComparison.Ordinal)
-                && !baseline.Contains("AttemptSucceeded", StringComparison.Ordinal)
-                && !baseline.Contains("RunSucceeded", StringComparison.Ordinal),
-                "Default must retain errors and decisions, but suppress successful steps.");
+                && baseline.Contains("AttemptSucceeded", StringComparison.Ordinal)
+                && baseline.Contains("RunSucceeded", StringComparison.Ordinal),
+                "Default must capture the complete success/failure/decision narrative.");
 
-            AgentLoggingSettings successes = AgentLoggingSettings.Parse(
-                original.Replace("\"logSuccessfulSteps\": false",
-                    "\"logSuccessfulSteps\": true", StringComparison.Ordinal));
-            string successText = Emit(successes, Path.Combine(temp, "successes"));
-            Ensure(successText.Contains("AttemptSucceeded", StringComparison.Ordinal)
-                && successText.Contains("DecisionRecorded", StringComparison.Ordinal),
-                "Success logging did not enable independently of decision logging.");
+            AgentLoggingSettings quietSuccesses = AgentLoggingSettings.Parse(
+                original.Replace("\"logSuccessfulSteps\": true",
+                    "\"logSuccessfulSteps\": false", StringComparison.Ordinal));
+            string quietText = Emit(quietSuccesses, Path.Combine(temp, "quiet-successes"));
+            Ensure(quietText.Contains("DecisionRecorded", StringComparison.Ordinal)
+                && quietText.Contains("ExpressionRejected", StringComparison.Ordinal)
+                && !quietText.Contains("AttemptSucceeded", StringComparison.Ordinal)
+                && !quietText.Contains("RunSucceeded", StringComparison.Ordinal),
+                "Disabling successful steps must not suppress errors or decisions.");
 
             AgentLoggingSettings noDecisions = AgentLoggingSettings.Parse(
                 original.Replace("\"logDecisionSummaries\": true",
                     "\"logDecisionSummaries\": false", StringComparison.Ordinal));
             string noDecisionText = Emit(noDecisions, Path.Combine(temp, "no-decisions"));
             Ensure(noDecisionText.Contains("ExpressionRejected", StringComparison.Ordinal)
+                && noDecisionText.Contains("AttemptSucceeded", StringComparison.Ordinal)
                 && !noDecisionText.Contains("DecisionRecorded", StringComparison.Ordinal),
-                "Disabling decisions must not suppress failures or warnings.");
+                "Disabling decisions must not suppress errors or successful steps.");
 
-            AgentLoggingSettings onlySuccesses = AgentLoggingSettings.Parse(
-                original.Replace("\"logSuccessfulSteps\": false",
-                    "\"logSuccessfulSteps\": true", StringComparison.Ordinal)
+            AgentLoggingSettings quietBoth = AgentLoggingSettings.Parse(
+                original.Replace("\"logSuccessfulSteps\": true",
+                    "\"logSuccessfulSteps\": false", StringComparison.Ordinal)
                 .Replace("\"logDecisionSummaries\": true",
                     "\"logDecisionSummaries\": false", StringComparison.Ordinal));
-            string successOnly = Emit(onlySuccesses, Path.Combine(temp, "success-only"));
-            Ensure(successOnly.Contains("AttemptSucceeded", StringComparison.Ordinal)
-                && !successOnly.Contains("DecisionRecorded", StringComparison.Ordinal)
-                && successOnly.Contains("ExpressionRejected", StringComparison.Ordinal),
-                "Success=true and decisions=false must work independently.");
+            string quietBothText = Emit(quietBoth, Path.Combine(temp, "quiet-both"));
+            Ensure(quietBothText.Contains("ExpressionRejected", StringComparison.Ordinal)
+                && !quietBothText.Contains("AttemptSucceeded", StringComparison.Ordinal)
+                && !quietBothText.Contains("DecisionRecorded", StringComparison.Ordinal),
+                "Disabling both switches must retain failures.");
 
             TestRotation(original, Path.Combine(temp, "rotation"));
 
@@ -205,7 +223,7 @@ internal static class AgentLoggingSelfTest
             }
 
             Console.WriteLine("Structured logging self-test passed: "
-                + "defaults success=false/decisions=true, all four toggle combinations, "
+                + "defaults success=true/decisions=true, all four toggle combinations, "
                 + "correlated failure events, configured rollover/retention and safe paths.");
         }
         finally
@@ -241,7 +259,13 @@ internal static class AgentLoggingSelfTest
         Ensure(files.Length == 2 && files.All(f => new FileInfo(f).Length
                 <= smallFiles.FileSizeLimitBytes + 4096),
             "Serilog size rollover and retention did not enforce the configured limits.");
-        EnsureFileHandlesReleased(files);
+        string[] narrativeFiles = Directory.GetFiles(Path.Combine(temp,
+            smallFiles.RelativeDirectory), "agent-*.log");
+        Ensure(narrativeFiles.Length == 2 && narrativeFiles.All(f => new FileInfo(f).Length
+                <= smallFiles.FileSizeLimitBytes + 4096),
+            "Readable narrative rollover or retention is not bounded.");
+        EnsureFileHandlesReleased(Directory.GetFiles(Path.Combine(temp,
+            smallFiles.RelativeDirectory), "agent-*.*"));
     }
 
     private static string Emit(AgentLoggingSettings settings, string temp)
@@ -280,7 +304,15 @@ internal static class AgentLoggingSelfTest
         string[] files = Directory.GetFiles(Path.Combine(temp, settings.RelativeDirectory),
             "agent-*.clef");
         Ensure(files.Length > 0, "No log file was emitted.");
-        EnsureFileHandlesReleased(files);
+        EnsureFileHandlesReleased(Directory.GetFiles(Path.Combine(temp,
+            settings.RelativeDirectory), "agent-*.*"));
+        string[] readableFiles = Directory.GetFiles(Path.Combine(temp, settings.RelativeDirectory),
+            "agent-*.log");
+        Ensure(readableFiles.Length > 0, "Readable narrative file is missing.");
+        string readable = string.Join("\n", readableFiles.SelectMany(File.ReadAllLines));
+        Ensure(readable.Contains("DecisionRecorded", StringComparison.Ordinal)
+            || !settings.LogDecisionSummaries,
+            "Readable narrative omitted an enabled decision.");
         string all = string.Join("\n", files.SelectMany(File.ReadAllLines));
         foreach (string line in all.Split('\n', StringSplitOptions.RemoveEmptyEntries))
         {

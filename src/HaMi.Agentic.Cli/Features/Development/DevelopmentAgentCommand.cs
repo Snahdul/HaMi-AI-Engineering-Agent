@@ -1,5 +1,7 @@
 using Akka.Actor;
 using Akka.Hosting;
+using HaMi.Agentic.Cli.Runtime.Logging;
+using Microsoft.Extensions.Logging;
 using HaMi.Agentic.Cli.Runtime;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -18,75 +20,150 @@ internal static class DevelopmentAgentCommand
         string repo, string? contractPath, string? sourceDirectory,
         string resultsDirectory, bool live, string? requestedModel)
     {
+        string jobId = Guid.NewGuid().ToString("N");
+        string phase = "logging";
+        AgentLoggingSession? logging = null;
+        Microsoft.Extensions.Logging.ILogger? logger = null;
         try
         {
+            // One ILogger event is sent to both console and the rolling .clef file.
+            // The same ID names the actor job, its temporary directory and its report.
+            logging = AgentLoggingSession.Create(repo, includeConsole: true);
+            logger = logging.CreateLogger("HaMi.Agentic.Cli.Features.Development");
+            if (logging.Settings.LogSuccessfulSteps)
+                DevelopmentLogEvents.JobRequested(logger, jobId, repo, resultsDirectory,
+                    live ? "live" : "offline-scripted",
+                    live ? requestedModel switch { null => "gpt-5.4-mini", { Length: > 64 } => "invalid-model-name", _ => requestedModel } : "scripted",
+                    contractPath ?? DevelopmentAgentContract.TrustedPath);
+
+            phase = "contract";
             DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, contractPath);
+            phase = "results";
             if (!Path.IsPathFullyQualified(resultsDirectory))
                 throw new InvalidOperationException("Agent results directory must be absolute.");
+            phase = "source-override";
             if (sourceDirectory is not null)
                 throw new InvalidOperationException("First actor slice cannot override the human-reviewed source fixture.");
+
+            phase = "snapshot";
             string source = Path.Combine(repo, "samples", "SandboxCoding");
             if (!Path.IsPathFullyQualified(source))
                 throw new InvalidOperationException("Agent source snapshot must be absolute.");
-            // Verify snapshot (including symlink/junction/credential restrictions)
-            // before any model call or file staging.
             DevelopmentSandboxRunner.InspectSnapshot(source, contract.ProjectFile);
-            // Reject overlap before we create agent-job-* or spend any model call.
-            // The runner repeats this same guard for defense in depth.
+
+            phase = "storage";
             DevelopmentIsolatedRunner.ValidateStoragePaths(repo, source, resultsDirectory);
 
+            phase = "api-key";
             string? key = live ? RuntimeSettings.GetApiKey() : null;
             if (live && string.IsNullOrWhiteSpace(key))
             {
-                Console.Error.WriteLine("Agent live mode requires a configured API key; no job started.");
+                DevelopmentLogEvents.JobFailed(logger, jobId, phase, "API_KEY_MISSING",
+                    "none", "Host-API-Schluessel konfigurieren oder --live weglassen; kein Job gestartet.");
                 return 2;
             }
 
-            string runRoot = Path.Combine(resultsDirectory,
-                "agent-job-" + Guid.NewGuid().ToString("N"));
+            if (logging.Settings.LogSuccessfulSteps)
+                DevelopmentLogEvents.PreflightAccepted(logger, jobId, contract.TaskId,
+                    contract.ProjectFile, contract.MaxAttempts);
+            phase = "results-allocation";
+            string runRoot = Path.Combine(resultsDirectory, "agent-job-" + jobId);
             Directory.CreateDirectory(runRoot);
 
+            phase = "generator";
             using Microsoft.Extensions.AI.IChatClient? client =
                 live ? DevelopmentAiGenerator.CreateClient(key!) : null;
             IDevelopmentCandidateGenerator generator = live
                 ? new DevelopmentAiGenerator(client!, requestedModel ?? "gpt-5.4-mini")
                 : new DevelopmentScriptedGenerator();
             IDevelopmentIsolatedRunner sandbox =
-                new DevelopmentIsolatedRunner(repo, source, runRoot);
+                new DevelopmentIsolatedRunner(repo, source, runRoot, logger, jobId,
+                    logging.Settings.LogSuccessfulSteps);
 
+            phase = "host";
             HostApplicationBuilder builder = Host.CreateApplicationBuilder();
-            builder.Services.AddAkka("hami-developer", _ => { });
+            // The owned job logger emits the lifecycle; suppress default host
+            // informational startup/shutdown chatter on the second pipeline.
+            builder.Logging.ClearProviders();
+            builder.Services.AddAkka("hami-developer", config =>
+                config.ConfigureLoggers(setup =>
+                    setup.LogLevel = Akka.Event.LogLevel.WarningLevel));
             using IHost host = builder.Build();
             await host.StartAsync();
             try
             {
+                phase = "job";
                 ActorSystem system = host.Services.GetRequiredService<ActorSystem>();
-                Console.WriteLine("HaMi Developer: actor-coordinated job started; source writes only in temporary snapshots.");
-                Console.WriteLine($"Contract: {contract.TaskId}; attempts <= {contract.MaxAttempts}; model: {(live ? "live" : "offline-scripted")}");
                 DevelopmentJobReport result = await DevelopmentActorCoordinator.RunAsync(
-                    system, contract, generator, sandbox);
+                    system, contract, generator, sandbox, logger: logger, jobId: jobId,
+                    logSuccessfulSteps: logging.Settings.LogSuccessfulSteps,
+                    logDecisionSummaries: logging.Settings.LogDecisionSummaries);
 
+                phase = "report";
                 string jsonPath = Path.Combine(runRoot, "agent-report.json");
                 await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(result,
                     new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true }));
-                Console.WriteLine($"Agent status: {result.Status}; model calls: {result.ModelCalls}; attempts: {result.Attempts.Length}");
-                foreach (DevelopmentJobAttempt attempt in result.Attempts)
-                    Console.WriteLine($"  #{attempt.Number}: {attempt.Status}, build={attempt.BuildExitCode}, run={attempt.RunExitCode}, cleanup={attempt.CleanupSucceeded}");
-                Console.WriteLine("Agent report: " + jsonPath);
+                if (logging.Settings.LogSuccessfulSteps)
+                    DevelopmentLogEvents.JobFinished(logger, jobId, result.Status,
+                        result.ModelCalls, result.Attempts.Length, jsonPath);
                 return result.Status == "passed" ? 0 : 1;
             }
             finally
             {
+                phase = "host-shutdown";
                 await host.StopAsync();
             }
         }
-        catch (Exception ex) when (ex is IOException or ArgumentException
-            or InvalidOperationException or UnauthorizedAccessException or JsonException
-            or TimeoutException)
+        catch (Exception ex)
         {
-            // Do not log raw untrusted model/sandbox text in infrastructure errors.
-            Console.Error.WriteLine($"Agent job failed ({ex.GetType().Name}). Check the bounded job report.");
+            // Never emit raw model/sandbox data or untrusted exception messages.
+            string reason = phase switch
+            {
+                "logging" => "LOG_CONFIGURATION_INVALID",
+                "contract" => "CONTRACT_REJECTED",
+                "results" => "RESULTS_PATH_NOT_ABSOLUTE",
+                "source-override" => "SOURCE_OVERRIDE_NOT_ALLOWED",
+                "storage" when ex is InvalidOperationException &&
+                    ex.Message == "Agent results must be separate from the repository and its fixture."
+                    => "RESULTS_PATH_OVERLAPS_REPOSITORY",
+                "storage" when ex is InvalidOperationException &&
+                    ex.Message == "Agent results path may not traverse directory reparse points."
+                    => "RESULTS_PATH_REPARSE_POINT",
+                "storage" => "RESULTS_PATH_REJECTED",
+                "snapshot" => "SNAPSHOT_REJECTED",
+                "api-key" => "API_KEY_INVALID",
+                "results-allocation" => "RESULTS_DIRECTORY_UNWRITABLE",
+                "generator" => "GENERATOR_INITIALIZATION_FAILED",
+                "host" => "HOST_START_FAILED",
+                "host-shutdown" => "HOST_STOP_FAILED",
+                "report" => "REPORT_WRITE_FAILED",
+                _ => "JOB_EXECUTION_FAILED"
+            };
+            string action = phase switch
+            {
+                "logging" => "config/logging.json und den externen Logpfad pruefen.",
+                "contract" => "Den versionierten, geprueften Agent-Auftrag pruefen.",
+                "results" or "storage" => "--results-dir absolut, ausserhalb des Repository und ohne Junctions/Symlinks angeben.",
+                "source-override" => "--source entfernen; der gepruefte Agent-Contract bestimmt die einzige Fixture.",
+                "snapshot" => "Die freigegebene Demo-Fixture und erlaubte Dateien kontrollieren.",
+                "api-key" => "Host-API-Schluessel pruefen.",
+                "results-allocation" or "report" => "Dateiberechtigungen und freien Speicher im Ergebnisverzeichnis pruefen.",
+                "generator" => "Modell-/Provider-Konfiguration pruefen.",
+                "host" => "Akka.Hosting-Konfiguration und DI pruefen.",
+                "host-shutdown" => "Akka-CoordinatedShutdown und vorhandene Job-Reports pruefen.",
+                _ => "Status der MicroVM und vorhandene Teilberichte pruefen; kein automatischer Neustart."
+            };
+            if (logger is not null)
+                DevelopmentLogEvents.JobFailed(logger, jobId, phase, reason,
+                    ex.GetType().Name, action);
+            else
+                Console.Error.WriteLine(
+                    $"Agent job {jobId} failed before logging (stage={phase}, reason={reason}, exception={ex.GetType().Name}). {action}");
             return 1;
+        }
+        finally
+        {
+            logging?.Dispose();
         }
     }
 
@@ -111,7 +188,9 @@ internal static class DevelopmentAgentCommand
         // Use the same Akka.Hosting composition root in CI as in the real
         // agent command; this catches DI/host startup errors without Docker.
         HostApplicationBuilder builder = Host.CreateApplicationBuilder();
-        builder.Services.AddAkka("hami-development-offline-tests", _ => { });
+        builder.Services.AddAkka("hami-development-offline-tests", config =>
+            config.ConfigureLoggers(setup =>
+                setup.LogLevel = Akka.Event.LogLevel.WarningLevel));
         using IHost host = builder.Build();
         await host.StartAsync();
         try
@@ -176,6 +255,8 @@ internal static class DevelopmentAgentCommand
                 throw new InvalidOperationException(
                     "Coordinator did not await cleanup or incorrectly restarted cancelled job.");
 
+            await VerifyNarrativeLoggingAsync(system, contract, repo);
+
             Console.WriteLine("Akka development offline self-test passed: fail/correct, "
                 + "retry budget, timeout, preflight, restore, build-exec, cleanup "
                 + "and deadline-awaited sandbox cleanup.");
@@ -183,6 +264,75 @@ internal static class DevelopmentAgentCommand
         finally
         {
             await host.StopAsync();
+        }
+    }
+
+    private static async Task VerifyNarrativeLoggingAsync(
+        ActorSystem system, DevelopmentAgentContract contract, string repo)
+    {
+        string id = "offline-selftest-development-001";
+        string temp = Path.Combine(Path.GetTempPath(), "hami-development-log-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temp);
+        try
+        {
+            AgentLoggingSettings settings = AgentLoggingSettings.Load(repo);
+            using (var session = AgentLoggingSession.CreateForTest(settings, temp))
+            {
+                Microsoft.Extensions.Logging.ILogger logger =
+                    session.CreateLogger("HaMi.Agentic.Cli.Features.Development");
+                DevelopmentLogEvents.JobRequested(logger, id, repo, temp, "offline-scripted",
+                    "scripted", DevelopmentAgentContract.TrustedPath);
+                DevelopmentLogEvents.PreflightAccepted(logger, id, contract.TaskId,
+                    contract.ProjectFile, contract.MaxAttempts);
+                DevelopmentJobReport report = await DevelopmentActorCoordinator.RunAsync(
+                    system, contract, new DevelopmentScriptedGenerator(),
+                    new SimulatedIsolatedRunner(), logger: logger, jobId: id);
+                if (report.Status != "passed" || report.JobId != id || report.Attempts.Length != 2)
+                    throw new InvalidOperationException("Development log test actor report differs.");
+                DevelopmentLogEvents.JobFinished(logger, id, report.Status,
+                    report.ModelCalls, report.Attempts.Length, "selftest-report.json");
+            }
+
+            string folder = Path.Combine(temp, settings.RelativeDirectory);
+            string[] logFiles = Directory.GetFiles(folder, "agent-*.clef");
+            if (logFiles.Length == 0)
+                throw new InvalidOperationException("Development narrative file log is missing.");
+
+            string[] readableFiles = Directory.GetFiles(folder, "agent-*.log");
+            if (readableFiles.Length == 0)
+                throw new InvalidOperationException("Readable development narrative log is missing.");
+            string narrative = string.Join("\n", readableFiles.SelectMany(File.ReadAllLines));
+            int begin = narrative.IndexOf("JobRequested", StringComparison.Ordinal);
+            int failure = narrative.IndexOf("AttemptFailed", StringComparison.Ordinal);
+            int retry = narrative.IndexOf("RETRY_APPROVED", StringComparison.Ordinal);
+            int finished = narrative.IndexOf("JobFinished", StringComparison.Ordinal);
+            if (begin < 0 || failure <= begin || retry <= failure || finished <= retry)
+                throw new InvalidOperationException("Readable narrative events are out of order.");
+
+            string combined = string.Join("\n", logFiles.SelectMany(File.ReadAllLines));
+            foreach (string eventLine in combined.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                using JsonDocument document = JsonDocument.Parse(eventLine);
+                if (!document.RootElement.TryGetProperty("JobId", out JsonElement jobProperty)
+                    || jobProperty.GetString() != id)
+                    throw new InvalidOperationException("Uncorrelated development log event.");
+            }
+
+            foreach (string expected in new[] { "JobRequested", "PreflightAccepted",
+                "GenerationStarted", "GenerationFinished", "SandboxStarted", "SandboxFinished",
+                "AttemptFailed", "DecisionRecorded", "JobFinished", "CS0103" })
+                if (!combined.Contains(expected, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        "Development log is missing the expected event: " + expected);
+            if (combined.Contains("UnknownIdentifier", StringComparison.Ordinal)
+                || narrative.Contains("UnknownIdentifier", StringComparison.Ordinal)
+                || combined.Contains("OPENAI_API_KEY", StringComparison.Ordinal)
+                || narrative.Contains("OPENAI_API_KEY", StringComparison.Ordinal))
+                throw new InvalidOperationException("Unsafe raw data entered development logs.");
+        }
+        finally
+        {
+            Directory.Delete(temp, recursive: true);
         }
     }
 

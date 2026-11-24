@@ -9,15 +9,12 @@ namespace HaMi.Agentic.Cli.Runtime;
 /// <summary>
 /// System.CommandLine is the single parsing/dispatch boundary for named
 /// commands. Existing feature use cases remain intact while migrated.
-/// The historical option-first replay entrypoint is deliberately preserved.
+/// Replay is available only through the explicit 'replay' subcommand.
 /// </summary>
 internal static class CommandLineRouter
 {
     public static Task<int> RunAsync(string[] args)
     {
-        if (args.Length == 0 || args[0].StartsWith("--", StringComparison.Ordinal))
-            return ReplayCommand.RunAsync(args);
-
         RootCommand root = CreateRoot(args);
         return root.Parse(args).InvokeAsync();
     }
@@ -94,7 +91,9 @@ internal static class CommandLineRouter
             || valid.Parse(["coding", "--repo", ".", "--unattended", "--task", "clamp-kata"]).Errors.Count != 0
             || valid.Parse(["workflow", "--repo", ".", "--manifest", "workflows/mvp02.json", "--validate"]).Errors.Count != 0
             || valid.Parse(["development", "--repo", ".", "--model"]).Errors.Count == 0
-            || valid.Parse(["development", "--unknown-option"]).Errors.Count == 0)
-            throw new InvalidOperationException("CLI parser accepted invalid options or rejected legacy flags.");
+            || valid.Parse(["development", "--unknown-option"]).Errors.Count == 0
+            || valid.Parse(["--check", "."]).Errors.Count == 0
+            || valid.Parse(["--unattended"]).Errors.Count == 0)
+            throw new InvalidOperationException("CLI parser accepted implicit legacy Replay dispatch or rejected a named command.");
     }
 }

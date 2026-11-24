@@ -1,11 +1,11 @@
 # Architecture decision 0001: Typed CLI and actor-driven isolated coding
 
-**Status:** Implemented for the limited Issue #36 vertical slice, 23 November 2026.
+**Status:** Implemented for Issue #36; the option-first compatibility clause below was superseded by [ADR-0002](0002-development-logging-and-explicit-cli.md), 23 November 2026.
 **Prerequisite:** Issue #33, merged PR #35, real HaMi11 Docker Sandbox acceptance.
 
 ## Decision
 
-1. **System.CommandLine 3.0.0** becomes the parsing, command discovery and dispatch boundary. Historical option-first Replay invocations remain compatible. Legacy handlers stay operational while command parsing is migrated incrementally.
+1. **System.CommandLine 3.0.0** becomes the parsing, command discovery and dispatch boundary. Historical option-first Replay invocations were initially compatible; from Issue #38 onward Replay requires the explicit `replay` subcommand. Legacy handlers stay operational while command parsing is migrated incrementally.
 2. A **versioned human-reviewed contract** defines the first task. It permits producing exactly one source file (Program.cs) for a fixed .NET 11 console project and a maximum of two model attempts. This cannot grant host shell, GitHub write, extra file or network privileges.
 3. **Akka.Hosting 1.5.74** manages an in-process ActorSystem and one coordinator actor for each coding job. The actor owns attempt numbering, state and terminal decisions. It does not compile code itself. Remote, cluster, distributed scheduling, durable persistence and automatic actor restart are excluded.
 4. **IDevelopmentCandidateGenerator** isolates model access. The default offline fake intentionally generates a compiler error then repairs it using bounded feedback. The opt-in live generator uses Microsoft.Extensions.AI IChatClient, structured JSON responses, no model tools and store=false.
