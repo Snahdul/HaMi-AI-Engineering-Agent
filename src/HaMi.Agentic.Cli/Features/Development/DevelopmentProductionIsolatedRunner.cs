@@ -47,12 +47,18 @@ internal sealed class DevelopmentProductionIsolatedRunner(
         DevelopmentAgentContract contract, string generatedSource, int attempt,
         CancellationToken cancellationToken)
     {
+        string stage = "PRODUCTION_CONTRACT";
+        try
+        {
         if (!contract.IsProduction || attempt is < 1 or > 2)
             throw new InvalidOperationException("Unreviewed production execution attempt.");
         contract.Validate();
         cancellationToken.ThrowIfCancellationRequested();
+        stage = "PRODUCTION_EXPRESSION";
         string expression = DevelopmentProductionExpression.Parse(generatedSource);
+        stage = "PRODUCTION_PREFLIGHT";
         await PreflightAsync(repo, root);
+        stage = "PRODUCTION_BASELINE";
         string baseCommit = (await DevelopmentWorktreeGuard.GitAsync(
             repo, "rev-parse", "HEAD")).Trim();
         string baselinePath = Path.Combine(repo,
@@ -71,19 +77,23 @@ internal sealed class DevelopmentProductionIsolatedRunner(
             throw new InvalidOperationException("Production attempt worktree already exists.");
 
         cancellationToken.ThrowIfCancellationRequested();
+        stage = "PRODUCTION_WORKTREE_CREATE";
         await DevelopmentWorktreeGuard.GitAsync(
             repo, "worktree", "add", "--detach", worktree, baseCommit);
         string target = Path.Combine(worktree,
             DevelopmentProductionVerifier.SourcePath.Replace('/', Path.DirectorySeparatorChar));
+        stage = "PRODUCTION_SOURCE_WRITE";
         RejectReparsePoints(worktree, DevelopmentProductionVerifier.SourcePath);
         cancellationToken.ThrowIfCancellationRequested();
         await File.WriteAllTextAsync(target, generated, cancellationToken);
 
         // M3a is the ONLY authority that verifies the real Git diff and the
         // independent, host-owned tests in a freshly created isolated MicroVM.
+        stage = "PRODUCTION_SCOPE_AND_MICROVM";
         int verificationExit = await DevelopmentProductionVerifier.RunAsync(
             repo, worktree, DevelopmentAgentContract.ProductionScopePath, evaluations);
 
+        stage = "PRODUCTION_EVIDENCE";
         string[] directories = Directory.GetDirectories(evaluations, "production-check-*");
         if (directories.Length != 1)
             throw new InvalidOperationException("Expected one production verification report.");
@@ -124,6 +134,15 @@ internal sealed class DevelopmentProductionIsolatedRunner(
             feedback, evidence.SandboxReport,
             evidence.CheckoutUnchanged ? microVm.Error : "CANDIDATE_CHANGED",
             evidence.OutputAccepted, worktree, evidence.DiffPath);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException
+            && ex is not DevelopmentProductionStageException)
+        {
+            // Only trusted host-defined stage codes cross the Akka logging
+            // boundary. Never reveal model response, Git stderr, guest logs
+            // or arbitrary exception messages.
+            throw new DevelopmentProductionStageException(stage, ex);
+        }
     }
 
     internal static void RejectReparsePoints(string root, string relative)
@@ -137,4 +156,11 @@ internal sealed class DevelopmentProductionIsolatedRunner(
                 throw new InvalidOperationException("Production source path contains a reparse point.");
         }
     }
+}
+
+internal sealed class DevelopmentProductionStageException(string stageCode, Exception inner)
+    : InvalidOperationException("A reviewed production stage failed.", inner)
+{
+    // Source is a fixed, host-owned stage name, never model or Git data.
+    internal string StageCode { get; } = stageCode;
 }
