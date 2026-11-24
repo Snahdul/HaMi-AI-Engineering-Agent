@@ -167,7 +167,10 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                     self.Tell(new Executed(current, t.Result));
                 else
                 {
-                    Exception? failure = t.Exception?.GetBaseException();
+                    // Preserve the trusted production-stage wrapper: GetBaseException()
+                    // would discard it and lose its host-defined stage code.
+                    Exception? failure = t.Exception is { InnerExceptions.Count: 1 } aggregate
+                        ? aggregate.InnerExceptions[0] : t.Exception;
                     self.Tell(new Faulted(current, "sandbox",
                         t.IsCanceled ? "OperationCanceled" : failure?.GetType().Name ?? "Unknown",
                         (failure as DevelopmentProductionStageException)?.StageCode));
