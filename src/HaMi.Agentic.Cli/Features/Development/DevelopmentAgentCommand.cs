@@ -19,7 +19,8 @@ internal static class DevelopmentAgentCommand
     public static async Task<int> RunAsync(
         string repo, string? contractPath, string? sourceDirectory,
         string resultsDirectory, bool live, string? requestedModel,
-        int? issueNumber = null, bool publishIssue = false, bool allowFollowUps = false)
+        int? issueNumber = null, bool publishIssue = false, bool allowFollowUps = false,
+        bool publishDraft = false, string? publicationBase = null)
     {
         string jobId = Guid.NewGuid().ToString("N");
         string phase = "logging";
@@ -27,6 +28,7 @@ internal static class DevelopmentAgentCommand
         Microsoft.Extensions.Logging.ILogger? logger = null;
         GitHubIssueGateway? issues = null;
         DevelopmentIssueWorkflow? journal = null;
+        DevelopmentPublicationGateway? publisher = null;
         try
         {
             // One ILogger event is sent to both console and the rolling .clef file.
@@ -92,6 +94,18 @@ internal static class DevelopmentAgentCommand
                     journal = new DevelopmentIssueWorkflow(issues, sourceIssue, jobId, allowFollowUps, live);
             }
 
+            phase = "publication-authorization";
+            if (publishDraft != (publicationBase is not null))
+                throw new InvalidOperationException("Publication authorization incomplete.");
+            if (publishDraft)
+            {
+                if (!contract.IsProduction || issueNumber is null)
+                    throw new InvalidOperationException("Production issue required for publication.");
+                await DevelopmentPublicationPolicy.LoadAsync(repo, resultsDirectory, true,
+                    issueNumber.Value, publicationBase!);
+                publisher = new DevelopmentPublicationGateway();
+            }
+
             if (logging.Settings.LogSuccessfulSteps)
                 DevelopmentLogEvents.PreflightAccepted(logger, jobId, contract.TaskId,
                     contract.ProjectFile, contract.MaxAttempts);
@@ -145,6 +159,16 @@ internal static class DevelopmentAgentCommand
                 if (logging.Settings.LogSuccessfulSteps)
                     DevelopmentLogEvents.JobFinished(logger, jobId, result.Status,
                         result.ModelCalls, result.Attempts.Length, jsonPath);
+                if (publisher is not null && result.Status == "passed")
+                {
+                    phase = "draft-publication";
+                    int pull = await publisher.PublishAsync(repo, resultsDirectory, result,
+                        issueNumber!.Value, publicationBase!, true, CancellationToken.None);
+                    result = result with { DraftPullRequestNumber = pull };
+                    await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(result,
+                        new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true }));
+                    Console.WriteLine("Draft pull request: #" + pull);
+                }
                 if (journal is not null)
                 {
                     phase = "issue-publish-result";
@@ -156,7 +180,6 @@ internal static class DevelopmentAgentCommand
             }
             finally
             {
-                phase = "host-shutdown";
                 await host.StopAsync();
             }
         }
@@ -180,6 +203,8 @@ internal static class DevelopmentAgentCommand
                 "api-key" => "API_KEY_INVALID",
                 "issue-authorization" => "ISSUE_AUTHORIZATION_REJECTED",
                 "issue-fetch" => "ISSUE_NOT_APPROVED_OR_UNAVAILABLE",
+                "publication-authorization" => "DRAFT_AUTHORIZATION_REJECTED",
+                "draft-publication" => "DRAFT_PUBLICATION_FAILED",
                 "issue-publish-start" or "issue-publish-result" => "ISSUE_PUBLICATION_FAILED",
                 "results-allocation" => "RESULTS_DIRECTORY_UNWRITABLE",
                 "generator" => "GENERATOR_INITIALIZATION_FAILED",
@@ -214,6 +239,7 @@ internal static class DevelopmentAgentCommand
         }
         finally
         {
+            publisher?.Dispose();
             issues?.Dispose();
             logging?.Dispose();
         }
