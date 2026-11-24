@@ -104,8 +104,10 @@ internal sealed class DevelopmentIssueWorkflow(
         // publish records to the trusted HaMi engineering repository.
         var start = new ProcessStartInfo("git")
         {
-            UseShellExecute = false, RedirectStandardOutput = true,
-            RedirectStandardError = true, CreateNoWindow = true
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
         };
         foreach (string part in new[] { "-C", repo, "remote", "get-url", "origin" })
             start.ArgumentList.Add(part);
