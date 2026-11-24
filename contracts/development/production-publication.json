@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "repository": "Snahdul/HaMi-AI-Engineering-Agent",
+  "taskId": "production-retry-budget",
+  "targetBranch": "main",
+  "sourcePath": "src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs"
+}

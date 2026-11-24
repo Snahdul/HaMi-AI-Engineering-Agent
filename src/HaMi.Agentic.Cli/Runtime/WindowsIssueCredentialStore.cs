@@ -38,15 +38,21 @@ internal static class WindowsIssueCredentialStore
     [DllImport("advapi32.dll", EntryPoint = "CredFree")]
     private static extern void CredFree(IntPtr credential);
 
-    public static string? Read()
+    public static string? Read() => ReadDedicated(Target);
+
+    internal const string PublicationTarget = "HaMi-AI-Engineering-Agent/GitHub-Publication/Snahdul";
+
+    internal static string? ReadPublication() => ReadDedicated(PublicationTarget);
+
+    private static string? ReadDedicated(string target)
     {
         if (!OperatingSystem.IsWindows()) return null;
-        if (!CredRead(Target, GenericCredential, 0, out IntPtr address))
+        if (!CredRead(target, GenericCredential, 0, out IntPtr address))
         {
             int error = Marshal.GetLastWin32Error();
             if (error == NotFound) return null;
             throw new InvalidOperationException(
-                "Windows Credential Manager failed to read the dedicated GitHub Issues token ("
+                "Windows Credential Manager failed to read the dedicated GitHub token ("
                 + error + ").");
         }
 
@@ -57,7 +63,7 @@ internal static class WindowsIssueCredentialStore
                 || credential.CredentialBlob == IntPtr.Zero
                 || credential.CredentialBlobSize is < 20 or > 2048
                 || credential.CredentialBlobSize % 2 != 0)
-                throw new InvalidOperationException("Stored GitHub Issues credential has invalid metadata.");
+                throw new InvalidOperationException("Stored GitHub credential has invalid metadata.");
             return Marshal.PtrToStringUni(credential.CredentialBlob,
                 checked((int)credential.CredentialBlobSize / 2));
         }

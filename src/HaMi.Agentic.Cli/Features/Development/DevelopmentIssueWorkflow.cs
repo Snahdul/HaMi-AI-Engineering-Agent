@@ -110,7 +110,7 @@ internal sealed class DevelopmentIssueWorkflow(
             CreateNoWindow = true
         };
         // git remote get-url never needs credentials; do not inherit them.
-        foreach (string name in new[] { "HAMI_AGENT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "OPENAI_API_KEY" })
+        foreach (string name in new[] { "HAMI_AGENT_GITHUB_TOKEN", DevelopmentPublicationGateway.TokenVariable, "GITHUB_TOKEN", "GH_TOKEN", "OPENAI_API_KEY" })
             start.Environment.Remove(name);
         foreach (string part in new[] { "-C", repo, "remote", "get-url", "origin" })
             start.ArgumentList.Add(part);
@@ -199,6 +199,8 @@ internal sealed class DevelopmentIssueWorkflow(
         if (status == "exhausted")
             body.AppendLine("- Entscheidung: Retry-Budget ausgeschöpft; keine automatische Budgeterhöhung.");
         body.AppendLine("- Technischer Nachweis: lokaler agent-report.json, Serilog und Sandbox-Reports");
+        if (report.DraftPullRequestNumber is > 0)
+            body.AppendLine("- Draft-PR: #" + report.DraftPullRequestNumber.Value);
         body.AppendLine("- Freigabe: menschliches Review erforderlich; kein automatischer Merge");
         body.AppendLine();
         body.AppendLine("_Automatisch generierte Statuszusammenfassung; keine Rohlogs, Prompts, Pfade oder Zugangsdaten._");

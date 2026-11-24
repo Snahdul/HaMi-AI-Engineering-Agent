@@ -386,6 +386,7 @@ internal static class DevelopmentSandboxPoC
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        DevelopmentChildEnvironment.RestrictSandboxProcess(start);
         start.ArgumentList.Add("--no-input");
         foreach (string arg in arguments) start.ArgumentList.Add(arg);
 

@@ -22,7 +22,7 @@ internal static class DevelopmentCommand
             Console.WriteLine("       development --repo <checkout> --agent-self-test (offline, Akka + CLI parser)");
             Console.WriteLine("       development --repo <checkout> --agent-run --results-dir <absolute-dir> [--contract contracts/development/agent-console-retry.json] [--live --model <model>] [--issue <number> [--publish-issue [--allow-followups]]]");
             Console.WriteLine("Issue opt-in: --issue <number> [--publish-issue [--allow-followups]]. Requires approved owner-authored Issue and matching contract marker.");
-            Console.WriteLine("No GitHub writes without explicit --publish-issue; no issue permissions in sandbox/model. Host token: HAMI_AGENT_GITHUB_TOKEN.");
+            Console.WriteLine("Issue writes require --publish-issue; Draft PR writes require --publish-draft --publication-base <sha> and the production contract. No credentials in sandbox/model.");
             Console.WriteLine("Agent run: reviewed console, pair or production expression task; independent ephemeral Docker MicroVM per eligible attempt.");
             Console.WriteLine("Contract checks are read-only. sandbox-poc runs the trusted RetryBudget fixture; sandbox-run executes a bounded project snapshot only in a fresh local MicroVM.");
             return 0;
@@ -41,6 +41,8 @@ internal static class DevelopmentCommand
             bool live = false;
             int? issueNumber = null;
             bool publishIssue = false;
+            bool publishDraft = false;
+            string? publicationBase = null;
             bool allowFollowUps = false;
             string? action = null;
             for (int i = 0; i < args.Length; i++)
@@ -64,6 +66,10 @@ internal static class DevelopmentCommand
                         if (live) throw new ArgumentException("Duplicate --live.");
                         live = true;
                         break;
+                    case "--publish-draft":
+                        if (publishDraft) throw new ArgumentException("Duplicate --publish-draft.");
+                        publishDraft = true;
+                        break;
                     case "--publish-issue":
                         if (publishIssue) throw new ArgumentException("Duplicate --publish-issue.");
                         publishIssue = true;
@@ -80,6 +86,7 @@ internal static class DevelopmentCommand
                     case "--mode":
                     case "--contract":
                     case "--worktree":
+                    case "--publication-base":
                     case "--issue":
                         string option = args[i];
                         if (i + 1 == args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
@@ -119,6 +126,10 @@ internal static class DevelopmentCommand
                                 if (worktree is not null) throw new ArgumentException("Duplicate --worktree.");
                                 worktree = value;
                                 break;
+                            case "--publication-base":
+                                if (publicationBase is not null) throw new ArgumentException("Duplicate --publication-base.");
+                                publicationBase = value;
+                                break;
                             case "--issue":
                                 if (issueNumber is not null || !int.TryParse(value, out int parsed) || parsed < 1)
                                     throw new ArgumentException("Issue number must be a unique positive integer.");
@@ -139,6 +150,10 @@ internal static class DevelopmentCommand
             if (publishIssue && issueNumber is null || allowFollowUps && !publishIssue)
                 throw new ArgumentException("--publish-issue requires --issue; --allow-followups requires --publish-issue.");
 
+            if (publishDraft != (publicationBase is not null) || (publishDraft &&
+                (action != "--agent-run" || issueNumber is null || contractPath != DevelopmentAgentContract.ProductionPath)))
+                throw new ArgumentException("Draft publication requires --agent-run, production contract, --issue, --publish-draft and --publication-base.");
+
             if (action == "--agent-self-test")
             {
                 if (source is not null || project is not null || mode is not null
@@ -157,7 +172,7 @@ internal static class DevelopmentCommand
                     throw new ArgumentException("Agent run requires --results-dir and the reviewed fixture; --source is not authorized; --model only with --live.");
                 return await DevelopmentAgentCommand.RunAsync(repo,
                     contractPath, source, resultsDir, live, model,
-                    issueNumber, publishIssue, allowFollowUps);
+                    issueNumber, publishIssue, allowFollowUps, publishDraft, publicationBase);
             }
 
             if (model is not null || live)
