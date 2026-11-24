@@ -118,12 +118,15 @@ internal sealed record DevelopmentAgentContract(
             "Unreviewed stdout expectation accepted.");
         ExpectInvalid(test with { ExpectedStdout = "" },
             "Empty stdout expectation accepted.");
-        var scope = DevelopmentContract.Parse(
-            """{"schemaVersion":1,"taskId":"sandbox-pair","description":"two files",
-                "targetFramework":"net11.0","allowedWritePaths":[
-                "src/HaMi.Agentic.Cli/Features/Development/PairCalculator.cs",
-                "src/HaMi.Agentic.Cli/Features/Development/PairFormatter.cs"],
-                "acceptanceCriteria":["Validated by trusted tests."]}""");
+        var scope = DevelopmentContract.Parse(JsonSerializer.Serialize(new
+        {
+            schemaVersion = 1,
+            taskId = "sandbox-pair",
+            description = "two files",
+            targetFramework = "net11.0",
+            allowedWritePaths = new[] { PairFirst, PairSecond },
+            acceptanceCriteria = new[] { "Validated by trusted tests." }
+        }));
         var pair = test with
         {
             TaskId = "sandbox-pair", SourceFile = PairFirst,
