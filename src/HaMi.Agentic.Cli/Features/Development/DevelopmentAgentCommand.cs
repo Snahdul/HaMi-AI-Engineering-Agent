@@ -28,6 +28,10 @@ internal static class DevelopmentAgentCommand
         Microsoft.Extensions.Logging.ILogger? logger = null;
         GitHubIssueGateway? issues = null;
         DevelopmentIssueWorkflow? journal = null;
+        ApprovedDevelopmentIssue? approvedIssue = null;
+        DevelopmentJobStateStore.Lease? ownership = null;
+        DevelopmentJobIdentity? durableIdentity = null;
+        bool legacyComplete = false;
         try
         {
             // One ILogger event is sent to both console and the rolling .clef file.
@@ -86,6 +90,7 @@ internal static class DevelopmentAgentCommand
                 using JsonDocument issueJson = await issues.GetIssueAsync(issueNumber.Value, CancellationToken.None);
                 ApprovedDevelopmentIssue sourceIssue = ApprovedDevelopmentIssue.Parse(
                     issueJson.RootElement, contract);
+                approvedIssue = sourceIssue;
                 contract = sourceIssue.Bind(contract);
                 if (logging.Settings.LogSuccessfulSteps)
                     DevelopmentLogEvents.IssueBound(logger, jobId, sourceIssue.Number);
@@ -104,11 +109,40 @@ internal static class DevelopmentAgentCommand
                     issueNumber.Value, publicationBase!);
             }
 
+            // Every issue-bound path uses the same private repository/issue
+            // lease, independent of checkout, result path or publication mode.
+            // V1 recovery is deliberately limited to draft-only production jobs.
+            phase = "ownership";
+            if (approvedIssue is not null)
+            {
+                var store = DevelopmentJobStateRoot.Open(repo, resultsDirectory);
+                ownership = store.Acquire(approvedIssue.Number);
+                if (ownership.Current is not null)
+                    throw new InvalidOperationException("Existing durable issue claim requires reconciliation.");
+                if (publishDraft && !publishIssue && !allowFollowUps)
+                {
+                    durableIdentity = await DevelopmentJobIdentityFactory.CreateAsync(
+                        repo, resultsDirectory, jobId, issueNumber!.Value, approvedIssue,
+                        contract, publicationBase!, live);
+                    ownership.Claim(DevelopmentJobState.Create(durableIdentity));
+                    ownership.Commit(ownership.Current!.Start());
+                }
+                else
+                {
+                    ownership.ClaimLegacy(jobId);
+                }
+            }
+
             if (logging.Settings.LogSuccessfulSteps)
                 DevelopmentLogEvents.PreflightAccepted(logger, jobId, contract.TaskId,
                     contract.ProjectFile, contract.MaxAttempts);
             phase = "results-allocation";
-            string runRoot = Path.Combine(resultsDirectory, "agent-job-" + jobId);
+            string runRoot = durableIdentity is null
+                ? Path.Combine(resultsDirectory, "agent-job-" + jobId)
+                : DevelopmentJobEvidence.JobRoot(durableIdentity);
+            if (Directory.Exists(runRoot) || File.Exists(runRoot)
+                || new DirectoryInfo(runRoot).LinkTarget is not null)
+                throw new InvalidOperationException("Agent job directory already exists.");
             Directory.CreateDirectory(runRoot);
             if (journal is not null)
             {
@@ -150,22 +184,57 @@ internal static class DevelopmentAgentCommand
                 if (issueNumber.HasValue)
                     result = result with { IssueNumber = issueNumber.Value };
 
+                // Persist the verified checkpoint before any publication,
+                // independently of the mutable, human-readable report.
+                if (durableIdentity is not null)
+                {
+                    phase = "checkpoint";
+                    if (result.Status == "passed")
+                    {
+                        string evidenceHash = await DevelopmentJobEvidence.SealAsync(repo, durableIdentity, result);
+                        ownership!.Commit(ownership.Current!.Verify(
+                            result.ModelCalls, result.Attempts.Length, evidenceHash));
+                    }
+                    else
+                    {
+                        // An exhausted corrective budget with confirmed cleanup
+                        // is terminal. Do not infer safe guest cleanup from an
+                        // infrastructure fault, cancellation or missing report.
+                        var state = ownership!.Current!;
+                        ownership.Commit(IsKnownExhaustion(result)
+                            ? state.FinishExecution(DevelopmentJobState.Exhausted,
+                                result.ModelCalls, result.Attempts.Length)
+                            : state.BlockUnknownExecution());
+                    }
+                }
+
                 phase = "report";
                 string jsonPath = Path.Combine(runRoot, "agent-report.json");
-                await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(result,
-                    new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true }));
+                if (durableIdentity is not null)
+                    DevelopmentJobEvidence.WriteProjection(durableIdentity, result);
+                else
+                    await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(result,
+                        new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true }));
                 if (logging.Settings.LogSuccessfulSteps)
                     DevelopmentLogEvents.JobFinished(logger, jobId, result.Status,
                         result.ModelCalls, result.Attempts.Length, jsonPath);
                 if (publishDraft && result.Status == "passed")
                 {
                     phase = "draft-publication";
+                    if (durableIdentity is not null)
+                        ownership!.Commit(ownership.Current!.ReservePublication());
                     using var publisher = new DevelopmentPublicationGateway();
                     int pull = await publisher.PublishAsync(repo, resultsDirectory, result,
                         issueNumber!.Value, publicationBase!, true, CancellationToken.None);
+                    if (durableIdentity is not null)
+                        ownership!.Commit(ownership.Current!.ConfirmPublication(pull));
                     result = result with { DraftPullRequestNumber = pull };
-                    await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(result,
-                        new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true }));
+                    phase = "report";
+                    if (durableIdentity is not null)
+                        DevelopmentJobEvidence.WriteProjection(durableIdentity, result);
+                    else
+                        await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(result,
+                            new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true }));
                     Console.WriteLine("Draft pull request: #" + pull);
                 }
                 if (journal is not null)
@@ -175,11 +244,19 @@ internal static class DevelopmentAgentCommand
                     if (logging.Settings.LogSuccessfulSteps)
                         DevelopmentLogEvents.IssueJournalPublished(logger, jobId, issueNumber!.Value, "completed");
                 }
+                legacyComplete = durableIdentity is null && ownership is not null
+                    && (result.Status == "passed" || IsKnownExhaustion(result))
+                    && result.Attempts.All(a => a.CleanupSucceeded && !a.TimedOut);
                 return result.Status == "passed" ? 0 : 1;
             }
             finally
             {
                 await host.StopAsync();
+                if (legacyComplete)
+                {
+                    phase = "ownership";
+                    ownership!.CompleteLegacy();
+                }
             }
         }
         catch (Exception ex)
@@ -203,6 +280,8 @@ internal static class DevelopmentAgentCommand
                 "issue-authorization" => "ISSUE_AUTHORIZATION_REJECTED",
                 "issue-fetch" => "ISSUE_NOT_APPROVED_OR_UNAVAILABLE",
                 "publication-authorization" => "DRAFT_AUTHORIZATION_REJECTED",
+                "ownership" => "ISSUE_OWNERSHIP_REJECTED",
+                "checkpoint" => "RECOVERY_CHECKPOINT_FAILED",
                 "draft-publication" => "DRAFT_PUBLICATION_FAILED",
                 "issue-publish-start" or "issue-publish-result" => "ISSUE_PUBLICATION_FAILED",
                 "results-allocation" => "RESULTS_DIRECTORY_UNWRITABLE",
@@ -223,6 +302,7 @@ internal static class DevelopmentAgentCommand
                 "issue-authorization" or "issue-fetch" => "GitHub-Origin, freigegebenes Issue, Contract-Marker und Label workflow:in-progress pruefen.",
                 "issue-publish-start" or "issue-publish-result" => "GitHub Issues-Berechtigung und Netzwerk pruefen; Job/Issue-Kommentar anhand der Job-ID abgleichen, keinen Job blind neu starten.",
                 "results-allocation" or "report" => "Dateiberechtigungen und freien Speicher im Ergebnisverzeichnis pruefen.",
+                "ownership" or "checkpoint" => "Persistente Job-Claim und Originalnachweise pruefen; keinen neuen Auftrag blind starten.",
                 "generator" => "Modell-/Provider-Konfiguration pruefen.",
                 "host" => "Akka.Hosting-Konfiguration und DI pruefen.",
                 "host-shutdown" => "Akka-CoordinatedShutdown und vorhandene Job-Reports pruefen.",
@@ -238,10 +318,16 @@ internal static class DevelopmentAgentCommand
         }
         finally
         {
+            ownership?.Dispose();
             issues?.Dispose();
             logging?.Dispose();
         }
     }
+
+    internal static bool IsKnownExhaustion(DevelopmentJobReport result) =>
+        result.Status == "exhausted" && result.ModelCalls == 2 && result.Attempts.Length == 2
+        && result.Attempts.All(a => a.CleanupSucceeded && !a.TimedOut
+            && a.Status is ("build-failed" or "run-failed" or "acceptance-failed" or "source-rejected"));
 
     internal static async Task SelfTestAsync(string repo)
     {
