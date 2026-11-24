@@ -12,6 +12,8 @@ internal static class DevelopmentOutputAcceptance
         + "was wrong. Print only HaMi isolated correction passed followed by one "
         + "normal line terminator. Do not print any extra text.";
 
+    internal const string ReviewedProductionStdout = "RetryBudget: 268 tests, 0 failures.";
+
     internal static string ForExpected(string expected) => expected switch
     {
         DevelopmentAgentContract.ReviewedStdout => CorrectionFeedback,
@@ -26,7 +28,8 @@ internal static class DevelopmentOutputAcceptance
     {
         if (actual is null || actual.Length > 16 * 1024
             || expected is not (DevelopmentAgentContract.ReviewedStdout
-                or DevelopmentAgentContract.ReviewedPairStdout))
+                or DevelopmentAgentContract.ReviewedPairStdout
+                or ReviewedProductionStdout))
             return false;
 
         // Normalize Windows vs Linux line endings, but allow at most ONE
