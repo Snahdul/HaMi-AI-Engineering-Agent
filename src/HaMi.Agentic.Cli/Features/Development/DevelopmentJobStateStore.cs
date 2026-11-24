@@ -5,7 +5,8 @@ namespace HaMi.Agentic.Cli.Features.Development;
 // The caller must provide a host-controlled private local root. Do not expose
 // this constructor as a CLI path override. Production root/ACL policy is a
 // separate integration gate; this primitive is also used by offline fixtures.
-internal sealed class DevelopmentJobStateStore(string trustedRoot)
+internal sealed class DevelopmentJobStateStore(string trustedRoot,
+    Action<string, bool>? validatePrivateEntry = null)
 {
     private readonly string root = ValidateRoot(trustedRoot);
 
@@ -14,10 +15,11 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot)
         if (issue <= 0)
             throw new InvalidOperationException("Recovery issue identity rejected.");
         _ = ValidateRoot(root);
+        validatePrivateEntry?.Invoke(root, true);
         // One canonical repository is supported by this vertical slice.
         // The key deliberately excludes checkout, base, task and results path.
         string prefix = Path.Combine(root, "issue-" + issue.ToString(CultureInfo.InvariantCulture));
-        return new Lease(prefix, issue);
+        return new Lease(prefix, issue, validatePrivateEntry);
     }
 
     private static string ValidateRoot(string path)
@@ -57,17 +59,19 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot)
         private readonly string statePath;
         private readonly string nextPath;
         private readonly int issue;
+        private readonly Action<string, bool>? validatePrivateEntry;
         private bool disposed;
 
-        internal Lease(string prefix, int issue)
+        internal Lease(string prefix, int issue, Action<string, bool>? validatePrivateEntry)
         {
             this.issue = issue;
+            this.validatePrivateEntry = validatePrivateEntry;
             statePath = prefix + ".json";
             nextPath = prefix + ".next";
             string lockPath = prefix + ".lock";
-            _ = RegularFileExists(lockPath);
-            handle = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
-                FileShare.None);
+            if (RegularFileExists(lockPath))
+                validatePrivateEntry?.Invoke(lockPath, false);
+            handle = OpenPrivateFile(lockPath, FileMode.OpenOrCreate, FileOptions.None);
             try
             {
                 _ = RegularFileExists(lockPath);
@@ -90,6 +94,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot)
         {
             if (!RegularFileExists(statePath))
                 return null;
+            validatePrivateEntry?.Invoke(statePath, false);
             using var stream = new FileStream(statePath, FileMode.Open, FileAccess.Read, FileShare.Read);
             if (stream.Length is < 1 or > DevelopmentJobState.MaxBytes)
                 throw new InvalidOperationException("Recovery state size rejected.");
@@ -130,16 +135,30 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot)
             // Same-directory temporary file, exclusively created. Flush the
             // contents before rename. This is a process-crash checkpoint,
             // not a claim of guaranteed durability through power loss.
-            using (var stream = new FileStream(nextPath, FileMode.CreateNew, FileAccess.Write,
-                FileShare.None, 4096, FileOptions.WriteThrough))
+            using (var stream = OpenPrivateFile(nextPath, FileMode.CreateNew, FileOptions.WriteThrough))
             {
                 stream.Write(bytes);
                 stream.Flush(flushToDisk: true);
             }
+            validatePrivateEntry?.Invoke(nextPath, false);
             File.Move(nextPath, statePath, overwrite: replace);
             Current = Read();
             if (Current != next)
                 throw new InvalidOperationException("Recovery checkpoint readback failed.");
+        }
+
+        private static FileStream OpenPrivateFile(string path, FileMode mode, FileOptions options)
+        {
+            var settings = new FileStreamOptions
+            {
+                Mode = mode,
+                Access = FileAccess.ReadWrite,
+                Share = FileShare.None,
+                Options = options
+            };
+            if (!OperatingSystem.IsWindows())
+                settings.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            return new FileStream(path, settings);
         }
 
         private void CheckOpen()
