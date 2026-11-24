@@ -1,6 +1,6 @@
 # Architecture decision 0003: Security architecture and credential isolation
 
-**Status:** Architecture decision agreed by the project owner, pending implementation verification and merge in Issue #55 / Draft PR #56, 24 November 2026.
+**Status:** Implemented and accepted in M4 (#55/#56 and real publication pilot #58/#59), 24 November 2026. See [M4 completion](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/55) for evidence and limitations.
 **Related:** [ADR-0001](0001-commandline-akka-isolated-coding.md), [ADR-0002](0002-development-logging-and-explicit-cli.md), [SECURITY.md](../../SECURITY.md), [architecture guidelines](../architecture-guidelines.md), [prompt-injection threat model](../prompt-injection-threat-model.md), security baseline #1, sandbox evaluation #33, issue integration #40 and roadmap #48.
 
 ## Context
@@ -34,7 +34,7 @@ M4 introduces a new privileged capability: publication of an independently verif
 
 A distinct review capability can assess proposed changes against approved ADRs, threat models and security invariants; flag privilege expansion, new trust boundaries, credential flow, unsafe CI, dependency changes and missing negative tests. Start with a read-only, bounded review of a pinned diff and existing architecture decisions, reporting finding ID, severity, affected path, rule/reference, evidence, confidence and recommended test/remediation. A missing or inconclusive review is never a clean bill of health. Findings may request human review; no autonomous merge, policy changes, credentials or authority to override deterministic gates. The human decides whether and when a review is required. Do not introduce a second runtime agent, ActorSystem, persistent monitoring service or new framework in M4. Validate usefulness on actual historical issues before assigning implementation priority.
 
-## M4 acceptance obligations (not yet verified)
+## M4 acceptance obligations (historical review checklist)
 
 - Offline regression: known and unknown secret variables removed, approved environment values retained; validate both Windows and Linux process behavior. Recheck actual sbx execution and effective isolation on the supported host.
 - Reject unauthorized or failed jobs, mismatched issue/base, tampered source/patch/evidence, unconfirmed cleanup; no publication API request before local validation. Test missing/denied credentials with a fake transport and no real secrets.
@@ -44,7 +44,7 @@ A distinct review capability can assess proposed changes against approved ADRs, 
 
 ## Consequences
 
-Existing security documentation remains authoritative for its scope. The new decision establishes testable cross-cutting boundaries; it is not a certification or proof of implementation. The current publisher and allowlist are review candidates until tests and acceptance are recorded. Short-lived GitHub App installation tokens and separate OS-enforced privileged workers may be evaluated when justified by actual deployment requirements.
+Existing security documentation remains authoritative for its scope. The new decision establishes testable cross-cutting boundaries; it is not a certification or proof of implementation. The publisher and allowlist were accepted within the M4 scope; the acceptance does not establish universal isolation or a general recovery capability. [ADR-0004](0004-durable-developer-job-recovery.md) preserves these boundaries for M5a. Short-lived GitHub App installation tokens and separate OS-enforced privileged workers may be evaluated when justified by actual deployment requirements.
 
 ## References
 
