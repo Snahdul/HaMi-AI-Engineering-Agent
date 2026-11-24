@@ -50,90 +50,90 @@ internal sealed class DevelopmentProductionIsolatedRunner(
         string stage = "PRODUCTION_CONTRACT";
         try
         {
-        if (!contract.IsProduction || attempt is < 1 or > 2)
-            throw new InvalidOperationException("Unreviewed production execution attempt.");
-        contract.Validate();
-        cancellationToken.ThrowIfCancellationRequested();
-        stage = "PRODUCTION_EXPRESSION";
-        string expression = DevelopmentProductionExpression.Parse(generatedSource);
-        stage = "PRODUCTION_PREFLIGHT";
-        await PreflightAsync(repo, root);
-        stage = "PRODUCTION_BASELINE";
-        string baseCommit = (await DevelopmentWorktreeGuard.GitAsync(
-            repo, "rev-parse", "HEAD")).Trim();
-        string baselinePath = Path.Combine(repo,
-            DevelopmentProductionVerifier.SourcePath.Replace('/', Path.DirectorySeparatorChar));
-        string baseline = await File.ReadAllTextAsync(baselinePath, cancellationToken);
-        string generated = CodingTaskDefinition.RetryBudget.ReplaceExpression(baseline, expression);
-        if (string.Equals(baseline, generated, StringComparison.Ordinal))
-            return new DevelopmentSandboxAttempt(false, -1, -1, -1, false, true,
-                "The proposed expression is identical to the trusted baseline; change it.",
-                null, SourceRejected: true);
-        DevelopmentProductionVerifier.ValidateSourceChange(baseline, generated);
+            if (!contract.IsProduction || attempt is < 1 or > 2)
+                throw new InvalidOperationException("Unreviewed production execution attempt.");
+            contract.Validate();
+            cancellationToken.ThrowIfCancellationRequested();
+            stage = "PRODUCTION_EXPRESSION";
+            string expression = DevelopmentProductionExpression.Parse(generatedSource);
+            stage = "PRODUCTION_PREFLIGHT";
+            await PreflightAsync(repo, root);
+            stage = "PRODUCTION_BASELINE";
+            string baseCommit = (await DevelopmentWorktreeGuard.GitAsync(
+                repo, "rev-parse", "HEAD")).Trim();
+            string baselinePath = Path.Combine(repo,
+                DevelopmentProductionVerifier.SourcePath.Replace('/', Path.DirectorySeparatorChar));
+            string baseline = await File.ReadAllTextAsync(baselinePath, cancellationToken);
+            string generated = CodingTaskDefinition.RetryBudget.ReplaceExpression(baseline, expression);
+            if (string.Equals(baseline, generated, StringComparison.Ordinal))
+                return new DevelopmentSandboxAttempt(false, -1, -1, -1, false, true,
+                    "The proposed expression is identical to the trusted baseline; change it.",
+                    null, SourceRejected: true);
+            DevelopmentProductionVerifier.ValidateSourceChange(baseline, generated);
 
-        string worktree = Path.Combine(root, "worktrees", attempt.ToString("D2"));
-        string evaluations = Path.Combine(root, "evaluations", attempt.ToString("D2"));
-        if (Directory.Exists(worktree))
-            throw new InvalidOperationException("Production attempt worktree already exists.");
+            string worktree = Path.Combine(root, "worktrees", attempt.ToString("D2"));
+            string evaluations = Path.Combine(root, "evaluations", attempt.ToString("D2"));
+            if (Directory.Exists(worktree))
+                throw new InvalidOperationException("Production attempt worktree already exists.");
 
-        cancellationToken.ThrowIfCancellationRequested();
-        stage = "PRODUCTION_WORKTREE_CREATE";
-        await DevelopmentWorktreeGuard.GitAsync(
-            repo, "worktree", "add", "--detach", worktree, baseCommit);
-        string target = Path.Combine(worktree,
-            DevelopmentProductionVerifier.SourcePath.Replace('/', Path.DirectorySeparatorChar));
-        stage = "PRODUCTION_SOURCE_WRITE";
-        RejectReparsePoints(worktree, DevelopmentProductionVerifier.SourcePath);
-        cancellationToken.ThrowIfCancellationRequested();
-        await File.WriteAllTextAsync(target, generated, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            stage = "PRODUCTION_WORKTREE_CREATE";
+            await DevelopmentWorktreeGuard.GitAsync(
+                repo, "worktree", "add", "--detach", worktree, baseCommit);
+            string target = Path.Combine(worktree,
+                DevelopmentProductionVerifier.SourcePath.Replace('/', Path.DirectorySeparatorChar));
+            stage = "PRODUCTION_SOURCE_WRITE";
+            RejectReparsePoints(worktree, DevelopmentProductionVerifier.SourcePath);
+            cancellationToken.ThrowIfCancellationRequested();
+            await File.WriteAllTextAsync(target, generated, cancellationToken);
 
-        // M3a is the ONLY authority that verifies the real Git diff and the
-        // independent, host-owned tests in a freshly created isolated MicroVM.
-        stage = "PRODUCTION_SCOPE_AND_MICROVM";
-        int verificationExit = await DevelopmentProductionVerifier.RunAsync(
-            repo, worktree, DevelopmentAgentContract.ProductionScopePath, evaluations);
+            // M3a is the ONLY authority that verifies the real Git diff and the
+            // independent, host-owned tests in a freshly created isolated MicroVM.
+            stage = "PRODUCTION_SCOPE_AND_MICROVM";
+            int verificationExit = await DevelopmentProductionVerifier.RunAsync(
+                repo, worktree, DevelopmentAgentContract.ProductionScopePath, evaluations);
 
-        stage = "PRODUCTION_EVIDENCE";
-        string[] directories = Directory.GetDirectories(evaluations, "production-check-*");
-        if (directories.Length != 1)
-            throw new InvalidOperationException("Expected one production verification report.");
-        string reportFile = Path.Combine(directories[0], "production-report.json");
-        var evidence = JsonSerializer.Deserialize<DevelopmentProductionVerifier.ProductionReport>(
-            await File.ReadAllTextAsync(reportFile, CancellationToken.None), JsonOptions)
-            ?? throw new InvalidOperationException("Production verification report is missing.");
-        if (evidence.BaseCommit != baseCommit
-            || evidence.SourcePath != DevelopmentProductionVerifier.SourcePath
-            || !File.Exists(evidence.DiffPath)
-            || evidence.SandboxReport is null
-            || !File.Exists(evidence.SandboxReport))
-            throw new InvalidOperationException("Production evidence failed consistency checks.");
+            stage = "PRODUCTION_EVIDENCE";
+            string[] directories = Directory.GetDirectories(evaluations, "production-check-*");
+            if (directories.Length != 1)
+                throw new InvalidOperationException("Expected one production verification report.");
+            string reportFile = Path.Combine(directories[0], "production-report.json");
+            var evidence = JsonSerializer.Deserialize<DevelopmentProductionVerifier.ProductionReport>(
+                await File.ReadAllTextAsync(reportFile, CancellationToken.None), JsonOptions)
+                ?? throw new InvalidOperationException("Production verification report is missing.");
+            if (evidence.BaseCommit != baseCommit
+                || evidence.SourcePath != DevelopmentProductionVerifier.SourcePath
+                || !File.Exists(evidence.DiffPath)
+                || evidence.SandboxReport is null
+                || !File.Exists(evidence.SandboxReport))
+                throw new InvalidOperationException("Production evidence failed consistency checks.");
 
-        var microVm = JsonSerializer.Deserialize<DevelopmentSandboxRunner.SandboxRunReport>(
-            await File.ReadAllTextAsync(evidence.SandboxReport, CancellationToken.None),
-            JsonOptions) ?? throw new InvalidOperationException("MicroVM report is missing.");
+            var microVm = JsonSerializer.Deserialize<DevelopmentSandboxRunner.SandboxRunReport>(
+                await File.ReadAllTextAsync(evidence.SandboxReport, CancellationToken.None),
+                JsonOptions) ?? throw new InvalidOperationException("MicroVM report is missing.");
 
-        string phaseLog = evidence.BuildExitCode != 0 ? "build.log" : "execution.log";
-        string feedbackPath = Path.Combine(Path.GetDirectoryName(evidence.SandboxReport)!, phaseLog);
-        string diagnostic = File.Exists(feedbackPath)
-            ? DevelopmentSandboxRunner.SafeLogPreview(
-                await File.ReadAllTextAsync(feedbackPath, CancellationToken.None))
-            : "No bounded guest diagnostic available.";
-        string feedback = evidence.BuildExitCode == 0 && evidence.RunExitCode == 0
-            && !evidence.OutputAccepted
-            ? "The unchanged trusted RetryBudget tests rejected the candidate output."
-            : diagnostic;
-        if (feedback.Length > 1200) feedback = feedback[..1200];
+            string phaseLog = evidence.BuildExitCode != 0 ? "build.log" : "execution.log";
+            string feedbackPath = Path.Combine(Path.GetDirectoryName(evidence.SandboxReport)!, phaseLog);
+            string diagnostic = File.Exists(feedbackPath)
+                ? DevelopmentSandboxRunner.SafeLogPreview(
+                    await File.ReadAllTextAsync(feedbackPath, CancellationToken.None))
+                : "No bounded guest diagnostic available.";
+            string feedback = evidence.BuildExitCode == 0 && evidence.RunExitCode == 0
+                && !evidence.OutputAccepted
+                ? "The unchanged trusted RetryBudget tests rejected the candidate output."
+                : diagnostic;
+            if (feedback.Length > 1200) feedback = feedback[..1200];
 
-        bool succeeded = verificationExit == 0 && evidence.Status == "passed"
-            && evidence.CheckoutUnchanged && evidence.OutputAccepted
-            && microVm.Error is null && !microVm.TimedOut
-            && evidence.CleanupSucceeded;
-        return new DevelopmentSandboxAttempt(
-            succeeded, evidence.RestoreExitCode, evidence.BuildExitCode,
-            evidence.RunExitCode, microVm.TimedOut, evidence.CleanupSucceeded,
-            feedback, evidence.SandboxReport,
-            evidence.CheckoutUnchanged ? microVm.Error : "CANDIDATE_CHANGED",
-            evidence.OutputAccepted, worktree, evidence.DiffPath);
+            bool succeeded = verificationExit == 0 && evidence.Status == "passed"
+                && evidence.CheckoutUnchanged && evidence.OutputAccepted
+                && microVm.Error is null && !microVm.TimedOut
+                && evidence.CleanupSucceeded;
+            return new DevelopmentSandboxAttempt(
+                succeeded, evidence.RestoreExitCode, evidence.BuildExitCode,
+                evidence.RunExitCode, microVm.TimedOut, evidence.CleanupSucceeded,
+                feedback, evidence.SandboxReport,
+                evidence.CheckoutUnchanged ? microVm.Error : "CANDIDATE_CHANGED",
+                evidence.OutputAccepted, worktree, evidence.DiffPath);
         }
         catch (Exception ex) when (ex is not OperationCanceledException
             && ex is not DevelopmentProductionStageException)
