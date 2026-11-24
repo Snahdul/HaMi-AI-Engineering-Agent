@@ -14,12 +14,12 @@ internal static class DevelopmentPublicationGatewayTests
     {
         const string oneBased = "attempt >= 1 && maxCalls >= 1 && attempt < maxCalls";
         const string positive = "attempt > 0 && maxCalls > 0 && attempt < maxCalls";
-        await SelfTestVariantAsync(repository, oneBased, positive);
-        await SelfTestVariantAsync(repository, positive, oneBased);
+        await SelfTestVariantAsync(repository, oneBased, positive, recoveryMatrix: true);
+        await SelfTestVariantAsync(repository, positive, oneBased, recoveryMatrix: false);
     }
 
     private static async Task SelfTestVariantAsync(string repository,
-        string baselineExpression, string candidateExpression)
+        string baselineExpression, string candidateExpression, bool recoveryMatrix)
     {
         string root = Path.Combine(Path.GetTempPath(), "hami-publish-" + Guid.NewGuid().ToString("N"));
         string repo = Path.Combine(root, "repo");
@@ -38,7 +38,7 @@ internal static class DevelopmentPublicationGatewayTests
             await Git(repo, "remote", "add", "origin",
                 "https://github.com/" + GitHubIssueGateway.Repository + ".git");
             foreach (string path in new[] { sourcePath, DevelopmentAgentContract.ProductionScopePath,
-                DevelopmentPublicationPolicy.PolicyPath })
+                DevelopmentPublicationPolicy.PolicyPath, DevelopmentAgentContract.ProductionPath })
             {
                 string target = Local(repo, path);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
@@ -128,6 +128,22 @@ internal static class DevelopmentPublicationGatewayTests
                 || (await Git(repo, "status", "--porcelain")).Length != 0
                 || (await Git(repo, "rev-parse", "HEAD")).Trim() != baseline)
                 throw new InvalidOperationException("Conflict modified publication or baseline.");
+            transport.Conflict = false;
+            foreach (string conflict in new[] { "closed", "ready", "body", "multiple", "missing-ref" })
+            {
+                transport.PullConflict = conflict;
+                await RejectAsync(() => Publish());
+                if (transport.Posts != postsBeforeRecovery)
+                    throw new InvalidOperationException("Conflicting existing PR caused remote writes.");
+            }
+            transport.PullConflict = null;
+            transport.TamperedTree = true;
+            await RejectAsync(() => Publish());
+            if (transport.Posts != postsBeforeRecovery)
+                throw new InvalidOperationException("Conflicting existing tree caused remote writes.");
+            transport.TamperedTree = false;
+            if (recoveryMatrix)
+                await VerifyRecoveryAsync(repo, results, root, baseline, changed);
         }
         finally
         {
@@ -168,8 +184,25 @@ internal static class DevelopmentPublicationGatewayTests
         private string? commitMessage;
         private JsonElement commitAuthor, commitCommitter;
         private bool branch;
-        internal bool Denied, Stale, TamperedTree, InterruptPull, Conflict;
+        internal bool Denied, Stale, TamperedTree, InterruptPull, Conflict, RateLimited;
+        internal string? InterruptEndpoint, PullConflict;
         internal int Calls, Posts, BranchCreates, PullCreates;
+        internal List<string> PostPaths { get; } = [];
+        private readonly Dictionary<string, string> objectPayloads = new(StringComparer.Ordinal);
+
+        // New client/handler per invocation, same simulated remote resources.
+        internal DevelopmentPublicationGateway OpenPublisher() =>
+            new(new Connection(this), "OFFLINE_DUMMY_TOKEN");
+
+        private sealed class Connection(FakeGitHub remote) : HttpMessageHandler
+        {
+            protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
+                remote.SendAsync(request, ct);
+        }
+
+        private HttpResponseMessage AfterEffect(string endpoint, object value) =>
+            InterruptEndpoint == endpoint || (endpoint == "pulls" && InterruptPull)
+                ? Reply(new { }, HttpStatusCode.ServiceUnavailable) : Reply(value);
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
@@ -181,8 +214,13 @@ internal static class DevelopmentPublicationGatewayTests
             string path = request.RequestUri.AbsolutePath[Root.Length..];
             bool get = request.Method == HttpMethod.Get;
             bool post = request.Method == HttpMethod.Post;
-            if (post) Posts++;
+            if (post)
+            {
+                Posts++;
+                PostPaths.Add(path);
+            }
             if (Denied) return Reply(new { }, HttpStatusCode.Forbidden);
+            if (RateLimited) return Reply(new { }, HttpStatusCode.TooManyRequests);
             if (get && path == "git/ref/heads/main")
                 return Reply(new { @object = new { sha = Stale ? OldBlob : baseline } });
             if (get && path == "git/commits/" + baseline)
@@ -209,14 +247,34 @@ internal static class DevelopmentPublicationGatewayTests
             if (get && path == "git/commits/" + OldBlob)
                 return Reply(new { }, HttpStatusCode.NotFound);
             if (get && path.StartsWith("git/ref/heads/hami-agent/job-", StringComparison.Ordinal))
-                return branch ? Reply(new { @object = new { sha = Conflict ? OldBlob : Commit } })
+                return branch && PullConflict != "missing-ref" ? Reply(new { @object = new { sha = Conflict ? OldBlob : Commit } })
                     : Reply(new { }, HttpStatusCode.NotFound);
             if (get && path == "pulls")
-                return Reply(pull is null ? Array.Empty<object>() : new[] { pull });
+            {
+                if (pull is null) return Reply(Array.Empty<object>());
+                if (PullConflict == "multiple") return Reply(new[] { pull, pull });
+                if (PullConflict is "closed" or "ready" or "body")
+                {
+                    var modified = JsonSerializer.Deserialize<Dictionary<string, object?>>(
+                        JsonSerializer.Serialize(pull))!;
+                    if (PullConflict == "closed") modified["state"] = "closed";
+                    if (PullConflict == "ready") modified["draft"] = false;
+                    if (PullConflict == "body") modified["body"] = "Different evidence";
+                    return Reply(new[] { modified });
+                }
+                return Reply(new[] { pull });
+            }
             if (!post || request.Content is null)
                 throw new Exception("Unexpected publication HTTP operation.");
             using var doc = JsonDocument.Parse(await request.Content.ReadAsStringAsync(ct));
             var data = doc.RootElement;
+            if (path is "git/blobs" or "git/trees" or "git/commits")
+            {
+                string payload = data.GetRawText();
+                if (objectPayloads.TryGetValue(path, out string? previous) && previous != payload)
+                    throw new Exception("Repeated content-addressed object request changed identity.");
+                objectPayloads[path] = payload;
+            }
             switch (path)
             {
                 case "git/blobs":
@@ -224,14 +282,14 @@ internal static class DevelopmentPublicationGatewayTests
                     byte[] header = Encoding.ASCII.GetBytes("blob " + bytes.Length.ToString(
                         System.Globalization.CultureInfo.InvariantCulture) + "\0");
                     blob = Convert.ToHexString(SHA1.HashData(header.Concat(bytes).ToArray())).ToLowerInvariant();
-                    return Reply(new { sha = blob });
+                    return AfterEffect(path, new { sha = blob });
                 case "git/trees":
                     var edit = data.GetProperty("tree");
                     if (data.GetProperty("base_tree").GetString() != BaseTree || edit.GetArrayLength() != 1
                         || edit[0].GetProperty("path").GetString() != DevelopmentProductionVerifier.SourcePath
                         || edit[0].GetProperty("sha").GetString() != blob)
                         throw new Exception("Unexpected tree update.");
-                    return Reply(new { sha = NextTree });
+                    return AfterEffect(path, new { sha = NextTree });
                 case "git/commits":
                     if (data.GetProperty("tree").GetString() != NextTree
                         || data.GetProperty("parents").GetArrayLength() != 1
@@ -240,14 +298,14 @@ internal static class DevelopmentPublicationGatewayTests
                     commitMessage = data.GetProperty("message").GetString();
                     commitAuthor = data.GetProperty("author").Clone();
                     commitCommitter = data.GetProperty("committer").Clone();
-                    return Reply(new { sha = Commit });
+                    return AfterEffect(path, new { sha = Commit });
                 case "git/refs":
                     if (branch || data.GetProperty("sha").GetString() != Commit
                         || data.GetProperty("ref").GetString() != "refs/heads/hami-agent/job-" + new string('a', 32))
                         throw new Exception("Unexpected branch creation.");
                     branch = true;
                     BranchCreates++;
-                    return Reply(new { @object = new { sha = Commit } });
+                    return AfterEffect(path, new { @object = new { sha = Commit } });
                 case "pulls":
                     if (pull is not null || !branch || !data.GetProperty("draft").GetBoolean()
                         || data.GetProperty("base").GetString() != "main")
@@ -263,7 +321,7 @@ internal static class DevelopmentPublicationGatewayTests
                         @base = new { @ref = "main", sha = baseline, repo = repository }
                     };
                     PullCreates++;
-                    return InterruptPull ? Reply(new { }, HttpStatusCode.ServiceUnavailable) : Reply(pull);
+                    return AfterEffect(path, pull);
                 default:
                     throw new Exception("Unexpected publication write endpoint.");
             }
