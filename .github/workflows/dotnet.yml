@@ -58,7 +58,7 @@ jobs:
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
 
       - name: Verify exclusive developer job ownership across processes (offline)
-        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --nologo
+        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release
 
       - name: Verify production-verify CLI dispatch reaches reviewed contract gate (offline)
         shell: bash
@@ -243,7 +243,7 @@ jobs:
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
 
       - name: Verify exclusive developer job ownership across processes (offline)
-        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --nologo
+        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release
 
       - name: Validate general C# sandbox runner input isolation on Windows (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-run-self-test
