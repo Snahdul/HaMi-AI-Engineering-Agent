@@ -156,6 +156,14 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
 
         internal DevelopmentJobState? Current { get; private set; }
 
+        internal DevelopmentJobState RequireCurrent()
+        {
+            CheckOpen();
+            if (Current is null || Read() != Current)
+                throw new InvalidOperationException("Recovery claim missing or changed.");
+            return Current;
+        }
+
         private DevelopmentJobState? Read()
         {
             if (!RegularFileExists(statePath))
