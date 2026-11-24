@@ -162,7 +162,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 Share = FileShare.None,
                 Options = options
             };
-            if (!OperatingSystem.IsWindows())
+            if (!OperatingSystem.IsWindows() && mode == FileMode.CreateNew)
                 settings.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
             return new FileStream(path, settings);
         }
