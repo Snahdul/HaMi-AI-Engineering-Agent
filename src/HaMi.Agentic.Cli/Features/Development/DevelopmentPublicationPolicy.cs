@@ -104,4 +104,46 @@ internal sealed record DevelopmentPublicationPolicy(
             System.Text.Encoding.UTF8.GetString(bytes));
         return bytes;
     }
+    internal static void SelfTest()
+    {
+        string json = """{"schemaVersion":1,"repository":"Snahdul/HaMi-AI-Engineering-Agent","taskId":"production-retry-budget","targetBranch":"main","sourcePath":"src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs"}""";
+        _ = Parse(json);
+        foreach (string invalid in new[] {
+            json.Replace("main", "other", StringComparison.Ordinal),
+            json.Replace("\"schemaVersion\":1", "\"schemaVersion\":2", StringComparison.Ordinal),
+            json.Replace("\"schemaVersion\":1", "\"schemaVersion\":1,\"schemaVersion\":1", StringComparison.Ordinal),
+            json.Replace("\"schemaVersion\":1", "\"schemaVersion\":1,\"enabled\":true", StringComparison.Ordinal)
+        })
+            Reject(() => Parse(invalid));
+
+        string sha = new('a', 40);
+        string hash = new('b', 64);
+        var evidence = new DevelopmentProductionVerifier.ProductionReport(
+            "passed", sha, DevelopmentProductionVerifier.SourcePath, hash,
+            "patch", "sandbox", 0, 0, 0, true, true, true, hash);
+        var attempt = new DevelopmentJobAttempt(1, "passed", 0, 0, 0, false, true,
+            "sandbox", true, "candidate", "patch", evidence);
+        var job = new DevelopmentJobReport(new string('c', 32), "passed", 1, [attempt], null, 55);
+        _ = RequireSuccessfulAttempt(job, 55, sha);
+        Reject(() => RequireSuccessfulAttempt(job, 56, sha));
+        Reject(() => RequireSuccessfulAttempt(job, 55, new string('d', 40)));
+        Reject(() => RequireSuccessfulAttempt(job with { Status = "failed" }, 55, sha));
+        foreach (var invalid in new[] {
+            attempt with { CleanupSucceeded = false },
+            attempt with { TimedOut = true },
+            attempt with { OutputAccepted = false },
+            attempt with { ProductionEvidence = null },
+            attempt with { ProductionEvidence = evidence with { DiffSha256 = "" } },
+            attempt with { ProductionEvidence = evidence with { CheckoutUnchanged = false } }
+        })
+            Reject(() => RequireSuccessfulAttempt(job with { Attempts = [invalid] }, 55, sha));
+
+        static void Reject(Action action)
+        {
+            try { action(); }
+            catch (InvalidOperationException) { return; }
+            throw new InvalidOperationException("Unsafe publication evidence or policy accepted.");
+        }
+    }
+
 }
