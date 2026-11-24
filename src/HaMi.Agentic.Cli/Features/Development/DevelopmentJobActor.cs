@@ -23,7 +23,7 @@ internal interface IDevelopmentIsolatedRunner
 internal sealed record DevelopmentSandboxAttempt(
     bool Succeeded, int RestoreExitCode, int BuildExitCode, int RunExitCode,
     bool TimedOut, bool CleanupSucceeded, string Feedback, string? ReportPath,
-    string? InfrastructureError = null, bool OutputAccepted = false);
+    string? InfrastructureError = null, bool? OutputAccepted = null);
 
 internal sealed record DevelopmentJobAttempt(
     int Number, string Status, int RestoreExitCode, int BuildExitCode,
@@ -255,7 +255,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             || result.BuildExitCode < 0)
             return "infrastructure-failed";
         if (result.Succeeded && result.BuildExitCode == 0 && result.RunExitCode == 0
-            && result.OutputAccepted)
+            && result.OutputAccepted == true)
             return "passed";
 
         // Only C# compiler diagnostics from the completed build are eligible
@@ -270,7 +270,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
         // stdout contract. This is a correctable task failure, not success or
         // a sandbox infrastructure failure.
         if (result.BuildExitCode == 0 && result.RunExitCode == 0
-            && !result.OutputAccepted)
+            && result.OutputAccepted == false)
             return "acceptance-failed";
         return "infrastructure-failed";
     }
