@@ -109,6 +109,9 @@ internal sealed class DevelopmentIssueWorkflow(
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        // git remote get-url never needs credentials; do not inherit them.
+        foreach (string name in new[] { "HAMI_AGENT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "OPENAI_API_KEY" })
+            start.Environment.Remove(name);
         foreach (string part in new[] { "-C", repo, "remote", "get-url", "origin" })
             start.ArgumentList.Add(part);
         using Process process = Process.Start(start)
