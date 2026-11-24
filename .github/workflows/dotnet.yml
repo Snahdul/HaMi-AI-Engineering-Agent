@@ -57,6 +57,9 @@ jobs:
       - name: Validate System.CommandLine and actor-driven retry workflow (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
 
+      - name: Verify exclusive developer job ownership across processes (offline)
+        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --nologo
+
       - name: Verify production-verify CLI dispatch reaches reviewed contract gate (offline)
         shell: bash
         run: |
@@ -238,6 +241,9 @@ jobs:
 
       - name: Validate System.CommandLine and Akka retry on Windows (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
+
+      - name: Verify exclusive developer job ownership across processes (offline)
+        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --nologo
 
       - name: Validate general C# sandbox runner input isolation on Windows (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-run-self-test
