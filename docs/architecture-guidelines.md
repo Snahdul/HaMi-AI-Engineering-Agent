@@ -259,3 +259,21 @@ Ein begrenzter GitHub-Issues-Adapter auf der Host-Seite erweitert den bestehende
 Der Agent führt genau den bisherigen Akka-/Sandbox-Job aus und dokumentiert dessen Ergebnis mit korrelierter Job-ID als einen aktualisierbaren Issue-Kommentar. Detaillierte Logs und Rohdiagnosen bleiben lokal. Nur ein ausdrücklich freigegebener Publish-Modus darf Schreibzugriffe ausführen; gegebenenfalls notwendige Folgeaufträge beginnen als neue offene Issues ohne autonome Ausführung.
 
 GitHub Projects #2 wird weiter durch vorhandene Label-/PR-Actions gepflegt, nicht von einem zweiten Statussystem im Agenten.
+
+## Automatische C#-Formatierung (Issue #19)
+
+Microsoft `dotnet format whitespace` ist das verbindliche Korrekturwerkzeug für den vertrauenswürdigen Implementierungscode des Agenten. Es nutzt die .editorconfig und das SDK aus global.json; kein eigener Formatter, keine automatischen Analyzer-Codefixes und keine Bestandsbereinigung. Der bereits vorhandene nicht-mutierende CI-Whitespace-/Analyzer-Gate bleibt verbindlich.
+
+Im separaten, geprüften Git-Worktree nach Restore und vor dem Commit (PowerShell 7.2+):
+
+```powershell
+$base = (git rev-parse origin/main).Trim()
+dotnet restore src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj
+./scripts/quality/Invoke-HaMiFormat.ps1 -Base $base -Mode Apply
+```
+
+Bei Änderungen im unterstützten JobState-Probe-Projekt zusätzlich dessen Restore ausführen. Apply selektiert neue/geänderte .cs-Dateien relativ zur expliziten Basis (auch untracked), begrenzt auf die beiden fest benannten Implementierungs-/Testprojekte, formatiert mit dem Herstellerwerkzeug und prüft unmittelbar danach erneut. Kein Apply auf main/master oder im primären Checkout. Hashvergleich von getrackten/nicht ignorierten Dateien und Git-Index/HEAD/Branch erkennt unerwartete Seiteneffekte; bei Fehler Worktree erhalten, nicht committen. Check-Modus ist nicht mutierend; bei leerem Scope kein Formatlauf. Ignorierte Buildartefakte sind kein Teil dieses Quellcode-Integritätsnachweises. Das Skript ist kein Sicherheits-Sandbox-Ersatz und setzt einen vertrauenswürdigen, exklusiv benutzten Implementierungsworktree voraus.
+
+Linux- und Windows-CI testen die reale Korrektur im separaten temporären Worktree. Der bestehende Linux-Format-/Analyzer-Gate bleibt unverändert in seiner Wirkung. Bei dessen Fehlschlag erzeugt ein zusätzlicher read-only CI-Schritt einen tatsächlichen Microsoft-Korrekturpatch im temporären Worktree und protokolliert ihn zur Übernahme auf dem exakten PR-Stand; kein CI-Commit/Push und kein Überschreiben des fehlgeschlagenen Qualitätsgates. Die GitHub-API-basierte Remote-Implementierung kann dotnet nicht vor ihrem API-Commit ausführen; in diesem Pfad dient der CI-Patch als deterministische Korrekturquelle, nicht als Freigabe. Kein verpflichtender lokaler Git-Hook wird installiert.
+
+**Abgrenzung zum generierten Agentenkandidaten:** dotnet format lädt MSBuild-Projekte. Unvertrauenswürdige generierte Projekte dürfen deshalb nicht auf dem Host formatiert werden. Spätere automatische Kandidatenformatierung innerhalb der frischen Offline-MicroVM, nur im autorisierten Scope, vor finalem unabhängigem Build/Test und Hashbildung, gesondert implementieren und abnehmen. Bestehender RetryBudget-Expression-Scope und seine Trivia-/Hash-Gates bleiben unverändert. Keine Ausweitung der Schreibrechte.
