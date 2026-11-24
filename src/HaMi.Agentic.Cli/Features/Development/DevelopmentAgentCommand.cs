@@ -54,7 +54,7 @@ internal static class DevelopmentAgentCommand
                 ?? Path.Combine("samples", "SandboxCoding"));
             if (!Path.IsPathFullyQualified(source))
                 throw new InvalidOperationException("Agent source snapshot must be absolute.");
-            DevelopmentSandboxRunner.InspectSnapshot(source, contract.ProjectFile);
+            DevelopmentIsolatedRunner.VerifyFixture(contract, source);
 
             phase = "storage";
             DevelopmentIsolatedRunner.ValidateStoragePaths(repo, source, resultsDirectory);
