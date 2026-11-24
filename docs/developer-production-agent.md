@@ -115,6 +115,12 @@ Add `--live` for a **separately authorized** and potentially billable
 real model invocation. The model has no tools and cannot authorize new
 write paths. Production code still runs only in a fresh offline guest.
 
+## M4 publication
+
+The optional, explicitly authorized publication path is described in
+[Developer M4: controlled Draft PR publication](developer-publication.md).
+The M3b commands above remain secret-free with no publication flags.
+
 ## Remaining v1 milestones
 
 This is the first **real production edit** with autonomous, bounded
