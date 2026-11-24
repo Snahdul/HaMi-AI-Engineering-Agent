@@ -12,10 +12,21 @@ internal static class DevelopmentOutputAcceptance
         + "was wrong. Print only HaMi isolated correction passed followed by one "
         + "normal line terminator. Do not print any extra text.";
 
+    internal static string ForExpected(string expected) => expected switch
+    {
+        DevelopmentAgentContract.ReviewedStdout => CorrectionFeedback,
+        DevelopmentAgentContract.ReviewedPairStdout =>
+            "The trusted offline boundary harness rejected the candidate. "
+            + "Fix the two reviewed C# files without modifying the trusted Program.cs. "
+            + "Produce only HaMi pair acceptance passed on a successful execution.",
+        _ => throw new InvalidOperationException("Unreviewed stdout expectation.")
+    };
+
     internal static bool Matches(string? actual, string expected)
     {
         if (actual is null || actual.Length > 16 * 1024
-            || expected != DevelopmentAgentContract.ReviewedStdout)
+            || expected is not (DevelopmentAgentContract.ReviewedStdout
+                or DevelopmentAgentContract.ReviewedPairStdout))
             return false;
 
         // Normalize Windows vs Linux line endings, but allow at most ONE
@@ -48,5 +59,10 @@ internal static class DevelopmentOutputAcceptance
 
         if (Matches(expected, "untrusted issue-supplied expected output"))
             throw new InvalidOperationException("Unreviewed expected output was accepted.");
+        string pair = DevelopmentAgentContract.ReviewedPairStdout;
+        if (!Matches(pair + "\n", pair) || Matches(pair + "\nextra", pair)
+            || string.IsNullOrWhiteSpace(ForExpected(pair))
+            || !string.Equals(ForExpected(expected), CorrectionFeedback, StringComparison.Ordinal))
+            throw new InvalidOperationException("Pair output acceptance gate failed.");
     }
 }

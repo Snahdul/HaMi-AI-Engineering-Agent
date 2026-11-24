@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "taskId": "sandbox-pair",
+  "description": "Implement PairCalculator.Clamp(value,min,max) and PairFormatter.Format(clamped,min,max). Clamp must return the inclusive nearest bound. Formatter must return exactly the invariant string 'clamped [min,max]' with integers rendered without spaces inside the brackets. Both classes live in namespace HaMi.Agentic.Cli.Features.Development. Preserve the required method signatures; only the two allowlisted files may change. A trusted offline .NET 11 harness verifies boundary cases.",
+  "targetFramework": "net11.0",
+  "projectFile": "Demo.csproj",
+  "sourceFile": "src/HaMi.Agentic.Cli/Features/Development/PairCalculator.cs",
+  "fixtureDirectory": "samples/SandboxCodingPair",
+  "scopeContract": "contracts/development/sandbox-pair.json",
+  "mode": "run",
+  "expectedStdout": "HaMi pair acceptance passed",
+  "maxAttempts": 2,
+  "acceptanceCriteria": [
+    "Two authorized C# files compile with no warnings using offline .NET 11.",
+    "The unchanged host-reviewed Program.cs harness exercises clamping and formatting boundary tests.",
+    "The program exits zero and prints exactly HaMi pair acceptance passed.",
+    "Both MicroVM guests are removed; the production checkout stays untouched."
+  ]
+}

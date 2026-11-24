@@ -27,22 +27,32 @@ internal sealed class DevelopmentIsolatedRunner(
 
         ValidateStoragePaths(repo, fixture, root);
 
-        string[] files = DevelopmentSandboxRunner.InspectSnapshot(fixture, contract.ProjectFile);
-        if (files.Length != 2
-            || !files.Contains(contract.ProjectFile, StringComparer.Ordinal)
-            || !files.Contains(contract.SourceFile, StringComparer.Ordinal))
-            throw new InvalidOperationException("Only the two reviewed console fixture files may enter the sandbox.");
+        // Validate the complete, exact input manifest and structured model
+        // response BEFORE creating any output files. The trusted harness,
+        // project and pre-existing fixture are never modified.
+        string[] files = VerifyFixture(contract, fixture);
+        IReadOnlyDictionary<string, string> replacements = contract.IsPair
+            ? DevelopmentCandidateFiles.Parse(contract, generatedSource)
+            : new Dictionary<string, string>(StringComparer.Ordinal)
+            { [contract.SourceFile] = generatedSource };
 
         string dir = Path.Combine(root, "candidates", attempt.ToString("D2"));
         string sandboxDir = Path.Combine(root, "sandbox", attempt.ToString("D2"));
         Directory.CreateDirectory(dir);
         Directory.CreateDirectory(sandboxDir);
         foreach (string relative in files)
-            File.Copy(Path.Combine(fixture, relative), Path.Combine(dir, relative), overwrite: false);
-        // Only Program.cs is mutable; the trusted project and other paths cannot
-        // be influenced by the model. The original fixture is not written.
-        await File.WriteAllTextAsync(Path.Combine(dir, contract.SourceFile),
-            generatedSource, cancellationToken);
+        {
+            string target = Path.Combine(dir, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.Copy(Path.Combine(fixture, relative), target, overwrite: false);
+        }
+        foreach ((string path, string source) in replacements)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await File.WriteAllTextAsync(Path.Combine(dir,
+                path.Replace('/', Path.DirectorySeparatorChar)),
+                source, cancellationToken);
+        }
 
         cancellationToken.ThrowIfCancellationRequested();
         // The sandbox runner owns the full MicroVM lifecycle and its bounded
@@ -100,7 +110,7 @@ internal sealed class DevelopmentIsolatedRunner(
         // Never send untrusted guest stdout to the model when the semantic
         // check fails. A fixed, reviewer-owned correction hint is sufficient.
         string boundedFeedback = outputAccepted == false
-            ? DevelopmentOutputAcceptance.CorrectionFeedback
+            ? DevelopmentOutputAcceptance.ForExpected(contract.ExpectedStdout)
             : DevelopmentSandboxRunner.SafeLogPreview(feedback);
         if (boundedFeedback.Length > 1200) boundedFeedback = boundedFeedback[..1200];
 
@@ -108,6 +118,22 @@ internal sealed class DevelopmentIsolatedRunner(
             passed, report.RestoreExitCode, report.BuildExitCode, report.ExecutionExitCode,
             report.TimedOut, report.SandboxRemovalSucceeded,
             boundedFeedback, reportPath, report.Error, OutputAccepted: outputAccepted);
+    }
+
+    internal static string[] VerifyFixture(DevelopmentAgentContract contract, string fixtureDirectory)
+    {
+        contract.Validate();
+        string[] files = DevelopmentSandboxRunner.InspectSnapshot(
+            fixtureDirectory, contract.ProjectFile);
+        var expectedFiles = new HashSet<string>(
+            [contract.ProjectFile, .. contract.GeneratedPaths], StringComparer.Ordinal);
+        if (contract.IsPair) expectedFiles.Add("Program.cs");
+        if (files.Length != expectedFiles.Count
+            || files.Any(path => !expectedFiles.Contains(
+                path.Replace('\\', '/'))))
+            throw new InvalidOperationException(
+                "Snapshot differs from the reviewed file manifest.");
+        return files;
     }
 
     // Phase descriptions are trusted host-owned vocabulary, not guest text.
@@ -173,6 +199,14 @@ internal sealed class DevelopmentScriptedGenerator : IDevelopmentCandidateGenera
         string feedback, int attempt, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (contract.IsPair)
+        {
+            if (attempt == 1 && string.IsNullOrEmpty(feedback))
+                return Task.FromResult(DevelopmentCandidateFiles.Scripted(compileError: true));
+            if (attempt == 2 && feedback.Contains("CS0103", StringComparison.Ordinal))
+                return Task.FromResult(DevelopmentCandidateFiles.Scripted(compileError: false));
+            throw new InvalidOperationException("Pair generator received unexpected retry feedback.");
+        }
         if (attempt == 1 && string.IsNullOrEmpty(feedback))
             return Task.FromResult("Console.WriteLine(UnknownIdentifier);");
         if (attempt == 2 && feedback.Contains("CS0103", StringComparison.Ordinal))
