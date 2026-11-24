@@ -33,18 +33,16 @@ internal static class DevelopmentJobEvidenceTests
                 || manifest.Artifacts.Select(a => a.Path).Distinct(StringComparer.Ordinal).Count() != manifest.Artifacts.Length)
                 throw new InvalidOperationException("Recovery evidence manifest incomplete.");
 
-            Reject(() => DevelopmentJobEvidence.BuildManifest(identity, job with
-            {
-                JobId = new string('e', 32)
-            }, original));
-            Reject(() => DevelopmentJobEvidence.BuildManifest(identity, job with
-            {
-                Attempts = [first with { CleanupSucceeded = false }, second]
-            }, original));
-            Reject(() => DevelopmentJobEvidence.BuildManifest(identity, job with
-            {
-                Attempts = [first, second with { CandidateWorktree = root }]
-            }, original));
+            // Re-serialize each deliberately invalid report so rejection
+            // is caused by the changed identity/evidence, not stale JSON bytes.
+            RejectReport(job with { JobId = new string('e', 32) });
+            RejectReport(job with { Attempts = [first with { CleanupSucceeded = false }, second] });
+            RejectReport(job with { Attempts = [first, second with { CandidateWorktree = root }] });
+            Reject(() => DevelopmentJobEvidence.BuildManifest(identity, job, "{}"u8.ToArray()));
+
+            void RejectReport(DevelopmentJobReport invalid) =>
+                Reject(() => DevelopmentJobEvidence.BuildManifest(identity, invalid,
+                    JsonSerializer.SerializeToUtf8Bytes(invalid, JsonOptions)));
 
             string log = Path.Combine(Path.GetDirectoryName(second.ReportPath!)!, "execution.log");
             string originalOutput = File.ReadAllText(log);
