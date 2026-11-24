@@ -737,3 +737,32 @@ Die Schreibfunktion benötigt einen separaten Host-Token in HAMI_AGENT_GITHUB_TO
 Der Host verwendet nur feste Statuswörter, numerische Exitcodes und Zeit-/Job-Korrelation, keine Rohlogs oder lokale absolute Pfade. Die vorhandenen Project-#2-Actions bleiben die einzige Statusautomatisierung; weder PR-Merge noch Folgejob werden ohne neue Autorisierung ausgeführt.
 
 Offline-Selbsttest: development --repo . --agent-self-test. Reale GitHub-Abnahme vor Merge ausstehend.
+
+
+### Dedizierter GitHub-Issues-Token unter Windows (HaMi11)
+
+Der HaMi Developer verwendet ein **Fine-grained Personal Access Token**, das
+auf `Snahdul/HaMi-AI-Engineering-Agent` beschränkt ist. Es benötigt
+ausschließlich `Issues: Read and write` (plus obligatorisches Metadata read).
+Die persönliche `gh auth`-Anmeldung wird **nicht** benutzt.
+
+Einmalig auf HaMi11 im Terminal des **PR-#41-Review-Worktrees**:
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- config --store-github-issues-token
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- config --check-github-issues-token
+```
+
+Der erste Befehl liest die Tokenzeichen ohne Echo und hinterlegt sie
+als generische Windows-Anmeldeinformation für den angemeldeten Benutzer
+unter dem Namen `HaMi-AI-Engineering-Agent/GitHub-Issues/Snahdul`.
+Der zweite Befehl meldet nur `available` oder `missing`, niemals den
+Tokenwert. Das Token wird nicht als GitHub-CLI-Login, Prozess-/Benutzer-
+Umgebungsvariable, Kommandozeilenargument oder Datei gespeichert.
+Der Windows-Credential-Manager-Eintrag hat Vorrang vor einem optionalen
+temporären `HAMI_AGENT_GITHUB_TOKEN`-Fallback. Weder Host-Protokolle noch
+MicroVMs erhalten den Tokenwert.
+
+Bei einer Rotation den Befehl `config --store-github-issues-token` erneut
+ausführen. Bei Ablauf (für die erste Ausgabe: 22.02.2027) muss der Token
+auf GitHub erneuert und anschließend im Credential Manager ersetzt werden.
