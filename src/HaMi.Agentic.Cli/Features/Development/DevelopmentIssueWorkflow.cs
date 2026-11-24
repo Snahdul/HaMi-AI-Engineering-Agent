@@ -174,17 +174,25 @@ internal sealed class DevelopmentIssueWorkflow(
             // compiler diagnostics, raw model text or local report paths.
             string classification = attempt.Status switch
             {
-                "passed" or "build-failed" or "run-failed" or "timed-out" or
-                "cleanup-failed" or "infrastructure-failed" or "source-rejected" => attempt.Status,
+                "passed" or "build-failed" or "run-failed" or "acceptance-failed" or
+                "timed-out" or "cleanup-failed" or "infrastructure-failed"
+                    or "source-rejected" => attempt.Status,
                 _ => "unclassified"
             };
             body.AppendLine("- Versuch " + attempt.Number + ": " + classification
                 + "; Restore=" + attempt.RestoreExitCode
                 + ", Build=" + attempt.BuildExitCode
                 + ", Run=" + attempt.RunExitCode
+                + ", Output=" + (attempt.OutputAccepted switch
+                {
+                    true => "bestätigt",
+                    false => "abweichend",
+                    _ => "nicht geprüft"
+                })
                 + ", Cleanup=" + (attempt.CleanupSucceeded ? "bestätigt" : "NICHT bestätigt"));
-            if (index < report.Attempts.Length - 1 && classification is "build-failed" or "run-failed")
-                body.AppendLine("  - Entscheidung: RETRY_APPROVED (korrigierbarer Fehler, Cleanup bestätigt).");
+            if (index < report.Attempts.Length - 1
+                && classification is "build-failed" or "run-failed" or "acceptance-failed")
+                body.AppendLine("  - Entscheidung: RETRY_APPROVED (korrigierbarer Build-/Laufzeit-/Outputfehler, Cleanup bestätigt).");
             if (!attempt.CleanupSucceeded || attempt.TimedOut)
                 body.AppendLine("  - Entscheidung: kein automatischer Retry bei fehlendem Cleanup oder Timeout.");
         }
