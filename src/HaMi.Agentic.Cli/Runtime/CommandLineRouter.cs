@@ -27,7 +27,6 @@ internal static class CommandLineRouter
         Add(config, "--repo");
         Add(config, "--check", flag: true);
         Add(config, "--self-test", flag: true);
-        Add(config, "--store-github-issues-token", flag: true);
         Add(config, "--check-github-issues-token", flag: true);
         config.SetAction((_, _) => Task.FromResult(
             RuntimeSettings.RunConfigurationCommand(args[1..])));
@@ -96,7 +95,7 @@ internal static class CommandLineRouter
             || valid.Parse(["development", "--repo", ".", "--model"]).Errors.Count == 0
             || valid.Parse(["development", "--repo", ".", "--agent-run", "--results-dir", "C:/reports",
                 "--issue", "42", "--publish-issue", "--allow-followups"]).Errors.Count != 0
-            || valid.Parse(["config", "--store-github-issues-token"]).Errors.Count != 0
+            || valid.Parse(["config", "--store-github-issues-token"]).Errors.Count == 0
             || valid.Parse(["config", "--check-github-issues-token"]).Errors.Count != 0
             || valid.Parse(["development", "--unknown-option"]).Errors.Count == 0
             || valid.Parse(["--check", "."]).Errors.Count == 0
