@@ -188,7 +188,7 @@ jobs:
       - name: Validate HaMi11 acceptance PowerShell syntax (offline)
         shell: pwsh
         run: |
-          foreach ($file in @('Invoke-HaMiSandboxAcceptance.ps1', 'Invoke-HaMiDeveloperAcceptance.ps1')) {
+          foreach ($file in @('Invoke-HaMiSandboxAcceptance.ps1', 'Invoke-HaMiDeveloperAcceptance.ps1', 'Invoke-HaMiProductionCandidateAcceptance.ps1')) {
             $tokens = $null
             $issues = $null
             $path = Join-Path $PWD "scripts/acceptance/$file"
