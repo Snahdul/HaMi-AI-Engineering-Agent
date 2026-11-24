@@ -8,7 +8,8 @@ internal sealed record DevelopmentJobIdentity(
     string JobId, string Repository, int IssueNumber, string BaseCommit,
     string TaskHash, string ContractHash, string ScopeHash, string PolicyHash,
     string ResultsRoot, string GenerationMode, int MaxAttempts,
-    int MaxPublicationAttempts);
+    int MaxPublicationAttempts, string TaskId, string TargetBranch,
+    bool PublishDraft, bool PublishIssue, bool AllowFollowUps);
 
 internal sealed record DevelopmentJobState(
     int SchemaVersion, long Revision, DevelopmentJobIdentity Identity,
@@ -36,7 +37,8 @@ internal sealed record DevelopmentJobState(
     private static readonly string[] IdentityFields =
         ["jobId", "repository", "issueNumber", "baseCommit", "taskHash", "contractHash",
             "scopeHash", "policyHash", "resultsRoot", "generationMode", "maxAttempts",
-            "maxPublicationAttempts"];
+            "maxPublicationAttempts", "taskId", "targetBranch", "publishDraft",
+            "publishIssue", "allowFollowUps"];
 
     internal static DevelopmentJobState Create(DevelopmentJobIdentity identity)
     {
@@ -98,6 +100,8 @@ internal sealed record DevelopmentJobState(
             || Path.TrimEndingDirectorySeparator(Path.GetFullPath(id.ResultsRoot)) != id.ResultsRoot
             || id.GenerationMode is not ("offline-scripted" or "live")
             || id.MaxAttempts != 2 || id.MaxPublicationAttempts != PublicationLimit
+            || id.TaskId != "production-retry-budget" || id.TargetBranch != "main"
+            || !id.PublishDraft || id.PublishIssue || id.AllowFollowUps
             || ModelCalls < 0 || ModelCalls > id.MaxAttempts
             || Attempts < 0 || Attempts > ModelCalls
             || PublicationAttempts < 0 || PublicationAttempts > id.MaxPublicationAttempts)
