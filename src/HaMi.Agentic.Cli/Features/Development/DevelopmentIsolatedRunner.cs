@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 
 namespace HaMi.Agentic.Cli.Features.Development;
 
@@ -7,7 +8,8 @@ namespace HaMi.Agentic.Cli.Features.Development;
 /// runner. Builds/tests NEVER occur directly on the Windows host.
 /// </summary>
 internal sealed class DevelopmentIsolatedRunner(
-    string repository, string trustedFixture, string jobResultsRoot)
+    string repository, string trustedFixture, string jobResultsRoot,
+    ILogger? logger = null, string? jobId = null, bool logSuccessfulSteps = true)
     : IDevelopmentIsolatedRunner
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -46,8 +48,19 @@ internal sealed class DevelopmentIsolatedRunner(
         // The sandbox runner owns the full MicroVM lifecycle and its bounded
         // finally/cleanup. A coordinator deadline may prevent further retries,
         // but must not interrupt reading the completed, auditable result.
+        // The runner emits only host-defined phase codes, generated sandbox IDs,
+        // elapsed times and exit codes. No raw compiler, model or sbx output
+        // enters ILogger. A supplied observer also suppresses the legacy
+        // direct-console progress/diagnostic preview for this agent invocation.
+        Action<string, string, long, int>? progress = logger is null ? null
+            : (phaseCode, sandboxName, elapsedMs, exitCode) =>
+            {
+                if (logSuccessfulSteps)
+                    DevelopmentLogEvents.SandboxPhase(logger, jobId ?? "uncorrelated",
+                        attempt, sandboxName, phaseCode, elapsedMs, exitCode);
+            };
         int cliExit = await DevelopmentSandboxRunner.RunAsync(
-            repo, dir, contract.ProjectFile, contract.Mode, sandboxDir);
+            repo, dir, contract.ProjectFile, contract.Mode, sandboxDir, progress);
 
         string reports = Path.Combine(sandboxDir, "reports");
         if (!Directory.Exists(reports))
