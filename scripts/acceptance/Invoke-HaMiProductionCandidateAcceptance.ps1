@@ -29,22 +29,38 @@ $actualHead = (& git -C $review rev-parse HEAD)
 if ($LASTEXITCODE -ne 0 -or $actualHead -ne $expectedHead) {
     throw 'Review worktree HEAD differs from the fetched PR branch.'
 }
-if (Test-Path -LiteralPath $CandidateWorktree) {
-    throw 'Candidate worktree already exists. Inspect it before proceeding.'
-}
 $mainHead = (& git -C $main rev-parse --verify HEAD)
 if ($LASTEXITCODE -ne 0) { throw 'Cannot read main HEAD.' }
-& git -C $main worktree add --detach $CandidateWorktree $mainHead
-if ($LASTEXITCODE -ne 0) { throw 'Could not create detached production candidate.' }
-
-$target = Join-Path $CandidateWorktree 'src\HaMi.Agentic.Cli\Features\Coding\RetryBudget.cs'
-$baseline = [IO.File]::ReadAllText($target)
+$relativeSource = 'src\HaMi.Agentic.Cli\Features\Coding\RetryBudget.cs'
+$baseline = [IO.File]::ReadAllText((Join-Path $main $relativeSource))
 $oldExpression = 'attempt >= 1 && maxCalls >= 1 && attempt < maxCalls'
 $newExpression = 'attempt > 0 && maxCalls > 0 && attempt < maxCalls'
 if ($baseline.IndexOf($oldExpression, [StringComparison]::Ordinal) -lt 0) {
     throw 'Trusted production baseline expression is missing.'
 }
-[IO.File]::WriteAllText($target, $baseline.Replace($oldExpression, $newExpression))
+$expectedSource = $baseline.Replace($oldExpression, $newExpression)
+$target = Join-Path $CandidateWorktree $relativeSource
+if (Test-Path -LiteralPath $CandidateWorktree) {
+    # The first run can stop before creating a MicroVM. Reuse its existing
+    # candidate only if its HEAD, status and exact bytes match our fixture.
+    # Never overwrite any existing or unexpected user work.
+    $candidateHead = (& git -C $CandidateWorktree rev-parse --verify HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $candidateHead -ne $mainHead) {
+        throw 'Existing candidate is not the reviewed main revision.'
+    }
+    $candidateStatus = @(& git -C $CandidateWorktree status --porcelain=v1 --untracked-files=all)
+    if ($LASTEXITCODE -ne 0 -or $candidateStatus.Count -ne 1 -or
+        $candidateStatus[0] -cne ' M src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs' -or
+        -not (Test-Path -LiteralPath $target) -or
+        [IO.File]::ReadAllText($target) -cne $expectedSource) {
+        throw 'Existing candidate differs from the exact reviewed test edit; nothing was overwritten.'
+    }
+    Write-Host 'Reusing existing, unchanged production candidate.' -ForegroundColor Cyan
+} else {
+    & git -C $main worktree add --detach $CandidateWorktree $mainHead
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create detached production candidate.' }
+    [IO.File]::WriteAllText($target, $expectedSource)
+}
 
 Write-Host '=== 1/3 Offline production scope verification ===' -ForegroundColor Cyan
 & dotnet run --project (Join-Path $review 'src\HaMi.Agentic.Cli') -c Release -- development --repo $main --worktree-check --contract contracts/development/retry-budget-refinement.json --worktree $CandidateWorktree
