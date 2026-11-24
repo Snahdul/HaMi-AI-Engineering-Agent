@@ -5,6 +5,8 @@ param(
     [ValidateSet('Check', 'Apply')][string]$Mode = 'Check'
 )
 $ErrorActionPreference = 'Stop'
+# Handle native exit codes explicitly, including expected check failures in CI.
+$PSNativeCommandUseErrorActionPreference = $false
 Set-StrictMode -Version Latest
 
 # Trusted implementation worktrees only. Do not run this script against
