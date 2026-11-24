@@ -47,6 +47,8 @@ internal static class DevelopmentJobStateRoot
             if (LinuxStat(["-f", "--format=%T", "--", home]) is not ("ext2/ext3" or "xfs" or "btrfs"))
                 throw new InvalidOperationException("Recovery storage requires a supported local Linux filesystem.");
             EnsureLinuxRoot(root, uid);
+            if (LinuxStat(["-f", "--format=%T", "--", root]) is not ("ext2/ext3" or "xfs" or "btrfs"))
+                throw new InvalidOperationException("Recovery root filesystem rejected.");
             return new DevelopmentJobStateStore(root,
                 (path, directory) => ValidateLinuxEntry(path, directory, uid));
         }
@@ -143,7 +145,9 @@ internal static class DevelopmentJobStateRoot
             if (rule.AccessControlType != AccessControlType.Allow || !TrustedWindowsSid(sid, user))
                 throw new InvalidOperationException("Recovery ACL is not private.");
             if (sid.Equals(user) && (rule.PropagationFlags & PropagationFlags.InheritOnly) == 0
-                && (rule.FileSystemRights & FileSystemRights.FullControl) == FileSystemRights.FullControl)
+                && (rule.FileSystemRights & FileSystemRights.FullControl) == FileSystemRights.FullControl
+                && (!directory || (rule.InheritanceFlags & (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit))
+                    == (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit)))
                 userFullControl = true;
         }
         if (!userFullControl)
