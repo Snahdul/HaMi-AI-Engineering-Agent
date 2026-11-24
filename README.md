@@ -8,13 +8,7 @@ HaMi AI Engineering Agent explores exactly that: a .NET 11-based approach to aut
 
 **The goal isn't to replace software engineers. It's to eliminate unnecessary interruptions while preserving engineering discipline.**
 
-```mermaid
-flowchart LR
-    Human[Human defines intent] --> Agent[Agent executes within limits]
-    Agent --> Validation[Compiler and test validation]
-    Validation -->|Bounded correction| Agent
-    Validation --> Review[Human reviews results]
-```
+![Human-led engineering workflow: human intent, bounded agent execution, compiler and test validation, correction loop and human review](docs/assets/engineering-workflow.svg)
 
 This is our engineering vision. The current implementation is an incremental, deliberately bounded prototype.
 
