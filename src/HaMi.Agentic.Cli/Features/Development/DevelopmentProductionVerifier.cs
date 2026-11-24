@@ -182,16 +182,17 @@ internal static class DevelopmentProductionVerifier
 
     internal static async Task ScopeSelfTestAsync(string repo)
     {
-        // Use the actual committed Git objects, not checked-out JSON, to
-        // detect path confusion BEFORE creating any snapshot or MicroVM.
-        await ValidateReviewedScopeAsync(repo, ContractPath);
-        await ValidateReviewedScopeAsync(repo, AgentContractPath);
+        // The CI checks out PR commits as detached HEAD and deliberately
+        // has no refs/heads/main. Inspect the immutable tested HEAD object
+        // here; only real production execution uses refs/heads/main.
         string agentJson = await DevelopmentWorktreeGuard.GitAsync(
-            repo, "show", "refs/heads/main:" + AgentContractPath);
+            repo, "show", "HEAD:" + AgentContractPath);
         string demoJson = await DevelopmentWorktreeGuard.GitAsync(
-            repo, "show", "refs/heads/main:" + ContractPath);
+            repo, "show", "HEAD:" + ContractPath);
         DevelopmentContract agentScope = DevelopmentContract.Parse(agentJson);
         DevelopmentContract demoScope = DevelopmentContract.Parse(demoJson);
+        ValidateReviewedScope(AgentContractPath, agentScope);
+        ValidateReviewedScope(ContractPath, demoScope);
         ExpectRejected(() => ValidateReviewedScope(ContractPath, agentScope));
         ExpectRejected(() => ValidateReviewedScope(AgentContractPath, demoScope));
         ExpectRejected(() => ValidateReviewedScope("contracts/development/unknown.json", agentScope));
