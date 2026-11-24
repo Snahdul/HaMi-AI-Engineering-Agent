@@ -35,7 +35,12 @@ internal static class DevelopmentJobStateRoot
             ValidateWindowsParent(parent, user);
             EnsureWindowsRoot(root, user);
             return new DevelopmentJobStateStore(root,
-                (path, directory) => ValidateWindowsEntry(path, directory, user));
+                (path, directory) =>
+                {
+                    if (!OperatingSystem.IsWindows())
+                        throw new PlatformNotSupportedException("Windows recovery storage requires Windows.");
+                    ValidateWindowsEntry(path, directory, user);
+                });
         }
 
         if (OperatingSystem.IsLinux())
@@ -50,7 +55,12 @@ internal static class DevelopmentJobStateRoot
             if (LinuxStat(["-f", "--format=%T", "--", root]) is not ("ext2/ext3" or "xfs" or "btrfs"))
                 throw new InvalidOperationException("Recovery root filesystem rejected.");
             return new DevelopmentJobStateStore(root,
-                (path, directory) => ValidateLinuxEntry(path, directory, uid));
+                (path, directory) =>
+                {
+                    if (!OperatingSystem.IsLinux())
+                        throw new PlatformNotSupportedException("Linux recovery storage requires Linux.");
+                    ValidateLinuxEntry(path, directory, uid);
+                });
         }
 
         throw new InvalidOperationException("Recovery storage platform not supported.");
