@@ -38,9 +38,15 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
                     additionalProperties = false,
                     properties = new
                     {
-                        path = new { type = "string",
-                            @enum = new[] { DevelopmentAgentContract.PairFirst,
-                                DevelopmentAgentContract.PairSecond } },
+                        path = new
+                        {
+                            type = "string",
+                            @enum = new[]
+                            {
+                                DevelopmentAgentContract.PairFirst,
+                                DevelopmentAgentContract.PairSecond
+                            }
+                        },
                         content = new { type = "string" }
                     },
                     required = new[] { "path", "content" }
@@ -176,7 +182,7 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
             || fake.Options.Tools?.Count != 0
             || fake.Options.ResponseFormat is not ChatResponseFormatJson
             || fake.Options.RawRepresentationFactory?.Invoke(fake) is not CreateResponseOptions
-                { StoredOutputEnabled: false }
+            { StoredOutputEnabled: false }
             || fake.UserText?.Contains(DevelopmentAgentContract.PairSecond,
                 StringComparison.Ordinal) != true)
             throw new InvalidOperationException(
