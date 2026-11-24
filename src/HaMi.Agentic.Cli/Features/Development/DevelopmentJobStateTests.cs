@@ -127,6 +127,30 @@ internal static class DevelopmentJobStateTests
             if (File.ReadAllText(statePath) != "{")
                 throw new InvalidOperationException("Corrupt state was overwritten.");
 
+            // Legacy paths share the same lock and durable blocker, but
+            // never manufacture a V1 recovery authorization.
+            using (var legacy = store.Acquire(65))
+            {
+                legacy.ClaimLegacy(identity.JobId);
+                Reject(() => legacy.Claim(DevelopmentJobState.Create(identity with { IssueNumber = 65 })));
+                Reject(() => store.Acquire(65).Dispose());
+                legacy.CompleteLegacy();
+            }
+            using (var legacy = store.Acquire(65))
+            {
+                legacy.ClaimLegacy(identity.JobId);
+                // Simulate loss of the owner without confirmed completion.
+            }
+            Reject(() => store.Acquire(65).Dispose());
+            if (!File.Exists(Path.Combine(root, "issue-65.legacy-active")))
+                throw new InvalidOperationException("Interrupted legacy claim was discarded.");
+
+            using (var durable = store.Acquire(66))
+            {
+                durable.Claim(DevelopmentJobState.Create(identity with { IssueNumber = 66 }));
+                Reject(() => durable.ClaimLegacy(identity.JobId));
+            }
+
             // A state file copied to a different issue is not a valid claim.
             File.WriteAllBytes(Path.Combine(root, "issue-64.json"), initialBytes);
             Reject(() => store.Acquire(64).Dispose());
