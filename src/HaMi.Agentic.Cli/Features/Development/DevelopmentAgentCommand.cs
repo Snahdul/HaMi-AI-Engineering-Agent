@@ -250,6 +250,8 @@ internal static class DevelopmentAgentCommand
         DevelopmentPublicationPolicy.SelfTest();
         DevelopmentJobStateTests.SelfTest();
         DevelopmentJobStateRoot.SelfTest();
+        DevelopmentJobIdentityFactory.SelfTest();
+        DevelopmentJobEvidenceTests.SelfTest();
         await DevelopmentPublicationGatewayTests.SelfTestAsync(repo);
         DevelopmentProductionExpression.SelfTest();
         await DevelopmentProductionVerifier.ScopeSelfTestAsync(repo);
