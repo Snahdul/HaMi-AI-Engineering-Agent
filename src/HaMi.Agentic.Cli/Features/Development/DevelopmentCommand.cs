@@ -13,6 +13,7 @@ internal static class DevelopmentCommand
         {
             Console.WriteLine("Usage: development --repo <checkout> --contract-check --contract <contracts/development/*.json>");
             Console.WriteLine("       development --repo <main-checkout> --worktree-check --contract <contracts/development/*.json> --worktree <detached-worktree>");
+            Console.WriteLine("       development --repo <main-checkout> --production-verify --contract contracts/development/retry-budget-refinement.json --worktree <detached-worktree> --results-dir <absolute-external-dir>");
             Console.WriteLine("       development --repo <checkout> --self-test");
             Console.WriteLine("       development --repo <main-checkout> --sandbox-poc --results-dir <absolute-local-dir>");
             Console.WriteLine("       development --repo <checkout> --sandbox-poc-self-test");
@@ -55,6 +56,7 @@ internal static class DevelopmentCommand
                     case "--agent-self-test":
                     case "--contract-check":
                     case "--worktree-check":
+                    case "--production-verify":
                         if (action is not null) throw new ArgumentException("Exactly one development action required.");
                         action = args[i];
                         break;
@@ -161,6 +163,16 @@ internal static class DevelopmentCommand
             if (model is not null || live)
                 throw new ArgumentException("--model and --live require --agent-run.");
 
+            if (action == "--production-verify")
+            {
+                if (worktree is null || contractPath is null || resultsDir is null
+                    || source is not null || project is not null || mode is not null)
+                    throw new ArgumentException(
+                        "Production verification needs --contract, --worktree and --results-dir.");
+                return await DevelopmentProductionVerifier.RunAsync(
+                    repo, worktree, contractPath, resultsDir);
+            }
+
             if (action == "--sandbox-run-self-test")
             {
                 if (source is not null || project is not null || mode is not null
@@ -244,6 +256,7 @@ internal static class DevelopmentCommand
 
     private static async Task SelfTestAsync(string repo)
     {
+        DevelopmentProductionVerifier.SelfTest();
         string json = await File.ReadAllTextAsync(Path.Combine(repo,
             ExampleContract.Replace('/', Path.DirectorySeparatorChar)));
         DevelopmentContract contract = DevelopmentContract.Parse(json);
