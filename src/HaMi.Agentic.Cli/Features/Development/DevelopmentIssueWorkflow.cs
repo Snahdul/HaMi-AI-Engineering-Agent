@@ -191,7 +191,7 @@ internal sealed class DevelopmentIssueWorkflow(
                 })
                 + ", Cleanup=" + (attempt.CleanupSucceeded ? "bestätigt" : "NICHT bestätigt"));
             if (index < report.Attempts.Length - 1
-                && classification is "build-failed" or "run-failed" or "acceptance-failed")
+                && classification is ("build-failed" or "run-failed" or "acceptance-failed"))
                 body.AppendLine("  - Entscheidung: RETRY_APPROVED (korrigierbarer Build-/Laufzeit-/Outputfehler, Cleanup bestätigt).");
             if (!attempt.CleanupSucceeded || attempt.TimedOut)
                 body.AppendLine("  - Entscheidung: kein automatischer Retry bei fehlendem Cleanup oder Timeout.");
