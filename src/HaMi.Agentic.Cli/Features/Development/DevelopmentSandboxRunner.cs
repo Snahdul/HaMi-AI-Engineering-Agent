@@ -508,8 +508,7 @@ internal static class DevelopmentSandboxRunner
 
     private static void ScrubHostCredentials(ProcessStartInfo info)
     {
-        foreach (string name in SensitiveEnvNames)
-            info.Environment.Remove(name);
+        DevelopmentChildEnvironment.RestrictSandboxProcess(info);
     }
 
     private static async Task<SandboxProcess> SbxAsync(TimeSpan limit, params string[] arguments)
@@ -603,8 +602,12 @@ internal static class DevelopmentSandboxRunner
         var scrubTest = new ProcessStartInfo("sbx");
         foreach (string name in SensitiveEnvNames)
             scrubTest.Environment[name] = "DUMMY-CI-VALUE";
+        scrubTest.Environment["HAMI_UNKNOWN_FUTURE_SECRET"] = "DUMMY-CI-VALUE";
+        scrubTest.Environment["PATH"] = "dummy-path";
         ScrubHostCredentials(scrubTest);
-        if (SensitiveEnvNames.Any(scrubTest.Environment.ContainsKey))
+        if (SensitiveEnvNames.Any(scrubTest.Environment.ContainsKey)
+            || scrubTest.Environment.ContainsKey("HAMI_UNKNOWN_FUTURE_SECRET")
+            || scrubTest.Environment["PATH"] != "dummy-path")
             throw new InvalidOperationException("Sensitive host variables were not removed from sbx environment.");
 
         ValidateGuestCredentialPreflight(new SandboxProcess(0, "CREDENTIAL_ENV=clean\n", ""));
