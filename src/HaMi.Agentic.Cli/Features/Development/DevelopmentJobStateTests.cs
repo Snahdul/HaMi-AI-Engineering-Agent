@@ -15,11 +15,14 @@ internal static class DevelopmentJobStateTests
             var identity = new DevelopmentJobIdentity(new string('a', 32),
                 GitHubIssueGateway.Repository, 62, new string('b', 40),
                 hash, hash, hash, hash, Path.Combine(root, "results"),
-                "offline-scripted", 2, DevelopmentJobState.PublicationLimit);
+                "offline-scripted", 2, DevelopmentJobState.PublicationLimit,
+                "production-retry-budget", "main", true, false, false);
             var initial = DevelopmentJobState.Create(identity);
             var store = new DevelopmentJobStateStore(root);
             Reject(() => initial.ReservePublication());
             Reject(() => DevelopmentJobState.Create(identity with { MaxAttempts = 3 }));
+            Reject(() => DevelopmentJobState.Create(identity with { PublishIssue = true }));
+            Reject(() => DevelopmentJobState.Create(identity with { PublishDraft = false }));
             Reject(() => DevelopmentJobState.Create(identity with { JobId = "../other" }));
 
             byte[] initialBytes = initial.Serialize();
@@ -73,10 +76,11 @@ internal static class DevelopmentJobStateTests
 
             using (var owner = store.Acquire(62))
             {
-                if (owner.Current?.Stage != DevelopmentJobState.PublicationPending
-                    || owner.Current.PublicationAttempts != 1)
+                var pendingState = owner.Current;
+                if (pendingState?.Stage != DevelopmentJobState.PublicationPending
+                    || pendingState.PublicationAttempts != 1)
                     throw new InvalidOperationException("Publication intent not retained.");
-                owner.Commit(owner.Current.ReservePublication());
+                owner.Commit(pendingState.ReservePublication());
                 owner.Commit(owner.Current!.ReservePublication());
                 Reject(() => owner.Current!.ReservePublication());
                 Reject(() => owner.Commit(owner.Current!.ConfirmPublication(59) with
@@ -89,8 +93,9 @@ internal static class DevelopmentJobStateTests
 
             using (var owner = store.Acquire(62))
             {
-                if (owner.Current?.PullRequestNumber != 59
-                    || owner.Current.Stage != DevelopmentJobState.Published)
+                var published = owner.Current;
+                if (published?.PullRequestNumber != 59
+                    || published.Stage != DevelopmentJobState.Published)
                     throw new InvalidOperationException("Published identity lost.");
                 Reject(() => owner.Claim(initial));
             }
