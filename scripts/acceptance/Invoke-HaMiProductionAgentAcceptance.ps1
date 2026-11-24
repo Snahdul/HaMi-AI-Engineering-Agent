@@ -56,12 +56,12 @@ if ($LASTEXITCODE -ne 0 -or
 # A clean mirror may fast-forward to the new reviewed PR head without touching
 # those old candidates, their Git metadata, or any previously saved reports.
 if ($mirrorHead -ne $reviewHead) {
-    & git -C $MirrorRepository merge-base --is-ancestor $mirrorHead $reviewHead
+    & git -C $MirrorRepository fetch --no-tags $review HEAD
+    if ($LASTEXITCODE -ne 0) { throw 'Could not fetch reviewed HEAD into mirror.' }
+    & git -C $MirrorRepository merge-base --is-ancestor $mirrorHead FETCH_HEAD
     if ($LASTEXITCODE -ne 0) {
         throw 'Existing mirror cannot be fast-forwarded to the reviewed PR head.'
     }
-    & git -C $MirrorRepository fetch --no-tags $review HEAD
-    if ($LASTEXITCODE -ne 0) { throw 'Could not fetch reviewed HEAD into mirror.' }
     & git -C $MirrorRepository merge --ff-only FETCH_HEAD
     if ($LASTEXITCODE -ne 0) { throw 'Safe mirror fast-forward failed.' }
     Write-Host 'PASS - reviewed mirror updated by fast-forward; previous candidates preserved.' -ForegroundColor Cyan
