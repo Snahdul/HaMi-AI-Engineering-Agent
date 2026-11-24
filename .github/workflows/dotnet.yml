@@ -57,8 +57,14 @@ jobs:
         run: ./scripts/quality/Show-HaMiFormatPatch.ps1 -Base $env:BASE_SHA
 
       - name: Test scoped automatic Microsoft formatting
+        id: formatter-regression
         shell: pwsh
         run: ./scripts/quality/Test-HaMiFormat.ps1
+
+      - name: Reproduce original RetryBudget formatter regression
+        if: success() || steps.formatter-regression.outcome == 'failure'
+        shell: pwsh
+        run: ./scripts/quality/Test-HaMiFormatRetryBudget.ps1
 
       - name: Validate versioned development task contract (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --contract-check --contract contracts/development/retry-budget-refinement.json
@@ -246,8 +252,14 @@ jobs:
         run: dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-restore
 
       - name: Test scoped automatic Microsoft formatting
+        id: formatter-regression
         shell: pwsh
         run: ./scripts/quality/Test-HaMiFormat.ps1
+
+      - name: Reproduce original RetryBudget formatter regression
+        if: success() || steps.formatter-regression.outcome == 'failure'
+        shell: pwsh
+        run: ./scripts/quality/Test-HaMiFormatRetryBudget.ps1
 
       - name: Validate development task and detached worktree scope on Windows
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --self-test
