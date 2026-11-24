@@ -40,10 +40,6 @@ if (Test-Path -LiteralPath $MirrorRepository) {
 } else {
     & git clone --local --no-hardlinks --branch main $main $MirrorRepository
     if ($LASTEXITCODE -ne 0) { throw 'Could not create independent local Git mirror.' }
-    & git -C $MirrorRepository fetch --no-tags $review HEAD
-    if ($LASTEXITCODE -ne 0) { throw 'Could not fetch reviewed HEAD into mirror.' }
-    & git -C $MirrorRepository switch -C main FETCH_HEAD
-    if ($LASTEXITCODE -ne 0) { throw 'Could not select reviewed code in mirror.' }
     & git -C $MirrorRepository remote set-url origin https://github.com/Snahdul/HaMi-AI-Engineering-Agent.git
     if ($LASTEXITCODE -ne 0) { throw 'Could not pin canonical Git origin.' }
 }
@@ -51,10 +47,29 @@ $mirrorHead = (& git -C $MirrorRepository rev-parse HEAD)
 $mirrorBranch = (& git -C $MirrorRepository branch --show-current)
 $mirrorStatus = @(& git -C $MirrorRepository status --porcelain=v1 --untracked-files=all)
 $mirrorOrigin = (& git -C $MirrorRepository remote get-url origin)
-if ($LASTEXITCODE -ne 0 -or $mirrorHead -ne $reviewHead -or
+if ($LASTEXITCODE -ne 0 -or
     $mirrorBranch -ne 'main' -or $mirrorStatus.Count -ne 0 -or
     $mirrorOrigin -ne 'https://github.com/Snahdul/HaMi-AI-Engineering-Agent.git') {
-    throw 'Reviewed mirror differs from the approved PR commit.'
+    throw 'Reviewed mirror has an unexpected branch, dirty checkout or Git origin.'
+}
+# An interrupted prior acceptance may have left detached candidate worktrees.
+# A clean mirror may fast-forward to the new reviewed PR head without touching
+# those old candidates, their Git metadata, or any previously saved reports.
+if ($mirrorHead -ne $reviewHead) {
+    & git -C $MirrorRepository merge-base --is-ancestor $mirrorHead $reviewHead
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Existing mirror cannot be fast-forwarded to the reviewed PR head.'
+    }
+    & git -C $MirrorRepository fetch --no-tags $review HEAD
+    if ($LASTEXITCODE -ne 0) { throw 'Could not fetch reviewed HEAD into mirror.' }
+    & git -C $MirrorRepository merge --ff-only FETCH_HEAD
+    if ($LASTEXITCODE -ne 0) { throw 'Safe mirror fast-forward failed.' }
+    Write-Host 'PASS - reviewed mirror updated by fast-forward; previous candidates preserved.' -ForegroundColor Cyan
+}
+$mirrorHead = (& git -C $MirrorRepository rev-parse HEAD)
+$mirrorStatus = @(& git -C $MirrorRepository status --porcelain=v1 --untracked-files=all)
+if ($LASTEXITCODE -ne 0 -or $mirrorHead -ne $reviewHead -or $mirrorStatus.Count -ne 0) {
+    throw 'Reviewed mirror does not match the exact PR commit.'
 }
 
 Write-Host '=== 1/3 Offline parser, contract and Akka self-tests ===' -ForegroundColor Cyan
