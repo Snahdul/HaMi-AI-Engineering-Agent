@@ -728,7 +728,7 @@ Ein zulässiges Pilot-Issue muss offen, vom Eigentümer Snahdul erstellt und mit
 
 **GitHub-Write-Opt-in:** --publish-issue ergänzt einen zu derselben Job-ID korrelierten Kommentar, aktualisiert ihn mit sicher verdichteten Ausführungsberichten und löst nach einem erfolgreichen Job das Label workflow:review aus. Optional erlaubt --allow-followups bei persistentem failed/exhausted einen deduplizierten Folgeauftrag ohne automatischen Neustart.
 
-Die Schreibfunktion benötigt einen separaten Host-Token in HAMI_AGENT_GITHUB_TOKEN mit Issues-Schreibrechten nur für dieses Repository. Nicht den Project-Token HAMI_PROJECT_TOKEN verwenden. Tokens niemals in Quelltext, Shell-Historie, Issues, Prompts oder Logs veröffentlichen. Keine GitHub-Credentials gelangen in die MicroVM.
+Die Schreibfunktion benötigt einen dedizierten, auf dieses Repository begrenzten GitHub-Issues-Token (Issues: Read and write). Unter Windows liest der Agent ausschließlich den Eintrag aus der Windows-Anmeldeinformationsverwaltung; auf anderen Plattformen ist eine ausdrücklich konfigurierte Prozessvariable `HAMI_AGENT_GITHUB_TOKEN` möglich. Nicht den Project-Token `HAMI_PROJECT_TOKEN` verwenden. Tokens niemals in Quelltext, Shell-Historie, Issues, Prompts oder Logs veröffentlichen. Keine GitHub-Credentials gelangen in die MicroVM.
 
 **Beispiel: **
 
@@ -741,38 +741,35 @@ Offline-Selbsttest: development --repo . --agent-self-test. Reale GitHub-Abnahme
 
 ### Dedizierter GitHub-Issues-Token unter Windows (HaMi11)
 
-Der HaMi Developer verwendet ein **Fine-grained Personal Access Token**, das
-auf `Snahdul/HaMi-AI-Engineering-Agent` beschränkt ist. Es benötigt
-ausschließlich `Issues: Read and write` (plus obligatorisches Metadata read).
-Die persönliche `gh auth`-Anmeldung wird **nicht** benutzt.
+Der HaMi Developer verwendet ein auf `Snahdul/HaMi-AI-Engineering-Agent`
+beschränktes **Fine-grained Personal Access Token** mit ausschließlich
+`Issues: Read and write` (und obligatorischem `Metadata: Read-only`).
+Die persönliche GitHub-CLI-Anmeldung wird nicht verwendet.
 
-Einmalig auf HaMi11 im Terminal des **PR-#41-Review-Worktrees**:
+**Einrichtung und Rotation:** `Win + R` → `control /name Microsoft.CredentialManager`
+→ **Windows-Anmeldeinformationen** → **Generische Anmeldeinformation hinzufügen**
+(bei Rotation bestehenden Eintrag bearbeiten):
+
+- Internet-/Netzwerkadresse: `HaMi-AI-Engineering-Agent/GitHub-Issues/Snahdul`
+- Benutzername: `Snahdul`
+- Kennwort: ausschließlich der dedizierte `github_pat_...`-Token aus dem sicheren Tresor
+
+Der vorherige Konsolenbefehl `config --store-github-issues-token` wurde nach
+mehrfachen fehlgeschlagenen interaktiven HaMi11-Tests **entfernt**. Den Token
+nicht als PowerShell-Argument oder Prozess-/Benutzer-Umgebungsvariable
+speichern. Auf HaMi11 wird ausschließlich der benutzerspezifische Windows
+Credential Manager gelesen.
+
+**Prüfung ohne Ausgabe des Tokenwerts:**
 
 ```powershell
-dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- config --store-github-issues-token
 dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- config --check-github-issues-token
 ```
 
-Der erste Befehl akzeptiert das Einfügen des kopierten Tokens mit
-`Strg+V` beziehungsweise der Einfügefunktion des Terminals. Die Eingabe
-erfolgt zeilenweise bei deaktivierter Konsolen-Echoausgabe, sodass
-**auch beim Einfügen keine Tokenzeichen angezeigt werden**. Anschließend
-`Enter` drücken. Die bisherigen `Console.ReadKey`-Probleme beim
-Einfügen sind damit vermieden. Das Verhalten wird zusätzlich
-auf HaMi11 im interaktiven Windows-Terminal geprüft.
-
-Der erste Befehl liest die Tokenzeichen ohne Echo und hinterlegt sie
-als generische Windows-Anmeldeinformation für den angemeldeten Benutzer
-unter dem Namen `HaMi-AI-Engineering-Agent/GitHub-Issues/Snahdul`.
-Der zweite Befehl meldet nur `available` oder `missing`, niemals den
-Tokenwert. Das Token wird nicht als GitHub-CLI-Login, Prozess-/Benutzer-
-Umgebungsvariable, Kommandozeilenargument oder Datei gespeichert.
-Auf Windows wird **ausschließlich** der dedizierte Credential-Manager-Eintrag
-akzeptiert (kein Fallback auf persönliche CLI- oder Prozess-Tokens).
-Auf anderen Betriebssystemen kann weiterhin eine gesonderte temporäre
-`HAMI_AGENT_GITHUB_TOKEN`-Variable verwendet werden. Weder Host-Protokolle noch
-MicroVMs erhalten den Tokenwert.
-
-Bei einer Rotation den Befehl `config --store-github-issues-token` erneut
-ausführen. Bei Ablauf (für die erste Ausgabe: 22.02.2027) muss der Token
-auf GitHub erneuert und anschließend im Credential Manager ersetzt werden.
+`available` bestätigt das Vorhandensein des Credentials. Der erfolgreiche
+echte GitHub-Issue-Pilot #42 (24.11.2026) bestätigt darüber hinaus, dass
+der gespeicherte Token für das Issue-Lesen, Aktualisieren eines Kommentars
+und den Labelwechsel auf `workflow:review` verwendet werden konnte.
+Beim Ablaufdatum 22.02.2027 den Token bei GitHub erneuern und den
+bestehenden Credential-Manager-Eintrag bearbeiten. Keine Secretwerte in
+Logs oder Issues kopieren.
