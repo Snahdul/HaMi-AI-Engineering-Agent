@@ -805,6 +805,12 @@ Der Offline-Selbsttest `development --repo <checkout> --agent-self-test`
 prüft den Output-Verifier und die semantische Korrekturschleife ohne
 Modell-API, GitHub-Schreibrechte oder Docker. Für die reale MicroVM-
 Abnahme ist ein separater HaMi11-Lauf im Review-Worktree erforderlich.
+Das vorhandene Skript `scripts/acceptance/Invoke-HaMiDeveloperAcceptance.ps1`
+prüft jetzt zusätzlich das exakte `execution.log` und
+`agent-report.json.attempts[1].outputAccepted` sowie unveränderten
+Git-Status und unabhängiges `sbx inspect` beider Gäste. Im Review-Branch
+mit `-ExpectedRef origin/feature/issue46-verified-output-acceptance`
+ausführen. Kein Modell-API-Aufruf; das Skript nutzt den Offline-Generator.
 Diese Prüfung ist für den freigegebenen Ein-Datei-Demonstrator ausgelegt;
 allgemeine Issue-Akzeptanzkriterien werden dadurch **noch nicht**
 automatisch interpretiert.
