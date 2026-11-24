@@ -152,15 +152,23 @@ internal static class DevelopmentPublicationGatewayTests
             if (get && path == "git/ref/heads/main")
                 return Reply(new { @object = new { sha = Stale ? OldBlob : baseline } });
             if (get && path == "git/commits/" + baseline)
-                return Reply(new { sha = baseline, tree = new { sha = BaseTree },
-                    committer = new { date = "2026-01-01T00:00:00Z" } });
+                return Reply(new
+                {
+                    sha = baseline,
+                    tree = new { sha = BaseTree },
+                    committer = new { date = "2026-01-01T00:00:00Z" }
+                });
             if (get && path == "git/trees/" + BaseTree)
                 return Tree(BaseTree, OldBlob, OtherBlob);
             if (get && path == "git/trees/" + NextTree)
                 return Tree(NextTree, blob!, TamperedTree ? OldBlob : OtherBlob);
             if (get && path == "git/commits/" + Commit)
-                return Reply(new { sha = Commit, tree = new { sha = NextTree },
-                    parents = new[] { new { sha = baseline } } });
+                return Reply(new
+                {
+                    sha = Commit,
+                    tree = new { sha = NextTree },
+                    parents = new[] { new { sha = baseline } }
+                });
             if (get && path.StartsWith("git/ref/heads/hami-agent/job-", StringComparison.Ordinal))
                 return branch ? Reply(new { @object = new { sha = Conflict ? OldBlob : Commit } })
                     : Reply(new { }, HttpStatusCode.NotFound);
@@ -203,10 +211,15 @@ internal static class DevelopmentPublicationGatewayTests
                         || data.GetProperty("base").GetString() != "main")
                         throw new Exception("Unexpected pull request creation.");
                     var repository = new { full_name = GitHubIssueGateway.Repository };
-                    pull = new { number = 99, state = "open", draft = true,
+                    pull = new
+                    {
+                        number = 99,
+                        state = "open",
+                        draft = true,
                         body = data.GetProperty("body").GetString(),
                         head = new { @ref = data.GetProperty("head").GetString(), sha = Commit, repo = repository },
-                        @base = new { @ref = "main", sha = baseline, repo = repository } };
+                        @base = new { @ref = "main", sha = baseline, repo = repository }
+                    };
                     PullCreates++;
                     return InterruptPull ? Reply(new { }, HttpStatusCode.ServiceUnavailable) : Reply(pull);
                 default:
@@ -215,10 +228,15 @@ internal static class DevelopmentPublicationGatewayTests
         }
 
         private static HttpResponseMessage Tree(string sha, string source, string other) =>
-            Reply(new { sha, truncated = false, tree = new[] {
+            Reply(new
+            {
+                sha,
+                truncated = false,
+                tree = new[] {
                 new { path = DevelopmentProductionVerifier.SourcePath, type = "blob", mode = "100644", sha = source },
                 new { path = "unrelated.cs", type = "blob", mode = "100644", sha = other }
-            } });
+            }
+            });
 
         private static HttpResponseMessage Reply(object value, HttpStatusCode status = HttpStatusCode.OK) =>
             new(status) { Content = new StringContent(JsonSerializer.Serialize(value)) };
