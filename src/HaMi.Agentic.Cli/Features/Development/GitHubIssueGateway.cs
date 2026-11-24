@@ -33,11 +33,13 @@ internal sealed class GitHubIssueGateway : IDevelopmentIssueGateway, IDisposable
         ownsClient = client is null;
         this.client = client ?? new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
         // An explicitly passed value (including empty for negative tests)
-        // wins; otherwise prefer the dedicated user credential over any
-        // temporary process environment compatibility fallback. Never use
-        // the operator's GitHub CLI / gh auth credentials.
-        this.token = token ?? WindowsIssueCredentialStore.Read()
-            ?? Environment.GetEnvironmentVariable(TokenVariable);
+        // wins. On Windows, only the dedicated Credential Manager entry is
+        // accepted, never the operator's broader gh auth or process token.
+        // Non-Windows hosts may opt into a separate temporary environment
+        // token; no credential store is available there.
+        this.token = token ?? (OperatingSystem.IsWindows()
+            ? WindowsIssueCredentialStore.Read()
+            : Environment.GetEnvironmentVariable(TokenVariable));
     }
 
     internal void RequireWriteAccess()
