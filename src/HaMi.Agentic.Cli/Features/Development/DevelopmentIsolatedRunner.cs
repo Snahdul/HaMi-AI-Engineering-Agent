@@ -83,11 +83,12 @@ internal sealed class DevelopmentIsolatedRunner(
         // The expected value is pinned in the versioned contract; read only
         // the retained guest output, after bounded sandbox cleanup.
         string executionLog = Path.Combine(dirs[0], "execution.log");
-        bool outputAccepted = executionSucceeded && File.Exists(executionLog)
-            && DevelopmentOutputAcceptance.Matches(
+        bool? outputAccepted = executionSucceeded
+            ? File.Exists(executionLog) && DevelopmentOutputAcceptance.Matches(
                 await File.ReadAllTextAsync(executionLog, CancellationToken.None),
-                contract.ExpectedStdout);
-        bool passed = executionSucceeded && outputAccepted;
+                contract.ExpectedStdout)
+            : null;
+        bool passed = outputAccepted == true;
 
         // Restore/preflight failures are infrastructure failures, NOT
         // compiler failures. Return their status explicitly to the actor.
@@ -98,7 +99,7 @@ internal sealed class DevelopmentIsolatedRunner(
             ? await File.ReadAllTextAsync(file, CancellationToken.None) : "No sandbox diagnostics recorded.";
         // Never send untrusted guest stdout to the model when the semantic
         // check fails. A fixed, reviewer-owned correction hint is sufficient.
-        string boundedFeedback = executionSucceeded && !outputAccepted
+        string boundedFeedback = outputAccepted == false
             ? DevelopmentOutputAcceptance.CorrectionFeedback
             : DevelopmentSandboxRunner.SafeLogPreview(feedback);
         if (boundedFeedback.Length > 1200) boundedFeedback = boundedFeedback[..1200];
