@@ -30,14 +30,7 @@ internal sealed class DevelopmentIsolatedRunner(
         // Validate the complete, exact input manifest and structured model
         // response BEFORE creating any output files. The trusted harness,
         // project and pre-existing fixture are never modified.
-        string[] files = DevelopmentSandboxRunner.InspectSnapshot(fixture, contract.ProjectFile);
-        var expectedFiles = new HashSet<string>(
-            [contract.ProjectFile, .. contract.GeneratedPaths], StringComparer.Ordinal);
-        if (contract.IsPair) expectedFiles.Add("Program.cs");
-        if (files.Length != expectedFiles.Count
-            || files.Any(path => !expectedFiles.Contains(
-                path.Replace('\\', '/'))))
-            throw new InvalidOperationException("Snapshot differs from the reviewed file manifest.");
+        string[] files = VerifyFixture(contract, fixture);
         IReadOnlyDictionary<string, string> replacements = contract.IsPair
             ? DevelopmentCandidateFiles.Parse(contract, generatedSource)
             : new Dictionary<string, string>(StringComparer.Ordinal)
@@ -125,6 +118,22 @@ internal sealed class DevelopmentIsolatedRunner(
             passed, report.RestoreExitCode, report.BuildExitCode, report.ExecutionExitCode,
             report.TimedOut, report.SandboxRemovalSucceeded,
             boundedFeedback, reportPath, report.Error, OutputAccepted: outputAccepted);
+    }
+
+    internal static string[] VerifyFixture(DevelopmentAgentContract contract, string fixtureDirectory)
+    {
+        contract.Validate();
+        string[] files = DevelopmentSandboxRunner.InspectSnapshot(
+            fixtureDirectory, contract.ProjectFile);
+        var expectedFiles = new HashSet<string>(
+            [contract.ProjectFile, .. contract.GeneratedPaths], StringComparer.Ordinal);
+        if (contract.IsPair) expectedFiles.Add("Program.cs");
+        if (files.Length != expectedFiles.Count
+            || files.Any(path => !expectedFiles.Contains(
+                path.Replace('\\', '/'))))
+            throw new InvalidOperationException(
+                "Snapshot differs from the reviewed file manifest.");
+        return files;
     }
 
     // Phase descriptions are trusted host-owned vocabulary, not guest text.
