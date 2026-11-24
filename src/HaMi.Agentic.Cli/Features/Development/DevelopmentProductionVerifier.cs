@@ -179,7 +179,7 @@ internal static class DevelopmentProductionVerifier
             || expression.Contains("//", StringComparison.Ordinal)
             || expression.Contains("/*", StringComparison.Ordinal)
             || expression.Contains("*/", StringComparison.Ordinal)
-            || Identifiers.Matches(expression)
+            || Identifiers.Matches(expression).Cast<Match>()
                 .Any(m => !CodingTaskDefinition.RetryBudget.AllowedIdentifiers.Contains(m.Value))
             || !string.Equals(CodingTaskDefinition.RetryBudget.ReplaceExpression(
                 baseline, expression), candidate, StringComparison.Ordinal))
