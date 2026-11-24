@@ -69,9 +69,13 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             statePath = prefix + ".json";
             nextPath = prefix + ".next";
             string lockPath = prefix + ".lock";
-            if (RegularFileExists(lockPath))
+            bool lockExists = RegularFileExists(lockPath);
+            if (lockExists)
                 validatePrivateEntry?.Invoke(lockPath, false);
-            handle = OpenPrivateFile(lockPath, FileMode.OpenOrCreate, FileOptions.None);
+            // A racing creator must not be silently accepted as a newly
+            // provisioned private file. Open an existing validated lock, or
+            // exclusively create a new one. Never overwrite an existing lock.
+            handle = OpenPrivateFile(lockPath, lockExists ? FileMode.Open : FileMode.CreateNew, FileOptions.None);
             try
             {
                 _ = RegularFileExists(lockPath);
@@ -147,8 +151,10 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 throw new InvalidOperationException("Recovery checkpoint readback failed.");
         }
 
-        private static FileStream OpenPrivateFile(string path, FileMode mode, FileOptions options)
+        private FileStream OpenPrivateFile(string path, FileMode mode, FileOptions options)
         {
+            if (OperatingSystem.IsWindows() && mode == FileMode.CreateNew && validatePrivateEntry is not null)
+                return DevelopmentJobStateRoot.CreateWindowsPrivateFile(path, options);
             var settings = new FileStreamOptions
             {
                 Mode = mode,
