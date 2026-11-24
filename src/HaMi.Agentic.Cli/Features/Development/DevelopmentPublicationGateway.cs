@@ -12,12 +12,11 @@ namespace HaMi.Agentic.Cli.Features.Development;
 internal sealed class DevelopmentPublicationGateway : IDisposable
 {
     private readonly HttpClient client;
-    private readonly string token;
+    private readonly string? testToken;
+    private string? token;
     internal DevelopmentPublicationGateway(HttpMessageHandler? handler = null, string? testToken = null)
     {
-        token = testToken ?? ReadDedicatedToken() ?? "";
-        if (string.IsNullOrWhiteSpace(token))
-            throw new InvalidOperationException("Dedicated GitHub publication credential missing.");
+        this.testToken = testToken;
         client = new HttpClient(handler ?? new HttpClientHandler { AllowAutoRedirect = false })
         {
             Timeout = TimeSpan.FromSeconds(20)
@@ -41,7 +40,8 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
     {
         using var request = new HttpRequestMessage(method,
             "https://api.github.com/repos/" + GitHubIssueGateway.Repository + "/" + path);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer",
+            token ?? throw new InvalidOperationException("Publication credential not resolved."));
         request.Headers.UserAgent.ParseAdd("HaMi-AI-Engineering-Agent/0.1");
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
         request.Headers.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28");
@@ -85,6 +85,9 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
             repo, resultsRoot, job, issue, approvedBase, authorized);
         var attempt = DevelopmentPublicationPolicy.RequireSuccessfulAttempt(job, issue, approvedBase);
         var evidence = attempt.ProductionEvidence!;
+        token = testToken ?? ReadDedicatedToken();
+        if (string.IsNullOrWhiteSpace(token))
+            throw new InvalidOperationException("Dedicated GitHub publication credential missing.");
         string branch = "hami-agent/job-" + job.JobId;
         string marker = "<!-- hami-agent-job:" + job.JobId + " -->";
         await RequireBaseAsync(approvedBase, ct);
@@ -213,5 +216,9 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
         return number > 0 ? number : throw new InvalidOperationException("Invalid pull request number.");
     }
 
-    public void Dispose() => client.Dispose();
+    public void Dispose()
+    {
+        token = null;
+        client.Dispose();
+    }
 }
