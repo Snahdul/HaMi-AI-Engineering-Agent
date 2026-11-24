@@ -25,13 +25,15 @@ internal sealed record DevelopmentSandboxAttempt(
     bool TimedOut, bool CleanupSucceeded, string Feedback, string? ReportPath,
     string? InfrastructureError = null, bool? OutputAccepted = null,
     string? CandidateWorktree = null, string? DiffPath = null,
-    bool SourceRejected = false);
+    bool SourceRejected = false,
+    DevelopmentProductionVerifier.ProductionReport? ProductionEvidence = null);
 
 internal sealed record DevelopmentJobAttempt(
     int Number, string Status, int RestoreExitCode, int BuildExitCode,
     int RunExitCode, bool TimedOut, bool CleanupSucceeded, string? ReportPath,
     bool? OutputAccepted = null,
-    string? CandidateWorktree = null, string? DiffPath = null);
+    string? CandidateWorktree = null, string? DiffPath = null,
+    DevelopmentProductionVerifier.ProductionReport? ProductionEvidence = null);
 
 internal sealed record DevelopmentJobReport(
     string JobId, string Status, int ModelCalls, DevelopmentJobAttempt[] Attempts,
@@ -201,7 +203,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 result.BuildExitCode == 0 && result.RunExitCode == 0
                     && result.CleanupSucceeded && result.InfrastructureError is null
                     ? result.OutputAccepted : null,
-                result.CandidateWorktree, result.DiffPath));
+                result.CandidateWorktree, result.DiffPath,
+                status == "passed" ? result.ProductionEvidence : null));
 
             // A coordinator deadline stops NEW attempts, but must not stop the
             // actor or its host until the already-running sbx task has returned
