@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 
@@ -97,6 +98,34 @@ internal sealed class DevelopmentIssueWorkflow(
     IDevelopmentIssueGateway gateway, ApprovedDevelopmentIssue issue, string jobId,
     bool allowFollowUps)
 {
+    internal static async Task VerifyOriginAsync(string repo)
+    {
+        // Pin the repository identity; an arbitrary local checkout must not
+        // publish records to the trusted HaMi engineering repository.
+        var start = new ProcessStartInfo("git")
+        {
+            UseShellExecute = false, RedirectStandardOutput = true,
+            RedirectStandardError = true, CreateNoWindow = true
+        };
+        foreach (string part in new[] { "-C", repo, "remote", "get-url", "origin" })
+            start.ArgumentList.Add(part);
+        using Process process = Process.Start(start)
+            ?? throw new InvalidOperationException("Git executable unavailable for origin verification.");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        Task<string> output = process.StandardOutput.ReadToEndAsync(timeout.Token);
+        Task<string> diagnostics = process.StandardError.ReadToEndAsync(timeout.Token);
+        await process.WaitForExitAsync(timeout.Token);
+        string origin = (await output).Trim();
+        _ = await diagnostics; // Never include remote stderr in logs.
+        if (process.ExitCode != 0 || origin is not (
+            "https://github.com/Snahdul/HaMi-AI-Engineering-Agent.git" or
+            "https://github.com/Snahdul/HaMi-AI-Engineering-Agent" or
+            "git@github.com:Snahdul/HaMi-AI-Engineering-Agent.git" or
+            "ssh://git@github.com/Snahdul/HaMi-AI-Engineering-Agent.git"))
+            throw new InvalidOperationException(
+                "Checkout origin does not match approved HaMi Agent GitHub repository.");
+    }
+
     internal string Marker => "<!-- hami-agent-job:" + jobId + " -->";
 
     internal async Task PublishStartedAsync(CancellationToken ct)
