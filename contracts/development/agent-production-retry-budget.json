@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "taskId": "production-retry-budget",
+  "description": "Refine the real RetryBudget.HasAnotherAttempt expression to the simplest correct one-based retry rule. Return only one complete C# expression, not a method, file, command, code fence, or patch. The exact rule is: a retry is permitted only when attempt is at least 1, maxCalls is at least 1, and attempt is strictly less than maxCalls. Preserve behavior for negative, zero and positive inputs. The host alone replaces the expression in the trusted source and tests it against 268 independent boundary cases in an isolated offline MicroVM. Rewrite the production expression rather than repeating the current exact spelling.",
+  "targetFramework": "net11.0",
+  "projectFile": "samples/RetryBudget/RetryBudget.csproj",
+  "sourceFile": "src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs",
+  "scopeContract": "contracts/development/agent-production-retry-budget-scope.json",
+  "mode": "run",
+  "expectedStdout": "RetryBudget: 268 tests, 0 failures.",
+  "maxAttempts": 2,
+  "acceptanceCriteria": [
+    "One bounded expression; only identifiers attempt and maxCalls and approved operators are allowed.",
+    "Change the exact RetryBudget method expression in a detached worktree; no other production path changes.",
+    "Unchanged host-owned RetryBudget tests must report exactly RetryBudget: 268 tests, 0 failures.",
+    "Confirm fresh offline MicroVM cleanup before accepting success or retrying."
+  ]
+}
