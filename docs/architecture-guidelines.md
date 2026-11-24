@@ -250,3 +250,12 @@ Review/Freigabe geändert.
 5. **Isoliertes Ergebnis**: Worktree auf I: (ReFS), nachvollziehbarer Bericht; Integration nach `main` ausschließlich nach menschlicher Entscheidung.
 
 **Aktueller Stand (Issue #19):** Die Coding-Aufträge führen echte C#-Builds und feste Tests für zwei eng begrenzte Ausdrücke aus. Der optionale `IChatClient`-Transport ist auf HaMi11 erprobt. Der PR-Workflow prüft zusätzlich die Formatierung und aktivierten Analyzer der **geänderten produktiven C#-Dateien** nicht-mutierend (`dotnet format ... --verify-no-changes`); bei reinen Konfigurationsänderungen läuft ein fester Smoke-Test. Die `.editorconfig` aktiviert zunächst nur CA2200 und CA2016 und erzwingt bewusst **keine** Umwandlung von LF/CRLF. Sample-Projekte, globale Bestandsbereinigung und allgemeine Codegenerierung sind von diesem ersten Gate nicht abgedeckt. Die Ausführung beliebigen generierten Codes benötigt weiterhin eine OS-Sandbox und zusätzliche Prüfungen.
+
+
+## Issue-getriebene Codeerzeugung (Pilot #40)
+
+Ein begrenzter GitHub-Issues-Adapter auf der Host-Seite erweitert den bestehenden Development-Vertical-Slice. Ein geprüftes Issue liefert fachliche Ziele und Akzeptanzkriterien, aber niemals Toolrechte, erlaubte Dateien oder Sandbox-/Retry-Grenzen. Die versionierte Contract-Definition bleibt verbindlich.
+
+Der Agent führt genau den bisherigen Akka-/Sandbox-Job aus und dokumentiert dessen Ergebnis mit korrelierter Job-ID als einen aktualisierbaren Issue-Kommentar. Detaillierte Logs und Rohdiagnosen bleiben lokal. Nur ein ausdrücklich freigegebener Publish-Modus darf Schreibzugriffe ausführen; gegebenenfalls notwendige Folgeaufträge beginnen als neue offene Issues ohne autonome Ausführung.
+
+GitHub Projects #2 wird weiter durch vorhandene Label-/PR-Actions gepflegt, nicht von einem zweiten Statussystem im Agenten.
