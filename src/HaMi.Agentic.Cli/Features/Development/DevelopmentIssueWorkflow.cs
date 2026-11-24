@@ -217,7 +217,7 @@ internal sealed class DevelopmentIssueWorkflow(
 
     private async Task UpsertAsync(string body, CancellationToken ct)
     {
-        int? id = await gateway.FindJobCommentAsync(issue.Number, Marker, ct);
+        long? id = await gateway.FindJobCommentAsync(issue.Number, Marker, ct);
         if (id.HasValue)
             await gateway.UpdateCommentAsync(id.Value, body, ct);
         else
