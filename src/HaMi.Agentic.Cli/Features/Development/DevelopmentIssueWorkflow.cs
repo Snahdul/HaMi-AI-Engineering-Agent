@@ -199,6 +199,8 @@ internal sealed class DevelopmentIssueWorkflow(
         if (status == "exhausted")
             body.AppendLine("- Entscheidung: Retry-Budget ausgeschöpft; keine automatische Budgeterhöhung.");
         body.AppendLine("- Technischer Nachweis: lokaler agent-report.json, Serilog und Sandbox-Reports");
+        if (report.DraftPullRequestNumber is > 0)
+            body.AppendLine("- Draft-PR: #" + report.DraftPullRequestNumber.Value);
         body.AppendLine("- Freigabe: menschliches Review erforderlich; kein automatischer Merge");
         body.AppendLine();
         body.AppendLine("_Automatisch generierte Statuszusammenfassung; keine Rohlogs, Prompts, Pfade oder Zugangsdaten._");
