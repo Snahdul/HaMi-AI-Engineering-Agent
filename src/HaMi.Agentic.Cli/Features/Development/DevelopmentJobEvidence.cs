@@ -262,6 +262,31 @@ internal static class DevelopmentJobEvidence
             throw new InvalidOperationException("Recovery report projection readback failed.");
     }
 
+    // Only the already confirmed PR number is supplied by the private
+    // state. Preserve an abandoned projection file without interpreting
+    // its contents as a job checkpoint; then regenerate from sealed bytes.
+    internal static void RepairPublishedProjection(DevelopmentJobIdentity identity,
+        DevelopmentJobReport original, int pull)
+    {
+        if (pull <= 0 || original.DraftPullRequestNumber is not null
+            || original.JobId != identity.JobId || original.IssueNumber != identity.IssueNumber)
+            throw new InvalidOperationException("Published report projection identity rejected.");
+        string path = Path.Combine(JobRoot(identity), "agent-report.json");
+        string next = path + ".next";
+        if (new FileInfo(next).LinkTarget is not null || Directory.Exists(next))
+            throw new InvalidOperationException("Interrupted projection path rejected.");
+        if (File.Exists(next))
+        {
+            RejectLinks(next, directory: false);
+            string preserved = path + ".interrupted";
+            if (File.Exists(preserved) || Directory.Exists(preserved)
+                || new FileInfo(preserved).LinkTarget is not null)
+                throw new InvalidOperationException("Interrupted projection preservation path occupied.");
+            File.Move(next, preserved, overwrite: false);
+        }
+        WriteProjection(identity, original with { DraftPullRequestNumber = pull });
+    }
+
     private static void WriteNew(string path, byte[] bytes)
     {
         RejectLinks(Path.GetDirectoryName(path)!, directory: true);
