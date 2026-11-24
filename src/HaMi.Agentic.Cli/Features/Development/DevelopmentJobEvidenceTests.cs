@@ -130,6 +130,13 @@ internal static class DevelopmentJobEvidenceTests
                     throw new InvalidOperationException("Interrupted report projection was not preserved.");
             }
 
+            DevelopmentJobEvidence.RepairPublishedProjection(identity, job, 59);
+            if (!File.ReadAllBytes(originalPath).SequenceEqual(original)
+                || File.Exists(next)
+                || File.ReadAllText(projection + ".interrupted") != "Interrupted report projection"
+                || JsonSerializer.Deserialize<DevelopmentJobReport>(File.ReadAllBytes(projection), JsonOptions)?.DraftPullRequestNumber != 59)
+                throw new InvalidOperationException("Published projection repair lost original or interrupted evidence.");
+
             DevelopmentJobAttempt Fixture(int attempt, bool passed)
             {
                 string number = attempt.ToString("D2", System.Globalization.CultureInfo.InvariantCulture);
