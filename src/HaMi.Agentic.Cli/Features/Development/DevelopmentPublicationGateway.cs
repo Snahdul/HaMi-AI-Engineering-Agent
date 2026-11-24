@@ -15,13 +15,25 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
     private readonly string token;
     internal DevelopmentPublicationGateway(HttpMessageHandler? handler = null, string? testToken = null)
     {
-        token = testToken ?? WindowsIssueCredentialStore.ReadPublication() ?? "";
+        token = testToken ?? ReadDedicatedToken() ?? "";
         if (string.IsNullOrWhiteSpace(token))
             throw new InvalidOperationException("Dedicated GitHub publication credential missing.");
         client = new HttpClient(handler ?? new HttpClientHandler { AllowAutoRedirect = false })
         {
             Timeout = TimeSpan.FromSeconds(20)
         };
+    }
+
+    internal const string TokenVariable = "HAMI_AGENT_GITHUB_PUBLICATION_TOKEN";
+
+    private static string? ReadDedicatedToken()
+    {
+        // A trusted host or Actions step can explicitly inject a dedicated
+        // token on any OS. Windows interactive use retains its secure store.
+        // Never fall back to GITHUB_TOKEN, GH_TOKEN or the Issues token.
+        string? injected = Environment.GetEnvironmentVariable(TokenVariable);
+        if (injected is not null) return injected;
+        return OperatingSystem.IsWindows() ? WindowsIssueCredentialStore.ReadPublication() : null;
     }
 
     private async Task<JsonDocument?> SendAsync(HttpMethod method, string path,
