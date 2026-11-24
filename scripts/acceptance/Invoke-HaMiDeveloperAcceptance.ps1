@@ -158,7 +158,7 @@ if ($contract.taskId -eq 'sandbox-pair') {
         $actualFiles = @(
             Get-ChildItem -LiteralPath $candidate -File -Recurse |
                 ForEach-Object {
-                    [IO.Path]::GetRelativePath($candidate, $_.FullName).Replace('\', '/')
+                    $_.FullName.Substring($candidate.Length).TrimStart('\', '/').Replace('\', '/')
                 }
         )
         $expectedFiles = @('Demo.csproj', 'Program.cs') + $allowed
