@@ -140,6 +140,10 @@ try {
             $arguments += $files
             & dotnet @arguments
             if ($LASTEXITCODE -ne 0) { throw "Microsoft formatter failed for $project (exit $LASTEXITCODE)." }
+            if ($Mode -eq 'Apply') {
+                & dotnet @arguments --verify-no-changes
+                if ($LASTEXITCODE -ne 0) { throw "Formatter verification failed for $project." }
+            }
         }
     }
     catch { $failure = $_ }
