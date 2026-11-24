@@ -138,7 +138,7 @@ internal sealed class DevelopmentIssueWorkflow(
         string body = Marker + "\n### HaMi Developer – Auftrag gestartet\n"
             + "- Issue: #" + issue.Number + "\n"
             + "- Job: " + jobId + "\n"
-            + "- Auftrag: geprüft und auf den versionierten Demo-Contract begrenzt\n"
+            + "- Auftrag: geprüft und auf den versionierten Agent-Contract begrenzt\n"
             + "- Generierung: " + (liveGeneration ? "live (API-Kosten möglich)" : "offline-scripted") + "\n"
             + "- Status: **In Progress**\n"
             + "- Nächster Schritt: isolierte Codegenerierung und Prüfung\n\n"
