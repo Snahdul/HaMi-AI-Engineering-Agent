@@ -759,8 +759,10 @@ unter dem Namen `HaMi-AI-Engineering-Agent/GitHub-Issues/Snahdul`.
 Der zweite Befehl meldet nur `available` oder `missing`, niemals den
 Tokenwert. Das Token wird nicht als GitHub-CLI-Login, Prozess-/Benutzer-
 Umgebungsvariable, Kommandozeilenargument oder Datei gespeichert.
-Der Windows-Credential-Manager-Eintrag hat Vorrang vor einem optionalen
-temporären `HAMI_AGENT_GITHUB_TOKEN`-Fallback. Weder Host-Protokolle noch
+Auf Windows wird **ausschließlich** der dedizierte Credential-Manager-Eintrag
+akzeptiert (kein Fallback auf persönliche CLI- oder Prozess-Tokens).
+Auf anderen Betriebssystemen kann weiterhin eine gesonderte temporäre
+`HAMI_AGENT_GITHUB_TOKEN`-Variable verwendet werden. Weder Host-Protokolle noch
 MicroVMs erhalten den Tokenwert.
 
 Bei einer Rotation den Befehl `config --store-github-issues-token` erneut
