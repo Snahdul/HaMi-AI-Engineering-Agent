@@ -42,7 +42,7 @@ internal static class CommandLineRouter
         foreach (string name in new[]
         {
             "--self-test", "--contract-check", "--worktree-check",
-            "--sandbox-poc", "--sandbox-poc-self-test", "--sandbox-run",
+            "--production-verify", "--sandbox-poc", "--sandbox-poc-self-test", "--sandbox-run",
             "--sandbox-run-self-test", "--agent-run", "--agent-self-test", "--live",
             "--publish-issue", "--allow-followups"
         }) Add(development, name, flag: true);
@@ -95,6 +95,12 @@ internal static class CommandLineRouter
             || valid.Parse(["development", "--repo", ".", "--model"]).Errors.Count == 0
             || valid.Parse(["development", "--repo", ".", "--agent-run", "--results-dir", "C:/reports",
                 "--issue", "42", "--publish-issue", "--allow-followups"]).Errors.Count != 0
+            || valid.Parse(["development", "--repo", ".", "--production-verify",
+                "--contract", DevelopmentProductionVerifier.ContractPath,
+                "--worktree", "G:/candidate", "--results-dir", "G:/reports"]).Errors.Count != 0
+            || valid.Parse(["development", "--repo", ".", "--production-verify",
+                "--contract", DevelopmentProductionVerifier.ContractPath,
+                "--worktree", "G:/candidate", "--results-dir"]).Errors.Count == 0
             || valid.Parse(["config", "--store-github-issues-token"]).Errors.Count == 0
             || valid.Parse(["config", "--check-github-issues-token"]).Errors.Count != 0
             || valid.Parse(["development", "--unknown-option"]).Errors.Count == 0
