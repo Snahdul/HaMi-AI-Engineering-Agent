@@ -53,7 +53,7 @@ internal static class DevelopmentProductionVerifier
             "rev-parse", "--verify", "refs/heads/main")).Trim();
 
         string[] changes = await DevelopmentWorktreeGuard.CheckAsync(
-            repo, worktree, ContractPath);
+            repo, worktree, contractPath);
         if (changes.Length != 1 || changes[0] != SourcePath)
             throw new InvalidOperationException(
                 "Production verification requires only a modified RetryBudget.cs.");
@@ -65,18 +65,10 @@ internal static class DevelopmentProductionVerifier
             throw new InvalidOperationException(
                 "Only one unstaged tracked source modification is authorized.");
 
-        DevelopmentContract scope = DevelopmentContract.Parse(
-            await DevelopmentWorktreeGuard.GitAsync(repo, "show",
-                "refs/heads/main:" + ContractPath));
-        bool reviewedDemo = contractPath == ContractPath
-            && scope.TaskId == "retry-budget-refinement"
-            && scope.AllowedWritePaths.SequenceEqual(
-                [SourcePath, OtherAllowedPath], StringComparer.Ordinal);
-        bool reviewedAgent = contractPath == AgentContractPath
-            && scope.TaskId == "production-retry-budget"
-            && scope.AllowedWritePaths.SequenceEqual([SourcePath], StringComparer.Ordinal);
-        if (!reviewedDemo && !reviewedAgent)
-            throw new InvalidOperationException("Production scope changed unexpectedly.");
+        // The exact scope used by the worktree guard MUST also be the scope
+        // independently loaded here. Never substitute the older demo scope
+        // when verifying the production-agent contract.
+        await ValidateReviewedScopeAsync(repo, contractPath);
 
         string baseline = await File.ReadAllTextAsync(ToPath(repo, SourcePath));
         string source = await File.ReadAllTextAsync(ToPath(worktree, SourcePath));
@@ -163,6 +155,53 @@ internal static class DevelopmentProductionVerifier
         Console.WriteLine("Local review diff: " + diffPath);
         Console.WriteLine("Local evidence: " + evidencePath);
         return passed ? 0 : 1;
+    }
+
+    internal static async Task ValidateReviewedScopeAsync(string repository, string contractPath)
+    {
+        if (contractPath is not (ContractPath or AgentContractPath))
+            throw new InvalidOperationException("Unreviewed production verification contract.");
+        DevelopmentContract scope = DevelopmentContract.Parse(
+            await DevelopmentWorktreeGuard.GitAsync(repository, "show",
+                "refs/heads/main:" + contractPath));
+        ValidateReviewedScope(contractPath, scope);
+    }
+
+    internal static void ValidateReviewedScope(string contractPath, DevelopmentContract scope)
+    {
+        bool reviewedDemo = contractPath == ContractPath
+            && scope.TaskId == "retry-budget-refinement"
+            && scope.AllowedWritePaths.SequenceEqual(
+                [SourcePath, OtherAllowedPath], StringComparer.Ordinal);
+        bool reviewedAgent = contractPath == AgentContractPath
+            && scope.TaskId == "production-retry-budget"
+            && scope.AllowedWritePaths.SequenceEqual([SourcePath], StringComparer.Ordinal);
+        if (!reviewedDemo && !reviewedAgent)
+            throw new InvalidOperationException("Production scope changed unexpectedly.");
+    }
+
+    internal static async Task ScopeSelfTestAsync(string repo)
+    {
+        // Use the actual committed Git objects, not checked-out JSON, to
+        // detect path confusion BEFORE creating any snapshot or MicroVM.
+        await ValidateReviewedScopeAsync(repo, ContractPath);
+        await ValidateReviewedScopeAsync(repo, AgentContractPath);
+        string agentJson = await DevelopmentWorktreeGuard.GitAsync(
+            repo, "show", "refs/heads/main:" + AgentContractPath);
+        string demoJson = await DevelopmentWorktreeGuard.GitAsync(
+            repo, "show", "refs/heads/main:" + ContractPath);
+        DevelopmentContract agentScope = DevelopmentContract.Parse(agentJson);
+        DevelopmentContract demoScope = DevelopmentContract.Parse(demoJson);
+        ExpectRejected(() => ValidateReviewedScope(ContractPath, agentScope));
+        ExpectRejected(() => ValidateReviewedScope(AgentContractPath, demoScope));
+        ExpectRejected(() => ValidateReviewedScope("contracts/development/unknown.json", agentScope));
+    }
+
+    private static void ExpectRejected(Action action)
+    {
+        try { action(); }
+        catch (InvalidOperationException) { return; }
+        throw new InvalidOperationException("Wrong production scope was accepted.");
     }
 
     internal static void ValidateSourceChange(string baseline, string candidate)
