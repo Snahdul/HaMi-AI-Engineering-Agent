@@ -83,9 +83,21 @@ diagnostics back as data, the second attempt produces
 all 268 independent tests. Both guests must be independently verified
 as removed by `sbx inspect`.
 
-The acceptance script keeps the local mirror and both candidate worktrees
-for inspection; it refuses to overwrite a mismatched mirror. A rerun with
-an unchanged mirror is supported and starts a new, isolated job.
+The acceptance script keeps the local mirror and all candidate worktrees
+for inspection. If a previous PR test ended after creating a candidate
+but before starting a MicroVM, the next run **fast-forwards the clean
+review mirror to the updated reviewed PR commit** and starts a fresh,
+separate agent job. It does not overwrite the previous detached candidate,
+reuse its failed state, reset, force-update or delete any worktree. A
+different origin, modified mirror checkout, unexpected branch, or
+non-fast-forward commit causes an immediate safe rejection.
+
+The offline self-test prints `PASS - erwartete Ablehnung` for a deliberately
+blocked results path; this expected security check is **not a job failure**.
+Any real pre-MicroVM production error now carries a fixed, safe stage code
+such as `PRODUCTION_SCOPE_AND_MICROVM` without exposing raw model or
+guest diagnostics.
+
 No GitHub writes or live model invocation occur.
 
 ## Production execution after merge
