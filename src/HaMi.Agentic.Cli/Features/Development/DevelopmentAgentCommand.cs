@@ -77,7 +77,8 @@ internal static class DevelopmentAgentCommand
                 ? new DevelopmentAiGenerator(client!, requestedModel ?? "gpt-5.4-mini")
                 : new DevelopmentScriptedGenerator();
             IDevelopmentIsolatedRunner sandbox =
-                new DevelopmentIsolatedRunner(repo, source, runRoot);
+                new DevelopmentIsolatedRunner(repo, source, runRoot, logger, jobId,
+                    logging.Settings.LogSuccessfulSteps);
 
             phase = "host";
             HostApplicationBuilder builder = Host.CreateApplicationBuilder();
