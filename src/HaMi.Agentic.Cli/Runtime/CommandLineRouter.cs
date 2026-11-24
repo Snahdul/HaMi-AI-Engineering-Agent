@@ -37,7 +37,7 @@ internal static class CommandLineRouter
         foreach (string name in new[]
         {
             "--repo", "--results-dir", "--source", "--project", "--mode",
-            "--contract", "--worktree", "--model", "--issue", "--publication-base"
+            "--contract", "--worktree", "--model", "--issue", "--publication-base", "--agent-resume"
         }) Add(development, name);
         foreach (string name in new[]
         {
@@ -93,6 +93,9 @@ internal static class CommandLineRouter
             || valid.Parse(["coding", "--repo", ".", "--unattended", "--task", "clamp-kata"]).Errors.Count != 0
             || valid.Parse(["workflow", "--repo", ".", "--manifest", "workflows/mvp02.json", "--validate"]).Errors.Count != 0
             || valid.Parse(["development", "--repo", ".", "--model"]).Errors.Count == 0
+            || valid.Parse(["development", "--repo", ".", "--agent-resume", new string('a', 32),
+                "--publish-draft", "--publication-base", new string('b', 40)]).Errors.Count != 0
+            || valid.Parse(["development", "--repo", ".", "--agent-resume"]).Errors.Count == 0
             || valid.Parse(["development", "--repo", ".", "--agent-run", "--results-dir", "C:/reports",
                 "--issue", "42", "--publish-issue", "--allow-followups"]).Errors.Count != 0
             || valid.Parse(["development", "--repo", ".", "--production-verify",

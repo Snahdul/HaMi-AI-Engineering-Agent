@@ -441,6 +441,37 @@ internal static class DevelopmentSandboxRunner
             && !path.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
             && !Path.IsPathRooted(path));
 
+    // Reentry must independently confirm absence, not merely trust the old
+    // rm result. This is a read-only command; never create, exec or remove.
+    internal static async Task RequireRemovedAsync(string runId)
+    {
+        string name = RecoverySandboxName(runId);
+        SandboxProcess result = await SbxAsync(TimeSpan.FromSeconds(30), "inspect", name);
+        if (!IsConfirmedAbsent(runId, result.ExitCode, result.Output, result.Error))
+            throw new InvalidOperationException("Recovery sandbox absence not confirmed.");
+    }
+
+    private static string RecoverySandboxName(string runId)
+    {
+        if (!DevelopmentPublicationPolicy.IsSha(runId, 32) || runId != runId.ToLowerInvariant())
+            throw new InvalidOperationException("Recovery sandbox run identity rejected.");
+        return "hami-code-" + runId[..12];
+    }
+
+    internal static bool IsConfirmedAbsent(string runId, int exitCode, string output, string error)
+    {
+        string name = RecoverySandboxName(runId);
+        if (exitCode == 0)
+            return false;
+        // Observed on HaMi11: sbx reports the exact sandbox name followed
+        // by 'not found', with optional wrapping and the fixed CLI hint.
+        // Reject other errors (backend unavailable, permission, timeout).
+        string diagnostic = (output + "\n" + error).Trim();
+        return Regex.IsMatch(diagnostic, @"\Aerror:\s+sandbox\s+'" + Regex.Escape(name)
+            + @"'\s+not\s+found(?:\s+try:\s+sbx\s+ls)?\s*\z",
+            RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+    }
+
     private static void ValidateInspect(SandboxProcess result, string sandbox)
     {
         EnsureSuccess(result, "Inspect sandbox");

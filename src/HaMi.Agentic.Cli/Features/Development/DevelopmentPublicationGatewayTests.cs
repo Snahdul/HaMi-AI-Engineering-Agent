@@ -14,12 +14,12 @@ internal static class DevelopmentPublicationGatewayTests
     {
         const string oneBased = "attempt >= 1 && maxCalls >= 1 && attempt < maxCalls";
         const string positive = "attempt > 0 && maxCalls > 0 && attempt < maxCalls";
-        await SelfTestVariantAsync(repository, oneBased, positive);
-        await SelfTestVariantAsync(repository, positive, oneBased);
+        await SelfTestVariantAsync(repository, oneBased, positive, recoveryMatrix: true);
+        await SelfTestVariantAsync(repository, positive, oneBased, recoveryMatrix: false);
     }
 
     private static async Task SelfTestVariantAsync(string repository,
-        string baselineExpression, string candidateExpression)
+        string baselineExpression, string candidateExpression, bool recoveryMatrix)
     {
         string root = Path.Combine(Path.GetTempPath(), "hami-publish-" + Guid.NewGuid().ToString("N"));
         string repo = Path.Combine(root, "repo");
@@ -38,7 +38,7 @@ internal static class DevelopmentPublicationGatewayTests
             await Git(repo, "remote", "add", "origin",
                 "https://github.com/" + GitHubIssueGateway.Repository + ".git");
             foreach (string path in new[] { sourcePath, DevelopmentAgentContract.ProductionScopePath,
-                DevelopmentPublicationPolicy.PolicyPath })
+                DevelopmentPublicationPolicy.PolicyPath, DevelopmentAgentContract.ProductionPath })
             {
                 string target = Local(repo, path);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
@@ -117,15 +117,38 @@ internal static class DevelopmentPublicationGatewayTests
             transport.InterruptPull = true;
             await RejectAsync(() => Publish());
             transport.InterruptPull = false;
+            int postsBeforeRecovery = transport.Posts;
             if (await Publish() != 99 || await Publish() != 99
+                || transport.Posts != postsBeforeRecovery
                 || transport.BranchCreates != 1 || transport.PullCreates != 1)
                 throw new InvalidOperationException("Publication is not idempotent after interruption.");
             transport.Conflict = true;
             await RejectAsync(() => Publish());
-            if (transport.BranchCreates != 1 || transport.PullCreates != 1
+            if (transport.Posts != postsBeforeRecovery || transport.BranchCreates != 1 || transport.PullCreates != 1
                 || (await Git(repo, "status", "--porcelain")).Length != 0
                 || (await Git(repo, "rev-parse", "HEAD")).Trim() != baseline)
                 throw new InvalidOperationException("Conflict modified publication or baseline.");
+            if (recoveryMatrix)
+            {
+                transport.Conflict = false;
+                foreach (string conflict in new[] { "closed", "ready", "body", "multiple", "missing-ref" })
+                {
+                    transport.PullConflict = conflict;
+                    await RejectAsync(() => Publish());
+                    if (transport.Posts != postsBeforeRecovery)
+                        throw new InvalidOperationException("Conflicting existing PR caused remote writes.");
+                }
+                transport.PullConflict = null;
+                transport.TamperedTree = true;
+                await RejectAsync(() => Publish());
+                transport.TamperedTree = false;
+                transport.ConflictingCommit = true;
+                await RejectAsync(() => Publish());
+                if (transport.Posts != postsBeforeRecovery)
+                    throw new InvalidOperationException("Conflicting existing tree or commit caused remote writes.");
+                transport.ConflictingCommit = false;
+                await VerifyRecoveryAsync(repo, results, root, baseline, changed);
+            }
         }
         finally
         {
@@ -137,6 +160,243 @@ internal static class DevelopmentPublicationGatewayTests
                     File.SetAttributes(file, FileAttributes.Normal);
                 Directory.Delete(root, true);
             }
+        }
+    }
+
+    // Reuse the disposable real Git baseline. Only the external issue,
+    // sandbox inspection and GitHub HTTP boundaries are controlled fixtures.
+    // No real credential, model, build, guest or remote write is involved.
+    private static async Task VerifyRecoveryAsync(string repo, string results, string root,
+        string baseline, string changed)
+    {
+        string jobId = new('a', 32);
+        string runId = new('f', 32);
+        const int issueNumber = 77;
+        string sourcePath = DevelopmentProductionVerifier.SourcePath;
+        bool revoked = false, changedTask = false, unknownCleanup = false;
+        int reads = 0, inspections = 0, publisherStarts = 0;
+
+        Task<JsonDocument> ReadIssue(int number)
+        {
+            if (number != issueNumber)
+                throw new Exception("Recovery used a different issue.");
+            reads++;
+            return Task.FromResult(JsonDocument.Parse(JsonSerializer.Serialize(new
+            {
+                number,
+                state = revoked ? "closed" : "open",
+                user = new { login = "Snahdul" },
+                labels = new[] { new { name = "workflow:in-progress" } },
+                title = "Approved recovery fixture",
+                body = "HaMi-Agent-Task: production-retry-budget\n\n### Ziel und Nutzen\n"
+                    + (changedTask ? "Changed approved business goal." : "Preserve the approved retry behavior.")
+                    + "\n\n### Akzeptanzkriterien\n- Preserve the retry semantics."
+            })));
+        }
+
+        Task Inspect(string id)
+        {
+            if (id != runId)
+                throw new Exception("Recovery inspected the wrong sandbox.");
+            inspections++;
+            if (unknownCleanup)
+                throw new InvalidOperationException("Fixture sandbox absence not confirmed.");
+            return Task.CompletedTask;
+        }
+
+        var contract = DevelopmentAgentContract.Load(repo, DevelopmentAgentContract.ProductionPath);
+        using var approvedJson = await ReadIssue(issueNumber);
+        var issue = ApprovedDevelopmentIssue.Parse(approvedJson.RootElement, contract);
+        var identity = await DevelopmentJobIdentityFactory.CreateAsync(repo, results, jobId, issueNumber,
+            issue, issue.Bind(contract), baseline, false);
+        string jobRoot = DevelopmentJobEvidence.JobRoot(identity);
+        string candidate = Path.Combine(jobRoot, "worktrees", "01");
+        string production = Path.Combine(jobRoot, "evaluations", "01", "production-check-" + new string('e', 32));
+        string sandbox = Path.Combine(production, "sandbox", "reports", "hami-code-" + runId);
+        string patch = Path.Combine(production, "candidate.patch");
+        string sandboxReport = Path.Combine(sandbox, "report.json");
+        string originalPath = Path.Combine(jobRoot, DevelopmentJobEvidence.OriginalReportName);
+        string projection = Path.Combine(jobRoot, "agent-report.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(candidate)!);
+        Directory.CreateDirectory(sandbox);
+        await Git(repo, "worktree", "add", "--detach", candidate, baseline);
+        try
+        {
+            string source = Local(candidate, sourcePath);
+            await File.WriteAllTextAsync(source, changed);
+            await File.WriteAllTextAsync(patch, await Git(candidate, "diff", "--no-ext-diff", "--no-textconv", "--", sourcePath));
+            string snapshot = Local(Path.Combine(production, "snapshot"), sourcePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(snapshot)!);
+            File.Copy(source, snapshot);
+            var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+            var evidence = new DevelopmentProductionVerifier.ProductionReport("passed",
+                baseline, sourcePath, DevelopmentProductionVerifier.FileHash(source), patch, sandboxReport,
+                0, 0, 0, true, true, true, DevelopmentProductionVerifier.FileHash(patch));
+            await File.WriteAllTextAsync(Path.Combine(production, "production-report.json"),
+                JsonSerializer.Serialize(evidence, jsonOptions));
+            await File.WriteAllTextAsync(sandboxReport, JsonSerializer.Serialize(
+                new DevelopmentSandboxRunner.SandboxRunReport(1, runId, "samples/RetryBudget/RetryBudget.csproj",
+                    "run", 0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null), jsonOptions));
+            await File.WriteAllTextAsync(Path.Combine(sandbox, "execution.log"),
+                DevelopmentOutputAcceptance.ReviewedProductionStdout);
+            var attempt = new DevelopmentJobAttempt(1, "passed", 0, 0, 0, false, true,
+                sandboxReport, true, candidate, patch, evidence);
+            var job = new DevelopmentJobReport(jobId, "passed", 1, [attempt], null, issueNumber);
+            string manifestHash = await DevelopmentJobEvidence.SealAsync(repo, identity, job);
+            byte[] original = File.ReadAllBytes(originalPath);
+            byte[] originalManifest = File.ReadAllBytes(Path.Combine(jobRoot, DevelopmentJobEvidence.ManifestName));
+            string[] fullWrites = ["git/blobs", "git/trees", "git/commits", "git/refs", "pulls"];
+
+            int scenario = 0;
+            foreach (string? interrupted in new string?[]
+            {
+                null, "git/blobs", "git/trees", "git/commits", "git/refs", "pulls", "rate-limit"
+            })
+            {
+                string stateRoot = Path.Combine(root, "recovery-state-" + (++scenario));
+                Directory.CreateDirectory(stateRoot);
+                var store = new DevelopmentJobStateStore(stateRoot);
+                var remote = new FakeGitHub(baseline);
+                // Simulate process loss by closing the initial lease. The
+                // durable checkpoint and fake remote effects survive.
+                using (var initial = store.Acquire(issueNumber))
+                {
+                    initial.Claim(DevelopmentJobState.Create(identity));
+                    initial.Commit(initial.RequireCurrent().Start());
+                    initial.Commit(initial.RequireCurrent().Verify(1, 1, manifestHash));
+                    if (interrupted is not null)
+                    {
+                        initial.Commit(initial.RequireCurrent().ReservePublication());
+                        remote.InterruptEndpoint = interrupted;
+                        remote.RateLimited = interrupted == "rate-limit";
+                        using var publisher = remote.OpenPublisher();
+                        await RejectAsync(() => publisher.PublishAsync(repo, results, job, issueNumber,
+                            baseline, true, CancellationToken.None), remote.RateLimited
+                                ? "Publication API rejected request: HTTP 429"
+                                : "Publication API rejected request: HTTP 503");
+                    }
+                }
+
+                remote.InterruptEndpoint = null;
+                remote.RateLimited = false;
+                int previousPosts = remote.Posts;
+                int expectedReservations = interrupted is null ? 1 : 2;
+                using (var owner = store.AcquireJob(jobId))
+                {
+                    Task<int> Resume(string approvedBase = "") =>
+                        DevelopmentRecoveryCommand.ResumeOwnedAsync(repo, owner,
+                            approvedBase == "" ? baseline : approvedBase, ReadIssue, Inspect, () =>
+                            {
+                                publisherStarts++;
+                                var pending = owner.RequireCurrent();
+                                if (pending.Stage != DevelopmentJobState.PublicationPending
+                                    || pending.PublicationAttempts != expectedReservations
+                                    || pending.Identity.JobId != jobId)
+                                    throw new Exception("Publication started before durable reservation.");
+                                return remote.OpenPublisher();
+                            });
+
+                    var before = owner.RequireCurrent();
+                    if (before.Identity != identity || before.ModelCalls != 1 || before.Attempts != 1
+                        || before.PublicationAttempts != expectedReservations - 1)
+                        throw new InvalidOperationException("Original recovery identity or budget was lost.");
+
+                    // The same production reentry use case must reject these
+                    // cases before the publication boundary is constructed.
+                    if (interrupted is null)
+                    {
+                        int beforeStarts = publisherStarts;
+                        await RejectAsync(() => Resume(new string('c', 40)));
+                        changedTask = true;
+                        await RejectAsync(() => Resume());
+                        changedTask = false;
+                        revoked = true;
+                        await RejectAsync(() => Resume());
+                        revoked = false;
+                        unknownCleanup = true;
+                        await RejectAsync(() => Resume());
+                        unknownCleanup = false;
+                        if (publisherStarts != beforeStarts || remote.Calls != 0
+                            || owner.RequireCurrent() != before)
+                            throw new InvalidOperationException("Rejected recovery reached publication or consumed budget.");
+                    }
+
+                    int previousReads = reads, previousInspections = inspections, previousStarts = publisherStarts;
+                    if (await Resume() != 99)
+                        throw new InvalidOperationException("Recovery returned an unexpected PR.");
+                    string[] expectedWrites = interrupted switch
+                    {
+                        "git/refs" => ["pulls"],
+                        "pulls" => [],
+                        _ => fullWrites
+                    };
+                    var final = owner.RequireCurrent();
+                    if (reads != previousReads + 1 || inspections != previousInspections + 1
+                        || publisherStarts != previousStarts + 1
+                        || !remote.PostPaths.Skip(previousPosts).SequenceEqual(expectedWrites)
+                        || remote.BranchCreates != 1 || remote.PullCreates != 1
+                        || final.Stage != DevelopmentJobState.Published || final.PullRequestNumber != 99
+                        || final.Identity != identity || final.ModelCalls != 1 || final.Attempts != 1
+                        || final.PublicationAttempts != expectedReservations
+                        || !File.ReadAllBytes(originalPath).SequenceEqual(original)
+                        || !File.ReadAllBytes(Path.Combine(jobRoot, DevelopmentJobEvidence.ManifestName)).SequenceEqual(originalManifest))
+                        throw new InvalidOperationException("Recovery did not preserve job identity, evidence or exact remote effect count.");
+                }
+
+                // Simulate the report update being lost after a confirmed
+                // remote publication. The next invocation is local only.
+                File.Delete(projection);
+                using (var published = store.AcquireJob(jobId))
+                {
+                    int repair = await DevelopmentRecoveryCommand.ResumeOwnedAsync(repo, published, baseline,
+                        _ => throw new Exception("Published repair read an issue."),
+                        _ => throw new Exception("Published repair inspected a sandbox."),
+                        () => throw new Exception("Published repair constructed a publisher."));
+                    if (repair != 99 || published.RequireCurrent().PublicationAttempts != expectedReservations
+                        || JsonSerializer.Deserialize<DevelopmentJobReport>(File.ReadAllBytes(projection), jsonOptions)?.DraftPullRequestNumber != 99)
+                        throw new InvalidOperationException("Published recovery did not repair the local projection.");
+                }
+                Console.WriteLine("Recovery regression passed: " + (interrupted ?? "before publication"));
+            }
+
+            // Exhausted publication budget and unknown early execution must
+            // not resolve any remote dependency or create a new job.
+            string terminalRoot = Path.Combine(root, "recovery-terminal-state");
+            Directory.CreateDirectory(terminalRoot);
+            var terminalStore = new DevelopmentJobStateStore(terminalRoot);
+            using (var owner = terminalStore.Acquire(issueNumber))
+            {
+                owner.Claim(DevelopmentJobState.Create(identity));
+                owner.Commit(owner.RequireCurrent().Start());
+                await RejectAsync(() => DevelopmentRecoveryCommand.ResumeOwnedAsync(repo, owner, baseline,
+                    _ => throw new Exception("Unknown execution read an issue."),
+                    _ => throw new Exception("Unknown execution inspected a sandbox."),
+                    () => throw new Exception("Unknown execution constructed a publisher.")));
+                if (owner.RequireCurrent().Stage != DevelopmentJobState.RecoveryBlocked)
+                    throw new InvalidOperationException("Unknown execution was not durably blocked.");
+            }
+
+            string exhaustedRoot = Path.Combine(root, "recovery-budget-state");
+            Directory.CreateDirectory(exhaustedRoot);
+            using (var owner = new DevelopmentJobStateStore(exhaustedRoot).Acquire(issueNumber))
+            {
+                owner.Claim(DevelopmentJobState.Create(identity));
+                owner.Commit(owner.RequireCurrent().Start());
+                owner.Commit(owner.RequireCurrent().Verify(1, 1, manifestHash));
+                for (int i = 0; i < identity.MaxPublicationAttempts; i++)
+                    owner.Commit(owner.RequireCurrent().ReservePublication());
+                var exhausted = owner.RequireCurrent();
+                await RejectAsync(() => DevelopmentRecoveryCommand.ResumeOwnedAsync(repo, owner, baseline,
+                    _ => throw new Exception("Exhausted recovery read an issue."),
+                    _ => throw new Exception("Exhausted recovery inspected a sandbox."),
+                    () => throw new Exception("Exhausted recovery constructed a publisher.")));
+                if (owner.RequireCurrent() != exhausted)
+                    throw new InvalidOperationException("Exhausted recovery budget changed.");
+            }
+        }
+        finally
+        {
+            await Git(repo, "worktree", "remove", "--force", candidate);
         }
     }
 
@@ -163,9 +423,28 @@ internal static class DevelopmentPublicationGatewayTests
         private static readonly string OtherBlob = new('f', 40);
         private string? blob;
         private object? pull;
+        private string? commitMessage;
+        private JsonElement commitAuthor, commitCommitter;
         private bool branch;
-        internal bool Denied, Stale, TamperedTree, InterruptPull, Conflict;
-        internal int Calls, BranchCreates, PullCreates;
+        internal bool Denied, Stale, TamperedTree, InterruptPull, Conflict, RateLimited, ConflictingCommit;
+        internal string? InterruptEndpoint, PullConflict;
+        internal int Calls, Posts, BranchCreates, PullCreates;
+        internal List<string> PostPaths { get; } = [];
+        private readonly Dictionary<string, string> objectPayloads = new(StringComparer.Ordinal);
+
+        // New client/handler per invocation, same simulated remote resources.
+        internal DevelopmentPublicationGateway OpenPublisher() =>
+            new(new Connection(this), "OFFLINE_DUMMY_TOKEN");
+
+        private sealed class Connection(FakeGitHub remote) : HttpMessageHandler
+        {
+            protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
+                remote.SendAsync(request, ct);
+        }
+
+        private HttpResponseMessage AfterEffect(string endpoint, object value) =>
+            InterruptEndpoint == endpoint || (endpoint == "pulls" && InterruptPull)
+                ? Reply(new { }, HttpStatusCode.ServiceUnavailable) : Reply(value);
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
@@ -177,7 +456,13 @@ internal static class DevelopmentPublicationGatewayTests
             string path = request.RequestUri.AbsolutePath[Root.Length..];
             bool get = request.Method == HttpMethod.Get;
             bool post = request.Method == HttpMethod.Post;
+            if (post)
+            {
+                Posts++;
+                PostPaths.Add(path);
+            }
             if (Denied) return Reply(new { }, HttpStatusCode.Forbidden);
+            if (RateLimited) return Reply(new { }, HttpStatusCode.TooManyRequests);
             if (get && path == "git/ref/heads/main")
                 return Reply(new { @object = new { sha = Stale ? OldBlob : baseline } });
             if (get && path == "git/commits/" + baseline)
@@ -196,17 +481,42 @@ internal static class DevelopmentPublicationGatewayTests
                 {
                     sha = Commit,
                     tree = new { sha = NextTree },
-                    parents = new[] { new { sha = baseline } }
+                    parents = new[] { new { sha = baseline } },
+                    message = ConflictingCommit ? "Different job marker" : commitMessage,
+                    author = commitAuthor,
+                    committer = commitCommitter
                 });
+            if (get && path == "git/commits/" + OldBlob)
+                return Reply(new { }, HttpStatusCode.NotFound);
             if (get && path.StartsWith("git/ref/heads/hami-agent/job-", StringComparison.Ordinal))
-                return branch ? Reply(new { @object = new { sha = Conflict ? OldBlob : Commit } })
+                return branch && PullConflict != "missing-ref" ? Reply(new { @object = new { sha = Conflict ? OldBlob : Commit } })
                     : Reply(new { }, HttpStatusCode.NotFound);
             if (get && path == "pulls")
-                return Reply(pull is null ? Array.Empty<object>() : new[] { pull });
+            {
+                if (pull is null) return Reply(Array.Empty<object>());
+                if (PullConflict == "multiple") return Reply(new[] { pull, pull });
+                if (PullConflict is "closed" or "ready" or "body")
+                {
+                    var modified = JsonSerializer.Deserialize<Dictionary<string, object?>>(
+                        JsonSerializer.Serialize(pull))!;
+                    if (PullConflict == "closed") modified["state"] = "closed";
+                    if (PullConflict == "ready") modified["draft"] = false;
+                    if (PullConflict == "body") modified["body"] = "Different evidence";
+                    return Reply(new[] { modified });
+                }
+                return Reply(new[] { pull });
+            }
             if (!post || request.Content is null)
                 throw new Exception("Unexpected publication HTTP operation.");
             using var doc = JsonDocument.Parse(await request.Content.ReadAsStringAsync(ct));
             var data = doc.RootElement;
+            if (path is "git/blobs" or "git/trees" or "git/commits")
+            {
+                string payload = data.GetRawText();
+                if (objectPayloads.TryGetValue(path, out string? previous) && previous != payload)
+                    throw new Exception("Repeated content-addressed object request changed identity.");
+                objectPayloads[path] = payload;
+            }
             switch (path)
             {
                 case "git/blobs":
@@ -214,27 +524,30 @@ internal static class DevelopmentPublicationGatewayTests
                     byte[] header = Encoding.ASCII.GetBytes("blob " + bytes.Length.ToString(
                         System.Globalization.CultureInfo.InvariantCulture) + "\0");
                     blob = Convert.ToHexString(SHA1.HashData(header.Concat(bytes).ToArray())).ToLowerInvariant();
-                    return Reply(new { sha = blob });
+                    return AfterEffect(path, new { sha = blob });
                 case "git/trees":
                     var edit = data.GetProperty("tree");
                     if (data.GetProperty("base_tree").GetString() != BaseTree || edit.GetArrayLength() != 1
                         || edit[0].GetProperty("path").GetString() != DevelopmentProductionVerifier.SourcePath
                         || edit[0].GetProperty("sha").GetString() != blob)
                         throw new Exception("Unexpected tree update.");
-                    return Reply(new { sha = NextTree });
+                    return AfterEffect(path, new { sha = NextTree });
                 case "git/commits":
                     if (data.GetProperty("tree").GetString() != NextTree
                         || data.GetProperty("parents").GetArrayLength() != 1
                         || data.GetProperty("parents")[0].GetString() != baseline)
                         throw new Exception("Unexpected commit creation.");
-                    return Reply(new { sha = Commit });
+                    commitMessage = data.GetProperty("message").GetString();
+                    commitAuthor = data.GetProperty("author").Clone();
+                    commitCommitter = data.GetProperty("committer").Clone();
+                    return AfterEffect(path, new { sha = Commit });
                 case "git/refs":
                     if (branch || data.GetProperty("sha").GetString() != Commit
                         || data.GetProperty("ref").GetString() != "refs/heads/hami-agent/job-" + new string('a', 32))
                         throw new Exception("Unexpected branch creation.");
                     branch = true;
                     BranchCreates++;
-                    return Reply(new { @object = new { sha = Commit } });
+                    return AfterEffect(path, new { @object = new { sha = Commit } });
                 case "pulls":
                     if (pull is not null || !branch || !data.GetProperty("draft").GetBoolean()
                         || data.GetProperty("base").GetString() != "main")
@@ -250,7 +563,7 @@ internal static class DevelopmentPublicationGatewayTests
                         @base = new { @ref = "main", sha = baseline, repo = repository }
                     };
                     PullCreates++;
-                    return InterruptPull ? Reply(new { }, HttpStatusCode.ServiceUnavailable) : Reply(pull);
+                    return AfterEffect(path, pull);
                 default:
                     throw new Exception("Unexpected publication write endpoint.");
             }
