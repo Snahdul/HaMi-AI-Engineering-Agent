@@ -50,8 +50,7 @@ internal static class DevelopmentJobEvidence
     internal static (DevelopmentJobReport Report, Manifest Evidence) ReadVerified(
         DevelopmentJobStateStore.Lease owner)
     {
-        var state = owner.Current
-            ?? throw new InvalidOperationException("Recovery checkpoint missing.");
+        var state = owner.RequireCurrent();
         state.Validate();
         if (state.Stage is not (DevelopmentJobState.CandidateVerified
             or DevelopmentJobState.PublicationPending or DevelopmentJobState.Published))
