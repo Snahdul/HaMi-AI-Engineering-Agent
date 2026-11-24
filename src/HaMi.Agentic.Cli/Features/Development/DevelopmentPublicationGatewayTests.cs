@@ -117,12 +117,14 @@ internal static class DevelopmentPublicationGatewayTests
             transport.InterruptPull = true;
             await RejectAsync(() => Publish());
             transport.InterruptPull = false;
+            int postsBeforeRecovery = transport.Posts;
             if (await Publish() != 99 || await Publish() != 99
+                || transport.Posts != postsBeforeRecovery
                 || transport.BranchCreates != 1 || transport.PullCreates != 1)
                 throw new InvalidOperationException("Publication is not idempotent after interruption.");
             transport.Conflict = true;
             await RejectAsync(() => Publish());
-            if (transport.BranchCreates != 1 || transport.PullCreates != 1
+            if (transport.Posts != postsBeforeRecovery || transport.BranchCreates != 1 || transport.PullCreates != 1
                 || (await Git(repo, "status", "--porcelain")).Length != 0
                 || (await Git(repo, "rev-parse", "HEAD")).Trim() != baseline)
                 throw new InvalidOperationException("Conflict modified publication or baseline.");
@@ -163,9 +165,11 @@ internal static class DevelopmentPublicationGatewayTests
         private static readonly string OtherBlob = new('f', 40);
         private string? blob;
         private object? pull;
+        private string? commitMessage;
+        private JsonElement commitAuthor, commitCommitter;
         private bool branch;
         internal bool Denied, Stale, TamperedTree, InterruptPull, Conflict;
-        internal int Calls, BranchCreates, PullCreates;
+        internal int Calls, Posts, BranchCreates, PullCreates;
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
@@ -177,6 +181,7 @@ internal static class DevelopmentPublicationGatewayTests
             string path = request.RequestUri.AbsolutePath[Root.Length..];
             bool get = request.Method == HttpMethod.Get;
             bool post = request.Method == HttpMethod.Post;
+            if (post) Posts++;
             if (Denied) return Reply(new { }, HttpStatusCode.Forbidden);
             if (get && path == "git/ref/heads/main")
                 return Reply(new { @object = new { sha = Stale ? OldBlob : baseline } });
@@ -196,8 +201,13 @@ internal static class DevelopmentPublicationGatewayTests
                 {
                     sha = Commit,
                     tree = new { sha = NextTree },
-                    parents = new[] { new { sha = baseline } }
+                    parents = new[] { new { sha = baseline } },
+                    message = commitMessage,
+                    author = commitAuthor,
+                    committer = commitCommitter
                 });
+            if (get && path == "git/commits/" + OldBlob)
+                return Reply(new { }, HttpStatusCode.NotFound);
             if (get && path.StartsWith("git/ref/heads/hami-agent/job-", StringComparison.Ordinal))
                 return branch ? Reply(new { @object = new { sha = Conflict ? OldBlob : Commit } })
                     : Reply(new { }, HttpStatusCode.NotFound);
@@ -227,6 +237,9 @@ internal static class DevelopmentPublicationGatewayTests
                         || data.GetProperty("parents").GetArrayLength() != 1
                         || data.GetProperty("parents")[0].GetString() != baseline)
                         throw new Exception("Unexpected commit creation.");
+                    commitMessage = data.GetProperty("message").GetString();
+                    commitAuthor = data.GetProperty("author").Clone();
+                    commitCommitter = data.GetProperty("committer").Clone();
                     return Reply(new { sha = Commit });
                 case "git/refs":
                     if (branch || data.GetProperty("sha").GetString() != Commit
