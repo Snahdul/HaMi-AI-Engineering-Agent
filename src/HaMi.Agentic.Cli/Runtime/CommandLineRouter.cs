@@ -37,14 +37,14 @@ internal static class CommandLineRouter
         foreach (string name in new[]
         {
             "--repo", "--results-dir", "--source", "--project", "--mode",
-            "--contract", "--worktree", "--model", "--issue"
+            "--contract", "--worktree", "--model", "--issue", "--publication-base"
         }) Add(development, name);
         foreach (string name in new[]
         {
             "--self-test", "--contract-check", "--worktree-check",
             "--production-verify", "--sandbox-poc", "--sandbox-poc-self-test", "--sandbox-run",
             "--sandbox-run-self-test", "--agent-run", "--agent-self-test", "--live",
-            "--publish-issue", "--allow-followups"
+            "--publish-issue", "--allow-followups", "--publish-draft"
         }) Add(development, name, flag: true);
         development.SetAction((_, _) => DevelopmentCommand.RunAsync(args[1..]));
         root.Subcommands.Add(development);
