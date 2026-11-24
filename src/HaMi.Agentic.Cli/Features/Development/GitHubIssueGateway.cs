@@ -134,13 +134,28 @@ internal sealed class GitHubIssueGateway : IDevelopmentIssueGateway, IDisposable
     public async Task MarkReviewAsync(int issueNumber, CancellationToken ct)
     {
         RequireWriteAccess();
-        // Do not touch a Project field directly. Existing GitHub Actions
-        // translate these repository labels to Project #2's state.
-        using JsonDocument removed = await SendAsync(HttpMethod.Delete,
-            "issues/" + issueNumber + "/labels/workflow%3Ain-progress", null, ct);
-        using JsonDocument added = await SendAsync(HttpMethod.Post,
-            "issues/" + issueNumber + "/labels",
-            new { labels = new[] { "workflow:review" } }, ct);
+        // Idempotent: retrying after a completed transition must not fail on
+        // a missing old label. Project #2 remains owned by existing Actions.
+        using JsonDocument issue = await GetIssueAsync(issueNumber, ct);
+        JsonElement labels = issue.RootElement.GetProperty("labels");
+        bool inProgress = labels.EnumerateArray().Any(e =>
+            e.GetProperty("name").GetString() == "workflow:in-progress");
+        bool review = labels.EnumerateArray().Any(e =>
+            e.GetProperty("name").GetString() == "workflow:review");
+        if (!inProgress && !review)
+            throw new InvalidOperationException(
+                "Review transition rejected: issue has no active agent status label.");
+        if (inProgress)
+        {
+            using JsonDocument removed = await SendAsync(HttpMethod.Delete,
+                "issues/" + issueNumber + "/labels/workflow%3Ain-progress", null, ct);
+        }
+        if (!review)
+        {
+            using JsonDocument added = await SendAsync(HttpMethod.Post,
+                "issues/" + issueNumber + "/labels",
+                new { labels = new[] { "workflow:review" } }, ct);
+        }
     }
 
     public void Dispose()
