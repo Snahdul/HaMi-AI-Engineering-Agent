@@ -47,6 +47,61 @@ internal static class WindowsIssueCredentialStore
     [DllImport("advapi32.dll", EntryPoint = "CredFree")]
     private static extern void CredFree(IntPtr credential);
 
+    // ReadConsole line input supports terminal clipboard paste. Disable
+    // console echo before reading and restore the original flags even if
+    // validation or the native credential operation fails.
+    private const int StandardInputHandle = -10;
+    private const uint EnableLineInput = 0x0002;
+    private const uint EnableEchoInput = 0x0004;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int standardHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetConsoleMode(IntPtr handle, out uint mode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetConsoleMode(IntPtr handle, uint mode);
+
+    private static void ReadPastedToken(SecureString secret)
+    {
+        IntPtr input = GetStdHandle(StandardInputHandle);
+        if (input == IntPtr.Zero || input == new IntPtr(-1)
+            || !GetConsoleMode(input, out uint originalMode))
+            throw new InvalidOperationException(
+                "Interactive Windows console input unavailable; use Windows Terminal or PowerShell.");
+
+        uint maskedMode = (originalMode | EnableLineInput) & ~EnableEchoInput;
+        if (!SetConsoleMode(input, maskedMode))
+            throw new InvalidOperationException(
+                "Cannot disable console echo; token input refused for security.");
+
+        try
+        {
+            // Console.ReadKey loses pasted text in some terminals.
+            // Console.Read reads the entire terminal-edited line (including
+            // pasted input) without echo; SecureString receives one char at
+            // a time, avoiding an immutable managed plaintext token string.
+            while (true)
+            {
+                int next = Console.Read();
+                if (next is -1 or '\r' or '\n') break;
+                if (next is < 33 or > 126 || secret.Length >= 512)
+                    throw new InvalidOperationException(
+                        "GitHub token contains invalid characters or exceeds the permitted length.");
+                secret.AppendChar((char)next);
+            }
+        }
+        finally
+        {
+            if (!SetConsoleMode(input, originalMode))
+                Console.Error.WriteLine(
+                    "WARNING: Could not restore original console mode. Close this terminal before further input.");
+        }
+    }
+
     public static string? Read()
     {
         if (!OperatingSystem.IsWindows()) return null;
@@ -148,24 +203,7 @@ internal static class WindowsIssueCredentialStore
         using var secret = new SecureString();
         try
         {
-            while (true)
-            {
-                ConsoleKeyInfo key = Console.ReadKey(intercept: true);
-                if (key.Key == ConsoleKey.Enter) break;
-                if (key.Key == ConsoleKey.Escape)
-                {
-                    Console.WriteLine();
-                    Console.WriteLine("Token enrollment cancelled.");
-                    return 2;
-                }
-                if (key.Key == ConsoleKey.Backspace)
-                {
-                    if (secret.Length > 0) secret.RemoveAt(secret.Length - 1);
-                    continue;
-                }
-                if (!char.IsControl(key.KeyChar) && secret.Length < 512)
-                    secret.AppendChar(key.KeyChar);
-            }
+            ReadPastedToken(secret);
             Console.WriteLine();
             Store(secret);
             Console.WriteLine("Dedicated GitHub Issues token stored in Windows Credential Manager.");
