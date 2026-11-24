@@ -328,6 +328,18 @@ internal static class DevelopmentAgentCommand
                 throw new InvalidOperationException(
                     "Production actor did not correct an independently failing program.");
 
+            // A faulted Task must retain the host-defined production phase,
+            // even when wrapped by the Task's AggregateException.
+            DevelopmentJobReport productionStageFault = await DevelopmentActorCoordinator.RunAsync(
+                system, production, new DevelopmentScriptedGenerator(),
+                new StageFaultIsolatedRunner());
+            if (productionStageFault.Status != "failed"
+                || productionStageFault.ModelCalls != 1
+                || productionStageFault.Attempts.Length != 0
+                || productionStageFault.Failure != "sandbox:PRODUCTION_SCOPE_AND_MICROVM")
+                throw new InvalidOperationException(
+                    "Production stage code was lost while unwrapping a faulted Task.");
+
             var noOpProductionRunner = new SimulatedIsolatedRunner();
             DevelopmentJobReport noOpProduction = await DevelopmentActorCoordinator.RunAsync(
                 system, production, new NoOpProductionGenerator(), noOpProductionRunner);
@@ -477,6 +489,17 @@ internal static class DevelopmentAgentCommand
         {
             Directory.Delete(temp, recursive: true);
         }
+    }
+
+    private sealed class StageFaultIsolatedRunner : IDevelopmentIsolatedRunner
+    {
+        public Task<DevelopmentSandboxAttempt> ExecuteAsync(
+            DevelopmentAgentContract contract, string generatedSource, int attempt,
+            CancellationToken cancellationToken) =>
+            Task.FromException<DevelopmentSandboxAttempt>(
+                new DevelopmentProductionStageException(
+                    "PRODUCTION_SCOPE_AND_MICROVM",
+                    new InvalidOperationException("Opaque host-only failure.")));
     }
 
     private sealed class DelayedIsolatedRunner : IDevelopmentIsolatedRunner
