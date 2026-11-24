@@ -316,6 +316,16 @@ internal static class DevelopmentAgentCommand
                 throw new InvalidOperationException(
                     "Production actor did not correct an independently failing program.");
 
+            var noOpProductionRunner = new SimulatedIsolatedRunner();
+            DevelopmentJobReport noOpProduction = await DevelopmentActorCoordinator.RunAsync(
+                system, production, new NoOpProductionGenerator(), noOpProductionRunner);
+            if (noOpProduction.Status != "exhausted"
+                || noOpProduction.ModelCalls != 2
+                || noOpProduction.Attempts.Length != 2
+                || noOpProduction.Attempts.Any(a => a.Status != "source-rejected"))
+                throw new InvalidOperationException(
+                    "No-op production source must exhaust safely without a MicroVM.");
+
             var invalidProduction = new InvalidProductionGenerator();
             var invalidRunner = new SimulatedIsolatedRunner();
             DevelopmentJobReport rejectedProduction = await DevelopmentActorCoordinator.RunAsync(
@@ -484,6 +494,18 @@ internal static class DevelopmentAgentCommand
             finished.TrySetResult(result);
     }
 
+    private sealed class NoOpProductionGenerator : IDevelopmentCandidateGenerator
+    {
+        public Task<string> GenerateAsync(
+            DevelopmentAgentContract contract, string feedback, int attempt,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(DevelopmentProductionExpression.Serialize(
+                "attempt >= 1 && maxCalls >= 1 && attempt < maxCalls"));
+        }
+    }
+
     private sealed class InvalidProductionGenerator : IDevelopmentCandidateGenerator
     {
         public Task<string> GenerateAsync(
@@ -541,6 +563,10 @@ internal static class DevelopmentAgentCommand
             if (contract.IsProduction)
             {
                 string expression = DevelopmentProductionExpression.Parse(generatedSource);
+                if (expression == "attempt >= 1 && maxCalls >= 1 && attempt < maxCalls")
+                    return Task.FromResult(new DevelopmentSandboxAttempt(false, -1, -1, -1,
+                        false, true, "Proposed source was identical to main.", null,
+                        SourceRejected: true));
                 if (expression == "attempt < maxCalls")
                     return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 0, 1,
                         false, true, "FAIL attempt=0 maxCalls=1", null, OutputAccepted: false));
