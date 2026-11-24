@@ -136,24 +136,47 @@ internal sealed record DevelopmentJobState(
         Advance(this with { Revision = Revision + 1, Stage = Executing });
 
     internal DevelopmentJobState Verify(int modelCalls, int attempts, string evidenceHash) =>
-        Advance(this with { Revision = Revision + 1, Stage = CandidateVerified,
-            ModelCalls = modelCalls, Attempts = attempts, EvidenceHash = evidenceHash });
+        Advance(this with
+        {
+            Revision = Revision + 1,
+            Stage = CandidateVerified,
+            ModelCalls = modelCalls,
+            Attempts = attempts,
+            EvidenceHash = evidenceHash
+        });
 
     internal DevelopmentJobState ReservePublication() =>
-        Advance(this with { Revision = Revision + 1, Stage = PublicationPending,
-            PublicationAttempts = PublicationAttempts + 1 });
+        Advance(this with
+        {
+            Revision = Revision + 1,
+            Stage = PublicationPending,
+            PublicationAttempts = PublicationAttempts + 1
+        });
 
     internal DevelopmentJobState ConfirmPublication(int pullRequestNumber) =>
-        Advance(this with { Revision = Revision + 1, Stage = Published,
-            PullRequestNumber = pullRequestNumber });
+        Advance(this with
+        {
+            Revision = Revision + 1,
+            Stage = Published,
+            PullRequestNumber = pullRequestNumber
+        });
 
     internal DevelopmentJobState FinishExecution(string stage, int modelCalls, int attempts) =>
-        Advance(this with { Revision = Revision + 1, Stage = stage,
-            ModelCalls = modelCalls, Attempts = attempts });
+        Advance(this with
+        {
+            Revision = Revision + 1,
+            Stage = stage,
+            ModelCalls = modelCalls,
+            Attempts = attempts
+        });
 
     internal DevelopmentJobState BlockUnknownExecution() =>
-        Advance(this with { Revision = Revision + 1, Stage = RecoveryBlocked,
-            Reason = "EXECUTION_STATE_UNKNOWN" });
+        Advance(this with
+        {
+            Revision = Revision + 1,
+            Stage = RecoveryBlocked,
+            Reason = "EXECUTION_STATE_UNKNOWN"
+        });
 
     private DevelopmentJobState Advance(DevelopmentJobState next)
     {
