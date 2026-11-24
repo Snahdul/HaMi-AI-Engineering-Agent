@@ -85,7 +85,9 @@ internal static class DevelopmentAgentCommand
             // The owned job logger emits the lifecycle; suppress default host
             // informational startup/shutdown chatter on the second pipeline.
             builder.Logging.ClearProviders();
-            builder.Services.AddAkka("hami-developer", _ => { });
+            builder.Services.AddAkka("hami-developer", config =>
+                config.ConfigureLoggers(setup =>
+                    setup.LogLevel = Akka.Event.LogLevel.WarningLevel));
             using IHost host = builder.Build();
             await host.StartAsync();
             try
@@ -186,7 +188,9 @@ internal static class DevelopmentAgentCommand
         // Use the same Akka.Hosting composition root in CI as in the real
         // agent command; this catches DI/host startup errors without Docker.
         HostApplicationBuilder builder = Host.CreateApplicationBuilder();
-        builder.Services.AddAkka("hami-development-offline-tests", _ => { });
+        builder.Services.AddAkka("hami-development-offline-tests", config =>
+            config.ConfigureLoggers(setup =>
+                setup.LogLevel = Akka.Event.LogLevel.WarningLevel));
         using IHost host = builder.Build();
         await host.StartAsync();
         try
