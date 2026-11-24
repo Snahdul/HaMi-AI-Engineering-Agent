@@ -386,6 +386,7 @@ internal static class DevelopmentSandboxPoC
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        start.Environment.Remove(DevelopmentPublicationGateway.TokenVariable);
         start.ArgumentList.Add("--no-input");
         foreach (string arg in arguments) start.ArgumentList.Add(arg);
 
