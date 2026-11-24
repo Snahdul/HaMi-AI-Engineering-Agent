@@ -145,16 +145,19 @@ internal sealed class GitHubIssueGateway : IDevelopmentIssueGateway, IDisposable
         if (!inProgress && !review)
             throw new InvalidOperationException(
                 "Review transition rejected: issue has no active agent status label.");
-        if (inProgress)
-        {
-            using JsonDocument removed = await SendAsync(HttpMethod.Delete,
-                "issues/" + issueNumber + "/labels/workflow%3Ain-progress", null, ct);
-        }
+        // Add the destination label BEFORE removing the source label.
+        // If either request fails midway, the next run can reconcile
+        // safely and never leave the Issue without an automation label.
         if (!review)
         {
             using JsonDocument added = await SendAsync(HttpMethod.Post,
                 "issues/" + issueNumber + "/labels",
                 new { labels = new[] { "workflow:review" } }, ct);
+        }
+        if (inProgress)
+        {
+            using JsonDocument removed = await SendAsync(HttpMethod.Delete,
+                "issues/" + issueNumber + "/labels/workflow%3Ain-progress", null, ct);
         }
     }
 
