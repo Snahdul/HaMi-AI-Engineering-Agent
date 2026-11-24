@@ -22,7 +22,8 @@ internal static class DevelopmentSandboxRunner
     // our guest policy probe. Never log secret values or environment dumps.
     private static readonly string[] SensitiveEnvNames =
     [
-        "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "HAMI_AGENT_GITHUB_TOKEN", "AZURE_CLIENT_SECRET",
+        "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "HAMI_AGENT_GITHUB_TOKEN",
+        "HAMI_AGENT_GITHUB_PUBLICATION_TOKEN", "AZURE_CLIENT_SECRET",
         "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK",
         // Windows User API-key alias; not a POSIX shell identifier.
         // Remove only from the sbx CHILD process environment.
@@ -30,12 +31,13 @@ internal static class DevelopmentSandboxRunner
     ];
 
     private const string GuestEnvCheckScript =
-        "for n in OPENAI_API_KEY GITHUB_TOKEN GH_TOKEN HAMI_AGENT_GITHUB_TOKEN AZURE_CLIENT_SECRET AWS_SECRET_ACCESS_KEY SSH_AUTH_SOCK; do " +
+        "for n in OPENAI_API_KEY GITHUB_TOKEN GH_TOKEN HAMI_AGENT_GITHUB_TOKEN HAMI_AGENT_GITHUB_PUBLICATION_TOKEN AZURE_CLIENT_SECRET AWS_SECRET_ACCESS_KEY SSH_AUTH_SOCK; do " +
         "case \"$n\" in " +
         "OPENAI_API_KEY) v=${OPENAI_API_KEY-};; " +
         "GITHUB_TOKEN) v=${GITHUB_TOKEN-};; " +
         "GH_TOKEN) v=${GH_TOKEN-};; " +
         "HAMI_AGENT_GITHUB_TOKEN) v=${HAMI_AGENT_GITHUB_TOKEN-};; " +
+        "HAMI_AGENT_GITHUB_PUBLICATION_TOKEN) v=${HAMI_AGENT_GITHUB_PUBLICATION_TOKEN-};; " +
         "AZURE_CLIENT_SECRET) v=${AZURE_CLIENT_SECRET-};; " +
         "AWS_SECRET_ACCESS_KEY) v=${AWS_SECRET_ACCESS_KEY-};; " +
         "SSH_AUTH_SOCK) v=${SSH_AUTH_SOCK-};; " +
@@ -120,6 +122,7 @@ internal static class DevelopmentSandboxRunner
                 "--skills", "off", "--static-mcp", "none",
                 "--env", "OPENAI_API_KEY=", "--env", "GITHUB_TOKEN=",
                 "--env", "GH_TOKEN=", "--env", "HAMI_AGENT_GITHUB_TOKEN=",
+                "--env", "HAMI_AGENT_GITHUB_PUBLICATION_TOKEN=",
                 "--env", "AZURE_CLIENT_SECRET=",
                 "--env", "AWS_SECRET_ACCESS_KEY=", "--env", "SSH_AUTH_SOCK=",
                 "shell"), "Create sandbox");
