@@ -49,7 +49,13 @@ production code with an AI model yet. That is the subsequent M3b step.
 The acceptance script creates an additional detached **candidate**
 worktree based on current main, changes only the production expression
 to a mathematically equivalent form, and runs the reviewed
-`development --production-verify` CLI action. It then independently
+`development --production-verify` CLI action. After an interrupted
+invocation, an already existing candidate is reused **only** if its
+HEAD, one-file Git status and exact expected source bytes match. It is
+never overwritten or deleted. If the review branch has been updated,
+run `git fetch origin` in main and `git switch --detach
+origin/feature/issue51-production-candidate-verifier` in the existing
+review worktree before rerunning this script. It then independently
 checks the MicroVM removal, immutable original main, production patch,
 and structured report. The candidate worktree is deliberately retained
 for human inspection; the script refuses to overwrite an existing one.
