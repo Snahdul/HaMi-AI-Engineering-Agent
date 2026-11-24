@@ -59,6 +59,10 @@ internal sealed class DevelopmentProductionIsolatedRunner(
             DevelopmentProductionVerifier.SourcePath.Replace('/', Path.DirectorySeparatorChar));
         string baseline = await File.ReadAllTextAsync(baselinePath, cancellationToken);
         string generated = CodingTaskDefinition.RetryBudget.ReplaceExpression(baseline, expression);
+        if (string.Equals(baseline, generated, StringComparison.Ordinal))
+            return new DevelopmentSandboxAttempt(false, -1, -1, -1, false, true,
+                "The proposed expression is identical to the trusted baseline; change it.",
+                null, SourceRejected: true);
         DevelopmentProductionVerifier.ValidateSourceChange(baseline, generated);
 
         string worktree = Path.Combine(root, "worktrees", attempt.ToString("D2"));
