@@ -773,3 +773,38 @@ und den Labelwechsel auf `workflow:review` verwendet werden konnte.
 Beim Ablaufdatum 22.02.2027 den Token bei GitHub erneuern und den
 bestehenden Credential-Manager-Eintrag bearbeiten. Keine Secretwerte in
 Logs oder Issues kopieren.
+
+
+### Fachliche Output-Abnahme im HaMi Developer (Issue #46)
+
+`passed` bedeutet bei dem genehmigten `sandbox-console-retry`-Vertical-Slice
+jetzt nicht mehr ausschließlich `Build=0` und `Run=0`.
+Der versionierte Contract enthält zusätzlich das verbindliche
+`expectedStdout: "HaMi isolated correction passed"`. Fehlt dieser Wert
+oder weicht er vom geprüften Soll ab, verweigert die Contract-Prüfung den
+Auftrag vor Modell- und MicroVM-Aufruf. GitHub-Issue-Text kann dieses
+Soll nicht überschreiben.
+
+Der Host vergleicht `execution.log` nach MicroVM-Cleanup bytegetreu auf
+Textebene (CRLF/LF normalisiert, maximal ein abschließender Zeilenumbruch).
+Eine zusätzliche Zeile, ein anderes Wort, leerer oder fehlender Output
+sowie zusätzliche STDERR-Ausgabe bedeuten **`acceptance-failed`**,
+selbst wenn das Programm Exitcode 0 liefert. Ein solcher Fehler darf
+nach bestätigtem Cleanup innerhalb des unveränderten Retry-Budgets von
+Akka korrigiert werden. Das Modell erhält dafür nur eine feste
+Anweisung mit dem geprüften Sollwert, **keine unvertrauenswürdige
+Roh-Programmausgabe**. Infrastruktur-/Timeout-/Cleanup-Fehler bleiben
+für automatische Wiederholungen gesperrt.
+
+`agent-report.json` dokumentiert `outputAccepted` (true/false/null,
+wobei null = wegen vorigem Phasenfehler nicht geprüft). Auch der
+GitHub-Journalbericht enthält ausschließlich die redigierte
+Output-Klassifikation, nie Roh-Ausgaben oder Zugangsdaten.
+
+Der Offline-Selbsttest `development --repo <checkout> --agent-self-test`
+prüft den Output-Verifier und die semantische Korrekturschleife ohne
+Modell-API, GitHub-Schreibrechte oder Docker. Für die reale MicroVM-
+Abnahme ist ein separater HaMi11-Lauf im Review-Worktree erforderlich.
+Diese Prüfung ist für den freigegebenen Ein-Datei-Demonstrator ausgelegt;
+allgemeine Issue-Akzeptanzkriterien werden dadurch **noch nicht**
+automatisch interpretiert.
