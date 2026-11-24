@@ -22,6 +22,63 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         return new Lease(prefix, issue, validatePrivateEntry);
     }
 
+    // Locate the original issue through the private registry only. The
+    // scan is not authorization: acquire the canonical issue lock and
+    // re-read the selected state under that lock before using it.
+    internal Lease AcquireJob(string jobId)
+    {
+        if (!DevelopmentPublicationPolicy.IsSha(jobId, 32)
+            || jobId != jobId.ToLowerInvariant())
+            throw new InvalidOperationException("Recovery job ID rejected.");
+        _ = ValidateRoot(root);
+        validatePrivateEntry?.Invoke(root, true);
+        int? selected = null;
+        int count = 0;
+        foreach (string path in Directory.EnumerateFiles(root, "issue-*.json"))
+        {
+            if (++count > 1024)
+                throw new InvalidOperationException("Recovery registry scan limit exceeded.");
+            string name = Path.GetFileNameWithoutExtension(path);
+            if (!int.TryParse(name.AsSpan(6), NumberStyles.None, CultureInfo.InvariantCulture, out int issue)
+                || issue <= 0 || name != "issue-" + issue.ToString(CultureInfo.InvariantCulture))
+                throw new InvalidOperationException("Recovery registry entry name rejected.");
+            if (!RegularFileExists(path))
+                throw new InvalidOperationException("Recovery registry entry disappeared.");
+            validatePrivateEntry?.Invoke(path, false);
+            var state = ReadState(path, issue);
+            if (state.Identity.JobId != jobId)
+                continue;
+            if (selected is not null)
+                throw new InvalidOperationException("Ambiguous recovery job identity.");
+            selected = issue;
+        }
+        if (selected is null)
+            throw new InvalidOperationException("Recovery job not found.");
+        var owner = Acquire(selected.Value);
+        if (owner.Current?.Identity.JobId == jobId)
+            return owner;
+        owner.Dispose();
+        throw new InvalidOperationException("Recovery job identity changed during acquisition.");
+    }
+
+    private static DevelopmentJobState ReadState(string path, int issue)
+    {
+        // Atomic replacement can occur while scanning other issues. The
+        // open handle observes a complete old or new checkpoint, not a mix.
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete);
+        if (stream.Length is < 1 or > DevelopmentJobState.MaxBytes)
+            throw new InvalidOperationException("Recovery state size rejected.");
+        byte[] bytes = new byte[(int)stream.Length];
+        stream.ReadExactly(bytes);
+        if (stream.ReadByte() != -1)
+            throw new InvalidOperationException("Recovery state changed during read.");
+        var state = DevelopmentJobState.Parse(bytes);
+        if (state.Identity.IssueNumber != issue)
+            throw new InvalidOperationException("Recovery state belongs to a different issue.");
+        return state;
+    }
+
     private static string ValidateRoot(string path)
     {
         if (!Path.IsPathFullyQualified(path))
@@ -104,17 +161,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             if (!RegularFileExists(statePath))
                 return null;
             validatePrivateEntry?.Invoke(statePath, false);
-            using var stream = new FileStream(statePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-            if (stream.Length is < 1 or > DevelopmentJobState.MaxBytes)
-                throw new InvalidOperationException("Recovery state size rejected.");
-            byte[] bytes = new byte[(int)stream.Length];
-            stream.ReadExactly(bytes);
-            if (stream.ReadByte() != -1)
-                throw new InvalidOperationException("Recovery state changed during read.");
-            var state = DevelopmentJobState.Parse(bytes);
-            if (state.Identity.IssueNumber != issue)
-                throw new InvalidOperationException("Recovery state belongs to a different issue.");
-            return state;
+            return ReadState(statePath, issue);
         }
 
         internal void Claim(DevelopmentJobState initial)
