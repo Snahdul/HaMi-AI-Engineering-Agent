@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "taskId": "sandbox-pair",
+  "description": "A reviewed two-file C# calculation and formatting task. Only staged fixture copies may change.",
+  "targetFramework": "net11.0",
+  "allowedWritePaths": [
+    "src/HaMi.Agentic.Cli/Features/Development/PairCalculator.cs",
+    "src/HaMi.Agentic.Cli/Features/Development/PairFormatter.cs"
+  ],
+  "acceptanceCriteria": [
+    "Both approved C# files implement their named operations.",
+    "The host-owned Program.cs harness checks normal and boundary values.",
+    "No production checkout or trusted harness file is changed."
+  ]
+}
