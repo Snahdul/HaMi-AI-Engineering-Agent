@@ -34,7 +34,7 @@ internal sealed class DevelopmentIsolatedRunner(
         IReadOnlyDictionary<string, string> replacements = contract.IsPair
             ? DevelopmentCandidateFiles.Parse(contract, generatedSource)
             : new Dictionary<string, string>(StringComparer.Ordinal)
-                { [contract.SourceFile] = generatedSource };
+            { [contract.SourceFile] = generatedSource };
 
         string dir = Path.Combine(root, "candidates", attempt.ToString("D2"));
         string sandboxDir = Path.Combine(root, "sandbox", attempt.ToString("D2"));
