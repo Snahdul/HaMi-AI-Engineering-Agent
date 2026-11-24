@@ -753,6 +753,14 @@ dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- config --store-github-
 dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- config --check-github-issues-token
 ```
 
+Der erste Befehl akzeptiert das Einfügen des kopierten Tokens mit
+`Strg+V` beziehungsweise der Einfügefunktion des Terminals. Die Eingabe
+erfolgt zeilenweise bei deaktivierter Konsolen-Echoausgabe, sodass
+**auch beim Einfügen keine Tokenzeichen angezeigt werden**. Anschließend
+`Enter` drücken. Die bisherigen `Console.ReadKey`-Probleme beim
+Einfügen sind damit vermieden. Das Verhalten wird zusätzlich
+auf HaMi11 im interaktiven Windows-Terminal geprüft.
+
 Der erste Befehl liest die Tokenzeichen ohne Echo und hinterlegt sie
 als generische Windows-Anmeldeinformation für den angemeldeten Benutzer
 unter dem Namen `HaMi-AI-Engineering-Agent/GitHub-Issues/Snahdul`.
