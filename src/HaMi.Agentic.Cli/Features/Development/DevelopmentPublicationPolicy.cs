@@ -42,7 +42,17 @@ internal sealed record DevelopmentPublicationPolicy(
         string actual = (await DevelopmentWorktreeGuard.GitAsync(repo, "rev-parse", "HEAD")).Trim();
         if (actual != approvedBase)
             throw new InvalidOperationException("Publication base changed.");
-        return Parse(await DevelopmentWorktreeGuard.GitAsync(repo, "show", actual + ":" + PolicyPath));
+        var policy = Parse(await DevelopmentWorktreeGuard.GitAsync(repo, "show", actual + ":" + PolicyPath));
+        // A worktree can be clean even when checkout filters converted LF to
+        // CRLF. The Git object API publishes raw verified bytes, not filtered
+        // bytes. Reject such baselines rather than silently widen the diff.
+        string committedBlob = (await DevelopmentWorktreeGuard.GitAsync(repo,
+            "rev-parse", actual + ":" + policy.SourcePath)).Trim();
+        string rawBlob = (await DevelopmentWorktreeGuard.GitAsync(repo,
+            "hash-object", "--no-filters", "--", policy.SourcePath)).Trim();
+        if (committedBlob != rawBlob)
+            throw new InvalidOperationException("Publication requires byte-identical baseline checkout; review Git checkout filters.");
+        return policy;
     }
 
     internal static DevelopmentJobAttempt RequireSuccessfulAttempt(DevelopmentJobReport job,
@@ -99,6 +109,12 @@ internal sealed record DevelopmentPublicationPolicy(
         if (hash != evidence.SourceSha256 || diffHash != evidence.DiffSha256
             || DevelopmentProductionVerifier.FileHash(attempt.DiffPath!) != evidence.DiffSha256)
             throw new InvalidOperationException("Publication candidate evidence changed.");
+        string filteredBlob = (await DevelopmentWorktreeGuard.GitAsync(candidate,
+            "hash-object", "--", policy.SourcePath)).Trim();
+        string rawBlob = (await DevelopmentWorktreeGuard.GitAsync(candidate,
+            "hash-object", "--no-filters", "--", policy.SourcePath)).Trim();
+        if (filteredBlob != rawBlob)
+            throw new InvalidOperationException("Publication candidate differs under Git clean filters.");
         DevelopmentProductionVerifier.ValidateSourceChange(
             await File.ReadAllTextAsync(Path.Combine(repo, policy.SourcePath.Replace('/', Path.DirectorySeparatorChar))),
             System.Text.Encoding.UTF8.GetString(bytes));
