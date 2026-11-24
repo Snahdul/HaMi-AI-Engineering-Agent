@@ -131,6 +131,7 @@ internal static class DevelopmentWorktreeGuard
             CreateNoWindow = true
         };
         info.Environment["GIT_TERMINAL_PROMPT"] = "0";
+        info.Environment.Remove(DevelopmentPublicationGateway.TokenVariable);
         foreach (string argument in arguments)
             info.ArgumentList.Add(argument);
 
