@@ -284,6 +284,22 @@ internal static class DevelopmentProductionVerifier
 
     internal static void SelfTest()
     {
+        // The publication evidence must refer to the exact bytes, not a
+        // normalized string that can silently change encoding or line endings.
+        string evidenceTest = Path.Combine(Path.GetTempPath(), "hami-evidence-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            File.WriteAllBytes(evidenceTest, [0x41, 0x0d, 0x0a]);
+            string originalHash = FileHash(evidenceTest);
+            File.WriteAllBytes(evidenceTest, [0x41, 0x0a]);
+            if (FileHash(evidenceTest) == originalHash)
+                throw new InvalidOperationException("Evidence hash did not detect changed bytes.");
+        }
+        finally
+        {
+            File.Delete(evidenceTest);
+        }
+
         const string original = """
             namespace HaMi.Agentic.Cli.Features.Coding;
 
