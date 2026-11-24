@@ -57,3 +57,8 @@ Der tägliche Recovery-Lauf dient dazu, verpasste PR-Ereignisse und Status-Label
 Ohne diese Live-Nachweise gilt die Automatisierung nur als **vorbereitet**, nicht als abgenommen.
 
 Verfolgung: [Agent-Issue #8](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/8).
+
+
+## Issue-driven Development: Label-Handover
+
+Ein erfolgreich abgeschlossener Development-Job darf nur nach ausdrücklichem Publish-Opt-in das Label workflow:in-progress entfernen und workflow:review setzen. Die bestehenden GitHub Actions übersetzen dies nach Review in Project #2; der Agent verändert keine ProjectV2-Felder. Ein Folge-Issue ohne Statuslabel wird durch den eingebauten Project-Workflow als Todo aufgenommen. Es gibt keinen automatischen Merge oder Neustart.
