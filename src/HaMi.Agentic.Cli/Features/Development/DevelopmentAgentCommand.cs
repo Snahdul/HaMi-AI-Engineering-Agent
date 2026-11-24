@@ -216,6 +216,7 @@ internal static class DevelopmentAgentCommand
     {
         CommandLineRouter.SelfTest();
         DevelopmentAgentContract.SelfTest();
+        DevelopmentOutputAcceptance.SelfTest();
         await DevelopmentIssueWorkflowTests.SelfTestAsync();
         DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, null);
         await DevelopmentAiGenerator.SelfTestAsync(contract);
@@ -251,6 +252,30 @@ internal static class DevelopmentAgentCommand
                 || completed.Attempts[1].Status != "passed"
                 || sandbox.Calls != 2)
                 throw new InvalidOperationException("Akka retry flow did not handle compiler feedback correctly.");
+
+            var semanticRunner = new SimulatedIsolatedRunner();
+            DevelopmentJobReport semantic = await DevelopmentActorCoordinator.RunAsync(
+                system, contract, new SemanticRepairGenerator(), semanticRunner);
+            if (semantic.Status != "passed" || semantic.ModelCalls != 2
+                || semanticRunner.Calls != 2 || semantic.Attempts.Length != 2
+                || semantic.Attempts[0].Status != "acceptance-failed"
+                || semantic.Attempts[0].OutputAccepted != false
+                || semantic.Attempts[0].BuildExitCode != 0
+                || semantic.Attempts[0].RunExitCode != 0
+                || semantic.Attempts[1].Status != "passed"
+                || semantic.Attempts[1].OutputAccepted != true)
+                throw new InvalidOperationException(
+                    "Akka accepted wrong stdout or failed to repair a semantic mismatch.");
+
+            var semanticLimited = contract with { MaxAttempts = 1 };
+            var limitedSemanticRunner = new SimulatedIsolatedRunner();
+            DevelopmentJobReport semanticExhausted = await DevelopmentActorCoordinator.RunAsync(
+                system, semanticLimited, new SemanticRepairGenerator(), limitedSemanticRunner);
+            if (semanticExhausted.Status != "exhausted" || semanticExhausted.ModelCalls != 1
+                || semanticExhausted.Attempts.Single().Status != "acceptance-failed"
+                || limitedSemanticRunner.Calls != 1)
+                throw new InvalidOperationException(
+                    "Akka exceeded retry budget after an acceptance mismatch.");
 
             var limited = contract with { MaxAttempts = 1 };
             var budgetSandbox = new SimulatedIsolatedRunner();
@@ -304,8 +329,8 @@ internal static class DevelopmentAgentCommand
             await VerifyNarrativeLoggingAsync(system, contract, repo);
 
             Console.WriteLine("Akka development offline self-test passed: fail/correct, "
-                + "retry budget, timeout, preflight, restore, build-exec, cleanup "
-                + "and deadline-awaited sandbox cleanup.");
+                + "retry budget, semantic stdout mismatch/correction, timeout, preflight, "
+                + "restore, build-exec, cleanup and deadline-awaited sandbox cleanup.");
         }
         finally
         {
@@ -409,6 +434,22 @@ internal static class DevelopmentAgentCommand
             finished.TrySetResult(result);
     }
 
+    private sealed class SemanticRepairGenerator : IDevelopmentCandidateGenerator
+    {
+        public Task<string> GenerateAsync(
+            DevelopmentAgentContract contract, string feedback, int attempt,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (attempt == 1 && string.IsNullOrEmpty(feedback))
+                return Task.FromResult("Console.WriteLine(\"incorrect output\");");
+            if (attempt == 2 && feedback == DevelopmentOutputAcceptance.CorrectionFeedback)
+                return Task.FromResult("Console.WriteLine(\"HaMi isolated correction passed\");");
+            throw new InvalidOperationException(
+                "Semantic retry did not receive the approved, bounded correction hint.");
+        }
+    }
+
     private sealed class SimulatedIsolatedRunner(bool timeout = false, string? failure = null)
         : IDevelopmentIsolatedRunner
     {
@@ -438,9 +479,13 @@ internal static class DevelopmentAgentCommand
             if (generatedSource.Contains("UnknownIdentifier", StringComparison.Ordinal))
                 return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 1, -1,
                     false, true, "error CS0103: The name UnknownIdentifier does not exist.", null));
+            if (generatedSource.Contains("incorrect output", StringComparison.Ordinal))
+                return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 0, 0,
+                    false, true, DevelopmentOutputAcceptance.CorrectionFeedback, null,
+                    OutputAccepted: false));
             if (generatedSource.Contains("HaMi isolated correction passed", StringComparison.Ordinal))
                 return Task.FromResult(new DevelopmentSandboxAttempt(true, 0, 0, 0,
-                    false, true, "", null));
+                    false, true, "", null, OutputAccepted: true));
             throw new InvalidOperationException("Unexpected fake source content.");
         }
     }
