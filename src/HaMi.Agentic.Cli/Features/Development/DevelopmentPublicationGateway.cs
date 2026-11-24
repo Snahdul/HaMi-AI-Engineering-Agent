@@ -14,6 +14,9 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
     private readonly HttpClient client;
     private readonly string? testToken;
     private string? token;
+    private int requests;
+    internal const int MaxRequestsPerReservation = 30;
+    internal static readonly TimeSpan PublicationDeadline = TimeSpan.FromMinutes(4);
     internal DevelopmentPublicationGateway(HttpMessageHandler? handler = null, string? testToken = null)
     {
         this.testToken = testToken;
@@ -38,6 +41,9 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
     private async Task<JsonDocument?> SendAsync(HttpMethod method, string path,
         object? payload, CancellationToken ct, bool allowMissing = false)
     {
+        if (++requests > MaxRequestsPerReservation)
+            throw new InvalidOperationException("Publication request budget exhausted.");
+        ct.ThrowIfCancellationRequested();
         using var request = new HttpRequestMessage(method,
             "https://api.github.com/repos/" + GitHubIssueGateway.Repository + "/" + path);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer",
@@ -81,6 +87,10 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
         DevelopmentJobReport job, int issue, string approvedBase, bool authorized,
         CancellationToken ct)
     {
+        requests = 0;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(PublicationDeadline);
+        ct = deadline.Token;
         byte[] bytes = await DevelopmentPublicationPolicy.ValidateCandidateAsync(
             repo, resultsRoot, job, issue, approvedBase, authorized);
         var attempt = DevelopmentPublicationPolicy.RequireSuccessfulAttempt(job, issue, approvedBase);
@@ -101,14 +111,6 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
         byte[] header = Encoding.ASCII.GetBytes("blob " + bytes.Length.ToString(
             System.Globalization.CultureInfo.InvariantCulture) + "\0");
         string expectedBlob = Convert.ToHexString(SHA1.HashData(header.Concat(bytes).ToArray())).ToLowerInvariant();
-        using var blob = await PostAsync("git/blobs", new
-        {
-            content = Convert.ToBase64String(bytes),
-            encoding = "base64"
-        }, ct);
-        if (Sha(blob.RootElement) != expectedBlob)
-            throw new InvalidOperationException("Uploaded blob differs from verified bytes.");
-
         // Preserve the existing file mode. Reject truncated/ambiguous trees.
         using var tree = await GetAsync("git/trees/" + baseTree + "?recursive=1", ct);
         if (Sha(tree.RootElement) != baseTree || tree.RootElement.GetProperty("truncated").GetBoolean())
@@ -120,64 +122,72 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
             || Sha(original) == expectedBlob)
             throw new InvalidOperationException("Unexpected baseline file mode or unchanged candidate.");
 
-        using var nextTree = await PostAsync("git/trees", new
-        {
-            base_tree = baseTree,
-            tree = new[] { new { path = evidence.SourcePath, mode = "100644", type = "blob", sha = expectedBlob } }
-        }, ct);
-        string candidateTree = Sha(nextTree.RootElement);
-        using var treeCheck = await GetAsync("git/trees/" + candidateTree + "?recursive=1", ct);
-        if (Sha(treeCheck.RootElement) != candidateTree || treeCheck.RootElement.GetProperty("truncated").GetBoolean())
-            throw new InvalidOperationException("Candidate tree could not be fully verified.");
-        VerifyTrees(tree.RootElement, treeCheck.RootElement, evidence.SourcePath, expectedBlob);
-
-        // Stable commit identity for retry of the same job; use the trusted
-        // base commit timestamp, not an uncontrolled wall clock.
         string date = baseline.RootElement.GetProperty("committer").GetProperty("date").GetString()
             ?? throw new InvalidOperationException("Missing base timestamp.");
+        string message = "HaMi Developer candidate for #" + issue + "\n\n" + marker;
         var identity = new { name = "HaMi Developer", email = "hami-developer@users.noreply.github.com", date };
-        using var commit = await PostAsync("git/commits", new
-        {
-            message = "HaMi Developer candidate for #" + issue + "\n\n" + marker,
-            tree = candidateTree,
-            parents = new[] { approvedBase },
-            author = identity,
-            committer = identity
-        }, ct);
-        string candidateSha = Sha(commit.RootElement);
-        using var verifiedCommit = await GetAsync("git/commits/" + candidateSha, ct);
-        var commitRoot = verifiedCommit.RootElement;
-        var parents = commitRoot.GetProperty("parents");
-        if (Sha(commitRoot) != candidateSha || Sha(commitRoot.GetProperty("tree")) != candidateTree
-            || parents.GetArrayLength() != 1 || Sha(parents[0]) != approvedBase)
-            throw new InvalidOperationException("Candidate commit verification failed.");
+        string query = "pulls?state=all&per_page=100&head=" + Uri.EscapeDataString("Snahdul:" + branch);
 
-        await RequireBaseAsync(approvedBase, ct);
+        // Reconcile the named remote resources BEFORE any POST. Existing
+        // refs are never moved. A lost response leaves this same job pending.
         using var existing = await SendAsync(HttpMethod.Get, "git/ref/heads/" + branch, null, ct, true);
-        if (existing is null)
+        using var existingPulls = await GetAsync(query, ct);
+        JsonElement initialPulls = existingPulls.RootElement;
+        RequireUnambiguousPulls(initialPulls);
+        string candidateSha;
+        if (existing is not null)
         {
+            candidateSha = Sha(existing.RootElement.GetProperty("object"));
+            await VerifyCommitAsync(candidateSha, null);
+            await RequireBaseAsync(approvedBase, ct);
+            if (initialPulls.GetArrayLength() == 1)
+                return VerifyPull(initialPulls[0], branch, approvedBase, candidateSha, Body(candidateSha));
+        }
+        else
+        {
+            if (initialPulls.GetArrayLength() != 0)
+                throw new InvalidOperationException("Publication pull request exists without its branch.");
+            // Git objects are content-addressed; repeating identical object
+            // creation after an interrupted response cannot create a second
+            // branch or PR. No branch/PR write is repeated blindly.
+            using var blob = await PostAsync("git/blobs", new
+            {
+                content = Convert.ToBase64String(bytes),
+                encoding = "base64"
+            }, ct);
+            if (Sha(blob.RootElement) != expectedBlob)
+                throw new InvalidOperationException("Uploaded blob differs from verified bytes.");
+            using var nextTree = await PostAsync("git/trees", new
+            {
+                base_tree = baseTree,
+                tree = new[] { new { path = evidence.SourcePath, mode = "100644", type = "blob", sha = expectedBlob } }
+            }, ct);
+            string candidateTree = Sha(nextTree.RootElement);
+            await VerifyTreeAsync(candidateTree);
+            using var commit = await PostAsync("git/commits", new
+            {
+                message,
+                tree = candidateTree,
+                parents = new[] { approvedBase },
+                author = identity,
+                committer = identity
+            }, ct);
+            candidateSha = Sha(commit.RootElement);
+            await VerifyCommitAsync(candidateSha, candidateTree);
+            await RequireBaseAsync(approvedBase, ct);
             using var created = await PostAsync("git/refs", new { @ref = "refs/heads/" + branch, sha = candidateSha }, ct);
             if (Sha(created.RootElement.GetProperty("object")) != candidateSha)
                 throw new InvalidOperationException("Unexpected created branch.");
         }
-        else if (Sha(existing.RootElement.GetProperty("object")) != candidateSha)
-            throw new InvalidOperationException("Existing publication branch conflicts.");
+
         using var remote = await GetAsync("git/ref/heads/" + branch, ct);
         if (Sha(remote.RootElement.GetProperty("object")) != candidateSha)
             throw new InvalidOperationException("Remote publication branch changed.");
-
-        string body = marker + "\nRefs #" + issue + "\n\n"
-            + "Base: " + approvedBase + "\n\nCandidate: " + candidateSha
-            + "\n\nSource SHA-256: " + evidence.SourceSha256
-            + "\n\nPatch SHA-256: " + evidence.DiffSha256
-            + "\n\nRestore=0; Build=0; Run=0; independent acceptance passed; MicroVM cleanup confirmed."
-            + "\n\nHuman review and merge approval required.";
+        string body = Body(candidateSha);
         await RequireBaseAsync(approvedBase, ct);
-        using var prs = await GetAsync("pulls?state=all&per_page=100&head="
-            + Uri.EscapeDataString("Snahdul:" + branch), ct);
+        using var prs = await GetAsync(query, ct);
         var array = prs.RootElement;
-        if (array.ValueKind != JsonValueKind.Array || array.GetArrayLength() > 1)
-            throw new InvalidOperationException("Ambiguous publication pull requests.");
+        RequireUnambiguousPulls(array);
         if (array.GetArrayLength() == 1)
             return VerifyPull(array[0], branch, approvedBase, candidateSha, body);
         using var pr = await PostAsync("pulls", new
@@ -190,6 +200,47 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
             maintainer_can_modify = false
         }, ct);
         return VerifyPull(pr.RootElement, branch, approvedBase, candidateSha, body);
+
+        string Body(string sha) => marker + "\nRefs #" + issue + "\n\n"
+            + "Base: " + approvedBase + "\n\nCandidate: " + sha
+            + "\n\nSource SHA-256: " + evidence.SourceSha256
+            + "\n\nPatch SHA-256: " + evidence.DiffSha256
+            + "\n\nRestore=0; Build=0; Run=0; independent acceptance passed; MicroVM cleanup confirmed."
+            + "\n\nHuman review and merge approval required.";
+
+        async Task VerifyTreeAsync(string candidateTree)
+        {
+            using var check = await GetAsync("git/trees/" + candidateTree + "?recursive=1", ct);
+            if (Sha(check.RootElement) != candidateTree || check.RootElement.GetProperty("truncated").GetBoolean())
+                throw new InvalidOperationException("Candidate tree could not be fully verified.");
+            VerifyTrees(tree.RootElement, check.RootElement, evidence.SourcePath, expectedBlob);
+        }
+
+        async Task VerifyCommitAsync(string sha, string? expectedTree)
+        {
+            using var check = await GetAsync("git/commits/" + sha, ct);
+            var root = check.RootElement;
+            string actualTree = Sha(root.GetProperty("tree"));
+            var parents = root.GetProperty("parents");
+            if (Sha(root) != sha || (expectedTree is not null && actualTree != expectedTree)
+                || parents.GetArrayLength() != 1 || Sha(parents[0]) != approvedBase
+                || root.GetProperty("message").GetString() != message
+                || !MatchesIdentity(root.GetProperty("author"))
+                || !MatchesIdentity(root.GetProperty("committer")))
+                throw new InvalidOperationException("Candidate commit identity verification failed.");
+            await VerifyTreeAsync(actualTree);
+        }
+
+        bool MatchesIdentity(JsonElement value) =>
+            value.GetProperty("name").GetString() == identity.name
+            && value.GetProperty("email").GetString() == identity.email
+            && value.GetProperty("date").GetString() == identity.date;
+    }
+
+    private static void RequireUnambiguousPulls(JsonElement array)
+    {
+        if (array.ValueKind != JsonValueKind.Array || array.GetArrayLength() > 1)
+            throw new InvalidOperationException("Ambiguous publication pull requests.");
     }
 
     internal static void VerifyTrees(JsonElement baseline, JsonElement candidate, string path, string blob)
