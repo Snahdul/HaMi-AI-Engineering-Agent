@@ -21,6 +21,7 @@ internal static class DevelopmentCommand
             Console.WriteLine("       development --repo <checkout> --sandbox-run-self-test");
             Console.WriteLine("       development --repo <checkout> --agent-self-test (offline, Akka + CLI parser)");
             Console.WriteLine("       development --repo <checkout> --agent-run --results-dir <absolute-dir> [--contract contracts/development/agent-console-retry.json] [--live --model <model>] [--issue <number> [--publish-issue [--allow-followups]]]");
+            Console.WriteLine("       development --repo <reviewed-checkout> --agent-resume <job-id> --publish-draft --publication-base <original-sha>");
             Console.WriteLine("Issue opt-in: --issue <number> [--publish-issue [--allow-followups]]. Requires approved owner-authored Issue and matching contract marker.");
             Console.WriteLine("Issue writes require --publish-issue; Draft PR writes require --publish-draft --publication-base <sha> and the production contract. No credentials in sandbox/model.");
             Console.WriteLine("Agent run: reviewed console, pair or production expression task; independent ephemeral Docker MicroVM per eligible attempt.");
@@ -45,6 +46,7 @@ internal static class DevelopmentCommand
             string? publicationBase = null;
             bool allowFollowUps = false;
             string? action = null;
+            string? resumeJobId = null;
             for (int i = 0; i < args.Length; i++)
             {
                 switch (args[i])
@@ -87,6 +89,7 @@ internal static class DevelopmentCommand
                     case "--contract":
                     case "--worktree":
                     case "--publication-base":
+                    case "--agent-resume":
                     case "--issue":
                         string option = args[i];
                         if (i + 1 == args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
@@ -126,6 +129,12 @@ internal static class DevelopmentCommand
                                 if (worktree is not null) throw new ArgumentException("Duplicate --worktree.");
                                 worktree = value;
                                 break;
+                            case "--agent-resume":
+                                if (action is not null || resumeJobId is not null)
+                                    throw new ArgumentException("Exactly one development action required.");
+                                action = option;
+                                resumeJobId = value;
+                                break;
                             case "--publication-base":
                                 if (publicationBase is not null) throw new ArgumentException("Duplicate --publication-base.");
                                 publicationBase = value;
@@ -145,6 +154,18 @@ internal static class DevelopmentCommand
             if (repo is null || action is null)
                 throw new ArgumentException("Development mode requires --repo and exactly one action.");
             repo = Path.GetFullPath(repo);
+            if (action == "--agent-resume")
+            {
+                if (!DevelopmentPublicationPolicy.IsSha(resumeJobId, 32)
+                    || resumeJobId != resumeJobId!.ToLowerInvariant()
+                    || !publishDraft || !DevelopmentPublicationPolicy.IsSha(publicationBase, 40)
+                    || publicationBase != publicationBase!.ToLowerInvariant()
+                    || issueNumber is not null || publishIssue || allowFollowUps || live || model is not null
+                    || contractPath is not null || worktree is not null || resultsDir is not null
+                    || source is not null || project is not null || mode is not null)
+                    throw new ArgumentException("Resume accepts only --repo, --agent-resume, --publish-draft and the original --publication-base.");
+                return await DevelopmentRecoveryCommand.RunAsync(repo, resumeJobId!, publicationBase!);
+            }
             if ((issueNumber is not null || publishIssue || allowFollowUps) && action != "--agent-run")
                 throw new ArgumentException("GitHub Issue options require --agent-run.");
             if (publishIssue && issueNumber is null || allowFollowUps && !publishIssue)
