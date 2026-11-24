@@ -202,6 +202,28 @@ internal static class DevelopmentJobEvidence
         return bytes;
     }
 
+    // Mutable projection is deliberately separate from the sealed report.
+    // A crash may leave a stale projection, but never loses publication state.
+    internal static void WriteProjection(DevelopmentJobIdentity identity, DevelopmentJobReport report)
+    {
+        if (report.JobId != identity.JobId || report.IssueNumber != identity.IssueNumber)
+            throw new InvalidOperationException("Recovery report projection identity rejected.");
+        string root = JobRoot(identity);
+        string path = Path.Combine(root, "agent-report.json");
+        string next = path + ".next";
+        byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(report, JsonOptions);
+        if (bytes.Length is < 1 or > 64 * 1024)
+            throw new InvalidOperationException("Recovery report projection size rejected.");
+        if (new FileInfo(path).LinkTarget is not null || Directory.Exists(path))
+            throw new InvalidOperationException("Recovery report projection destination rejected.");
+        if (File.Exists(path))
+            RejectLinks(path, directory: false);
+        WriteNew(next, bytes);
+        File.Move(next, path, overwrite: true);
+        if (!bytes.SequenceEqual(ReadBoundedFile(path, 64 * 1024)))
+            throw new InvalidOperationException("Recovery report projection readback failed.");
+    }
+
     private static void WriteNew(string path, byte[] bytes)
     {
         RejectLinks(Path.GetDirectoryName(path)!, directory: true);
