@@ -76,7 +76,9 @@ internal static class DevelopmentIssueWorkflowTests
     private static JsonElement FakeIssue(int number, string body, string author, bool approved) =>
         JsonSerializer.SerializeToElement(new
         {
-            number, title = "Freigegebener Demo-Auftrag", body,
+            number,
+            title = "Freigegebener Demo-Auftrag",
+            body,
             state = "open",
             user = new { login = author },
             labels = approved ? new[] { new { name = "workflow:in-progress" } }
