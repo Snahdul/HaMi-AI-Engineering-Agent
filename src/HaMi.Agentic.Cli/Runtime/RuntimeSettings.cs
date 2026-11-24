@@ -42,9 +42,25 @@ internal static class RuntimeSettings
         if (args.Contains("--help", StringComparer.Ordinal))
         {
             Console.WriteLine("Usage: config --check [--repo <local-checkout>] (offline; no key value printed)");
+            Console.WriteLine("       config --check-github-issues-token (presence only, no secret output)");
             Console.WriteLine("       config --self-test (offline; no API or Git access)");
             Console.WriteLine("Windows User settings: HaMi-AI-Engineering-Agent-Key and HAMI_AGENT_WORKTREE_ROOT.");
             return 0;
+        }
+
+        if (args.SequenceEqual(["--check-github-issues-token"]))
+        {
+            try
+            {
+                Console.WriteLine("Dedicated GitHub Issues credential: "
+                    + (WindowsIssueCredentialStore.Exists() ? "available" : "missing"));
+                return WindowsIssueCredentialStore.Exists() ? 0 : 1;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("Credential inspection failed: " + ex.GetType().Name);
+                return 2;
+            }
         }
 
         if (args.SequenceEqual(["--self-test"]))
@@ -52,7 +68,7 @@ internal static class RuntimeSettings
 
         if (!args.Contains("--check", StringComparer.Ordinal))
         {
-            Console.Error.WriteLine("Use config --check or config --self-test.");
+            Console.Error.WriteLine("Use config --check, config --check-github-issues-token or config --self-test.");
             return 2;
         }
 
