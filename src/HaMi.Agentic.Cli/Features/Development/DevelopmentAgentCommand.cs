@@ -49,7 +49,9 @@ internal static class DevelopmentAgentCommand
                 throw new InvalidOperationException("First actor slice cannot override the human-reviewed source fixture.");
 
             phase = "snapshot";
-            string source = Path.Combine(repo, "samples", "SandboxCoding");
+            string source = Path.Combine(repo,
+                contract.FixtureDirectory?.Replace('/', Path.DirectorySeparatorChar)
+                ?? Path.Combine("samples", "SandboxCoding"));
             if (!Path.IsPathFullyQualified(source))
                 throw new InvalidOperationException("Agent source snapshot must be absolute.");
             DevelopmentSandboxRunner.InspectSnapshot(source, contract.ProjectFile);
@@ -220,6 +222,10 @@ internal static class DevelopmentAgentCommand
         await DevelopmentIssueWorkflowTests.SelfTestAsync();
         DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, null);
         await DevelopmentAiGenerator.SelfTestAsync(contract);
+        DevelopmentAgentContract pair = DevelopmentAgentContract.Load(
+            repo, DevelopmentAgentContract.PairPath);
+        DevelopmentCandidateFiles.SelfTest(pair);
+        await DevelopmentAiGenerator.SelfTestPairAsync(pair);
 
         // A denied destination must create no folder, stage no source
         // and make no model call. No Docker is involved in this test.
@@ -276,6 +282,20 @@ internal static class DevelopmentAgentCommand
                 || limitedSemanticRunner.Calls != 1)
                 throw new InvalidOperationException(
                     "Akka exceeded retry budget after an acceptance mismatch.");
+
+            // Two-file structured model response has its own reviewed
+            // source contract and immutable harness. The same actor retry
+            // semantics must work without treating JSON as C# source.
+            var pairRunner = new SimulatedIsolatedRunner();
+            DevelopmentJobReport pairJob = await DevelopmentActorCoordinator.RunAsync(
+                system, pair, new DevelopmentScriptedGenerator(), pairRunner);
+            if (pairJob.Status != "passed" || pairJob.ModelCalls != 2
+                || pairRunner.Calls != 2 || pairJob.Attempts.Length != 2
+                || pairJob.Attempts[0].Status != "build-failed"
+                || pairJob.Attempts[1].Status != "passed"
+                || pairJob.Attempts[1].OutputAccepted != true)
+                throw new InvalidOperationException(
+                    "Actor failed reviewed multi-file retry and acceptance flow.");
 
             var limited = contract with { MaxAttempts = 1 };
             var budgetSandbox = new SimulatedIsolatedRunner();
@@ -476,6 +496,22 @@ internal static class DevelopmentAgentCommand
             if (timeout)
                 return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 0, -1,
                     true, true, "Simulated timeout", null));
+            if (contract.IsPair)
+            {
+                IReadOnlyDictionary<string, string> code =
+                    DevelopmentCandidateFiles.Parse(contract, generatedSource);
+                if (code.Values.Any(source =>
+                    source.Contains("UnknownIdentifier", StringComparison.Ordinal)))
+                    return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 1, -1,
+                        false, true, "error CS0103: UnknownIdentifier", null));
+                if (code[DevelopmentAgentContract.PairFirst].Contains("Math.Clamp",
+                        StringComparison.Ordinal)
+                    && code[DevelopmentAgentContract.PairSecond].Contains("InvariantCulture",
+                        StringComparison.Ordinal))
+                    return Task.FromResult(new DevelopmentSandboxAttempt(true, 0, 0, 0,
+                        false, true, "", null, OutputAccepted: true));
+                throw new InvalidOperationException("Pair fake accepted unexpected sources.");
+            }
             if (generatedSource.Contains("UnknownIdentifier", StringComparison.Ordinal))
                 return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 1, -1,
                     false, true, "error CS0103: The name UnknownIdentifier does not exist.", null));
