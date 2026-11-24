@@ -68,6 +68,30 @@ internal static class DevelopmentJobEvidenceTests
                 .SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(manifest, JsonOptions)))
                 throw new InvalidOperationException("Recovery evidence digest not reproducible.");
 
+            string projection = Path.Combine(jobRoot, "agent-report.json");
+            string originalPath = Path.Combine(jobRoot, DevelopmentJobEvidence.OriginalReportName);
+            File.WriteAllBytes(originalPath, original);
+            DevelopmentJobEvidence.WriteProjection(identity, job);
+            var published = job with { DraftPullRequestNumber = 59 };
+            DevelopmentJobEvidence.WriteProjection(identity, published);
+            if (!File.ReadAllBytes(originalPath).SequenceEqual(original)
+                || JsonSerializer.Deserialize<DevelopmentJobReport>(File.ReadAllBytes(projection), JsonOptions)?.DraftPullRequestNumber != 59)
+                throw new InvalidOperationException("Report projection changed original evidence.");
+            string next = projection + ".next";
+            File.WriteAllText(next, "Interrupted report projection");
+            byte[] priorProjection = File.ReadAllBytes(projection);
+            try
+            {
+                DevelopmentJobEvidence.WriteProjection(identity, job);
+                throw new InvalidOperationException("Interrupted projection was overwritten.");
+            }
+            catch (IOException)
+            {
+                if (!File.ReadAllBytes(projection).SequenceEqual(priorProjection)
+                    || File.ReadAllText(next) != "Interrupted report projection")
+                    throw new InvalidOperationException("Interrupted report projection was not preserved.");
+            }
+
             DevelopmentJobAttempt Fixture(int attempt, bool passed)
             {
                 string number = attempt.ToString("D2", System.Globalization.CultureInfo.InvariantCulture);
