@@ -4,8 +4,8 @@ using System.Text.Json.Serialization;
 namespace HaMi.Agentic.Cli.Features.Development;
 
 /// <summary>
-/// Versioned, human-reviewed task for the first actor-driven C# vertical slice.
-/// This intentionally permits exactly one generated file and no host commands.
+/// Pinned, human-reviewed execution tasks for the isolated C# actor flow.
+/// No model response can broaden the reviewed source scope or run host commands.
 /// </summary>
 internal sealed record DevelopmentAgentContract(
     int SchemaVersion,
