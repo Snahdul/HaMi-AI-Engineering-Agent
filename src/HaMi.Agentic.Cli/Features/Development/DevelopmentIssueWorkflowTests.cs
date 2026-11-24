@@ -39,7 +39,7 @@ internal static class DevelopmentIssueWorkflowTests
 
         var gateway = new MemoryIssueGateway();
         const string jobId = "offline-selftest-issue-001";
-        var workflow = new DevelopmentIssueWorkflow(gateway, issue, jobId, allowFollowUps: true);
+        var workflow = new DevelopmentIssueWorkflow(gateway, issue, jobId, allowFollowUps: true, liveGeneration: false);
         await workflow.PublishStartedAsync(CancellationToken.None);
         await workflow.PublishStartedAsync(CancellationToken.None);
         if (gateway.CreatedComments != 1 || gateway.UpdatedComments != 1)
@@ -53,7 +53,9 @@ internal static class DevelopmentIssueWorkflowTests
         if (gateway.CreatedComments != 1 || gateway.ReviewCalls != 1
             || !gateway.CommentBody.Contains("Build=1", StringComparison.Ordinal)
             || !gateway.CommentBody.Contains("passed", StringComparison.Ordinal)
-            || gateway.CommentBody.Contains("C:\\secret", StringComparison.Ordinal))
+            || gateway.CommentBody.Contains("C:\\secret", StringComparison.Ordinal)
+            || !gateway.CommentBody.Contains("RETRY_APPROVED", StringComparison.Ordinal)
+            || !gateway.CommentBody.Contains("offline-scripted", StringComparison.Ordinal))
             throw new InvalidOperationException("Result journal was duplicated, incorrect or leaked paths.");
         ExpectRejected(() => workflow.PublishFinishedAsync(report with { IssueNumber = 123 },
             CancellationToken.None).GetAwaiter().GetResult());
@@ -66,7 +68,7 @@ internal static class DevelopmentIssueWorkflowTests
             throw new InvalidOperationException("Blocking follow-up creation was duplicated or misclassified.");
 
         var noFollowUps = new DevelopmentIssueWorkflow(gateway, issue,
-            "offline-selftest-issue-002", allowFollowUps: false);
+            "offline-selftest-issue-002", allowFollowUps: false, liveGeneration: false);
         await noFollowUps.PublishFinishedAsync(failed with { JobId = "offline-selftest-issue-002" },
             CancellationToken.None);
         if (gateway.CreatedFollowUps != 1)
