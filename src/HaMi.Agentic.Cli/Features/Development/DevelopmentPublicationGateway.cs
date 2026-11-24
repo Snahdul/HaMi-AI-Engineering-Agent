@@ -101,8 +101,10 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
         byte[] header = Encoding.ASCII.GetBytes("blob " + bytes.Length.ToString(
             System.Globalization.CultureInfo.InvariantCulture) + "\0");
         string expectedBlob = Convert.ToHexString(SHA1.HashData(header.Concat(bytes).ToArray())).ToLowerInvariant();
-        using var blob = await PostAsync("git/blobs", new {
-            content = Convert.ToBase64String(bytes), encoding = "base64"
+        using var blob = await PostAsync("git/blobs", new
+        {
+            content = Convert.ToBase64String(bytes),
+            encoding = "base64"
         }, ct);
         if (Sha(blob.RootElement) != expectedBlob)
             throw new InvalidOperationException("Uploaded blob differs from verified bytes.");
@@ -118,7 +120,8 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
             || Sha(original) == expectedBlob)
             throw new InvalidOperationException("Unexpected baseline file mode or unchanged candidate.");
 
-        using var nextTree = await PostAsync("git/trees", new {
+        using var nextTree = await PostAsync("git/trees", new
+        {
             base_tree = baseTree,
             tree = new[] { new { path = evidence.SourcePath, mode = "100644", type = "blob", sha = expectedBlob } }
         }, ct);
@@ -133,10 +136,13 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
         string date = baseline.RootElement.GetProperty("committer").GetProperty("date").GetString()
             ?? throw new InvalidOperationException("Missing base timestamp.");
         var identity = new { name = "HaMi Developer", email = "hami-developer@users.noreply.github.com", date };
-        using var commit = await PostAsync("git/commits", new {
+        using var commit = await PostAsync("git/commits", new
+        {
             message = "HaMi Developer candidate for #" + issue + "\n\n" + marker,
-            tree = candidateTree, parents = new[] { approvedBase },
-            author = identity, committer = identity
+            tree = candidateTree,
+            parents = new[] { approvedBase },
+            author = identity,
+            committer = identity
         }, ct);
         string candidateSha = Sha(commit.RootElement);
         using var verifiedCommit = await GetAsync("git/commits/" + candidateSha, ct);
@@ -174,9 +180,14 @@ internal sealed class DevelopmentPublicationGateway : IDisposable
             throw new InvalidOperationException("Ambiguous publication pull requests.");
         if (array.GetArrayLength() == 1)
             return VerifyPull(array[0], branch, approvedBase, candidateSha, body);
-        using var pr = await PostAsync("pulls", new {
+        using var pr = await PostAsync("pulls", new
+        {
             title = "HaMi Developer candidate for #" + issue,
-            head = branch, @base = "main", body, draft = true, maintainer_can_modify = false
+            head = branch,
+            @base = "main",
+            body,
+            draft = true,
+            maintainer_can_modify = false
         }, ct);
         return VerifyPull(pr.RootElement, branch, approvedBase, candidateSha, body);
     }
