@@ -33,7 +33,8 @@ internal static class DevelopmentPublicationGatewayTests
             {
                 string target = Local(repo, path);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                File.Copy(Local(repository, path), target);
+                await File.WriteAllTextAsync(target, (await File.ReadAllTextAsync(Local(repository, path)))
+                    .Replace("\r\n", "\n", StringComparison.Ordinal));
             }
             await Git(repo, "add", ".");
             await Git(repo, "commit", "-m", "trusted fixture");
@@ -61,6 +62,15 @@ internal static class DevelopmentPublicationGatewayTests
             Task<int> Publish(bool allowed = true) => publisher.PublishAsync(repo, results,
                 job, 77, baseline, allowed, CancellationToken.None);
             await RejectAsync(() => Publish(false));
+            // A clean status is insufficient if Git smudged baseline bytes.
+            string baselineFile = Local(repo, sourcePath);
+            await Git(repo, "config", "core.autocrlf", "true");
+            await File.WriteAllTextAsync(baselineFile, original.Replace("\n", "\r\n", StringComparison.Ordinal));
+            if ((await Git(repo, "status", "--porcelain")).Length != 0)
+                throw new InvalidOperationException("Line ending regression fixture is not clean.");
+            await RejectAsync(() => Publish());
+            await File.WriteAllTextAsync(baselineFile, original);
+            await Git(repo, "config", "core.autocrlf", "false");
             await File.AppendAllTextAsync(patch, "tampered");
             await RejectAsync(() => Publish());
             await File.WriteAllTextAsync(patch, diff);
