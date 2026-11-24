@@ -24,7 +24,8 @@ internal sealed record DevelopmentSandboxAttempt(
     bool Succeeded, int RestoreExitCode, int BuildExitCode, int RunExitCode,
     bool TimedOut, bool CleanupSucceeded, string Feedback, string? ReportPath,
     string? InfrastructureError = null, bool? OutputAccepted = null,
-    string? CandidateWorktree = null, string? DiffPath = null);
+    string? CandidateWorktree = null, string? DiffPath = null,
+    bool SourceRejected = false);
 
 internal sealed record DevelopmentJobAttempt(
     int Number, string Status, int RestoreExitCode, int BuildExitCode,
@@ -212,7 +213,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             // No automatic retry after infrastructure, restore, timeout or
             // unconfirmed cleanup failure. The next attempt may run ONLY after
             // a completed isolated compiler/program failure with confirmed cleanup.
-            if (status is not ("build-failed" or "run-failed" or "acceptance-failed"))
+            if (status is not ("build-failed" or "run-failed" or "acceptance-failed"
+                or "source-rejected"))
             {
                 if (logger is not null)
                     DevelopmentLogEvents.JobFailed(logger, jobId, "sandbox", status, "none",
@@ -232,7 +234,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                     RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
                 DevelopmentLogEvents.AttemptFailed(logger, jobId, attempt, status,
                     diagnostic.Success ? diagnostic.Value.ToUpperInvariant()
-                        : status == "acceptance-failed" ? "ACCEPTANCE_MISMATCH" : "EXECUTION_NONZERO");
+                        : status == "acceptance-failed" ? "ACCEPTANCE_MISMATCH"
+                        : status == "source-rejected" ? "SOURCE_REJECTED" : "EXECUTION_NONZERO");
             }
 
             feedback = DevelopmentSandboxRunner.SafeLogPreview(result.Feedback);
@@ -274,6 +277,10 @@ internal sealed class DevelopmentJobActor : ReceiveActor
     {
         if (!result.CleanupSucceeded) return "cleanup-failed";
         if (result.TimedOut) return "timed-out";
+        if (result.SourceRejected && result.InfrastructureError is null
+            && result.RestoreExitCode == -1 && result.BuildExitCode == -1
+            && result.RunExitCode == -1)
+            return "source-rejected";
         if (result.InfrastructureError is not null || result.RestoreExitCode != 0
             || result.BuildExitCode < 0)
             return "infrastructure-failed";
