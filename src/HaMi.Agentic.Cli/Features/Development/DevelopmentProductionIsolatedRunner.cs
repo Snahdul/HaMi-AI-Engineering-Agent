@@ -104,6 +104,8 @@ internal sealed class DevelopmentProductionIsolatedRunner(
             if (evidence.BaseCommit != baseCommit
                 || evidence.SourcePath != DevelopmentProductionVerifier.SourcePath
                 || !File.Exists(evidence.DiffPath)
+                || DevelopmentProductionVerifier.FileHash(evidence.DiffPath) != evidence.DiffSha256
+                || DevelopmentProductionVerifier.FileHash(target) != evidence.SourceSha256
                 || evidence.SandboxReport is null
                 || !File.Exists(evidence.SandboxReport))
                 throw new InvalidOperationException("Production evidence failed consistency checks.");
@@ -133,7 +135,8 @@ internal sealed class DevelopmentProductionIsolatedRunner(
                 evidence.RunExitCode, microVm.TimedOut, evidence.CleanupSucceeded,
                 feedback, evidence.SandboxReport,
                 evidence.CheckoutUnchanged ? microVm.Error : "CANDIDATE_CHANGED",
-                evidence.OutputAccepted, worktree, evidence.DiffPath);
+                evidence.OutputAccepted, worktree, evidence.DiffPath,
+                ProductionEvidence: succeeded ? evidence : null);
         }
         catch (Exception ex) when (ex is not OperationCanceledException
             && ex is not DevelopmentProductionStageException)
