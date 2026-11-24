@@ -129,9 +129,12 @@ internal sealed record DevelopmentAgentContract(
         }));
         var pair = test with
         {
-            TaskId = "sandbox-pair", SourceFile = PairFirst,
-            ExpectedStdout = ReviewedPairStdout, FixtureDirectory = PairFixture,
-            ScopeContract = PairScopePath, ReviewedScope = scope
+            TaskId = "sandbox-pair",
+            SourceFile = PairFirst,
+            ExpectedStdout = ReviewedPairStdout,
+            FixtureDirectory = PairFixture,
+            ScopeContract = PairScopePath,
+            ReviewedScope = scope
         };
         pair.Validate();
         ExpectInvalid(pair with { ReviewedScope = null }, "Missing reviewed scope accepted.");
