@@ -31,7 +31,10 @@ internal sealed record DevelopmentJobAttempt(
 
 internal sealed record DevelopmentJobReport(
     string JobId, string Status, int ModelCalls, DevelopmentJobAttempt[] Attempts,
-    string? Failure);
+    string? Failure,
+    [property: System.Text.Json.Serialization.JsonIgnore(
+        Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    int? IssueNumber = null);
 
 /// <summary>
 /// Single-job Akka coordinator. Only this actor owns the retry counter and
