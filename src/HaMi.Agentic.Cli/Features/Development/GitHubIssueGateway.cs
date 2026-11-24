@@ -1,3 +1,4 @@
+using HaMi.Agentic.Cli.Runtime;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -31,14 +32,19 @@ internal sealed class GitHubIssueGateway : IDevelopmentIssueGateway, IDisposable
     {
         ownsClient = client is null;
         this.client = client ?? new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-        this.token = token ?? Environment.GetEnvironmentVariable(TokenVariable);
+        // An explicitly passed value (including empty for negative tests)
+        // wins; otherwise prefer the dedicated user credential over any
+        // temporary process environment compatibility fallback. Never use
+        // the operator's GitHub CLI / gh auth credentials.
+        this.token = token ?? WindowsIssueCredentialStore.Read()
+            ?? Environment.GetEnvironmentVariable(TokenVariable);
     }
 
     internal void RequireWriteAccess()
     {
         if (string.IsNullOrWhiteSpace(token))
             throw new InvalidOperationException(
-                "GitHub write requested: configure HAMI_AGENT_GITHUB_TOKEN with repository Issues write permission on the host.");
+                "GitHub write requested: store a dedicated Issues token using config --store-github-issues-token on HaMi11.");
     }
 
     private async Task<JsonDocument> SendAsync(
