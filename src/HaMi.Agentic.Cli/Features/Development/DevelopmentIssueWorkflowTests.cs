@@ -73,6 +73,34 @@ internal static class DevelopmentIssueWorkflowTests
             CancellationToken.None);
         if (gateway.CreatedFollowUps != 1)
             throw new InvalidOperationException("Follow-up created without authorization.");
+        await VerifyHttpAdapterOfflineAsync();
+    }
+
+    private static async Task VerifyHttpAdapterOfflineAsync()
+    {
+        // Exercise HTTP method/path, Bearer usage, 64-bit comment identifiers
+        // and label reconciliation through a fully in-memory transport.
+        using var http = new HttpClient(new FakeGitHubHandler());
+        using var adapter = new GitHubIssueGateway(http, "FAKE_TEST_TOKEN");
+        using JsonDocument source = await adapter.GetIssueAsync(77, CancellationToken.None);
+        if (source.RootElement.GetProperty("number").GetInt32() != 77)
+            throw new InvalidOperationException("GitHub issue endpoint returned wrong task.");
+        if (await adapter.FindJobCommentAsync(77, "<!-- none -->", CancellationToken.None) is not null)
+            throw new InvalidOperationException("Nonexistent issue journal was not recognized.");
+        long id = await adapter.CreateCommentAsync(77, "<!-- hami-agent-job:test -->",
+            CancellationToken.None);
+        if (id != 7127452838L)
+            throw new InvalidOperationException("GitHub's 64-bit comment ID was truncated.");
+        await adapter.UpdateCommentAsync(id, "Safe result summary", CancellationToken.None);
+        if (await adapter.FindFollowUpAsync("<!-- none -->", CancellationToken.None) is not null)
+            throw new InvalidOperationException("Nonexistent follow-up was not recognized.");
+        if (await adapter.CreateFollowUpAsync("[Task] Follow-up", "Safe details",
+            CancellationToken.None) != 88)
+            throw new InvalidOperationException("Follow-up issue API returned wrong number.");
+        await adapter.MarkReviewAsync(77, CancellationToken.None);
+        await adapter.MarkReviewAsync(77, CancellationToken.None);
+        using var denied = new GitHubIssueGateway(http, "");
+        ExpectRejected(denied.RequireWriteAccess);
     }
 
     private static JsonElement FakeIssue(int number, string body, string author, bool approved) =>
@@ -92,6 +120,57 @@ internal static class DevelopmentIssueWorkflowTests
         try { action(); }
         catch (InvalidOperationException) { return; }
         throw new InvalidOperationException("Unauthorized GitHub Issue was accepted.");
+    }
+
+    private sealed class FakeGitHubHandler : HttpMessageHandler
+    {
+        private bool inProgress = true;
+        private bool review;
+        private const string Base = "/repos/Snahdul/HaMi-AI-Engineering-Agent/";
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken ct)
+        {
+            if (request.RequestUri?.Host != "api.github.com"
+                || request.Headers.Authorization?.Parameter != "FAKE_TEST_TOKEN")
+                throw new InvalidOperationException("GitHub endpoint or auth header incorrect.");
+            string path = request.RequestUri.AbsolutePath;
+            string method = request.Method.Method;
+            string json;
+            if (method == "GET" && path == Base + "issues/77")
+                json = "{\"number\":77,\"labels\":["
+                    + (inProgress ? "{\"name\":\"workflow:in-progress\"}" : "")
+                    + (inProgress && review ? "," : "")
+                    + (review ? "{\"name\":\"workflow:review\"}" : "")
+                    + "]}";
+            else if (method == "GET" && path == Base + "issues/77/comments")
+                json = "[]";
+            else if (method == "GET" && path == Base + "issues")
+                json = "[]";
+            else if (method == "POST" && path == Base + "issues/77/comments")
+                json = "{\"id\":7127452838}";
+            else if (method == "PATCH" && path == Base + "issues/comments/7127452838")
+                json = "{\"id\":7127452838}";
+            else if (method == "POST" && path == Base + "issues")
+                json = "{\"number\":88}";
+            else if (method == "POST" && path == Base + "issues/77/labels")
+            {
+                review = true;
+                json = "[]";
+            }
+            else if (method == "DELETE" && path == Base + "issues/77/labels/workflow%3Ain-progress")
+            {
+                if (!review) throw new InvalidOperationException("Review label was not added first.");
+                inProgress = false;
+                json = "[]";
+            }
+            else
+                throw new InvalidOperationException("Unexpected GitHub transport call: " + method + " " + path);
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(json)
+            });
+        }
     }
 
     private sealed class MemoryIssueGateway : IDevelopmentIssueGateway
