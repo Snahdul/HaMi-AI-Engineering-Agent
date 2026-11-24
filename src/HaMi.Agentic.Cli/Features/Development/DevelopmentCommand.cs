@@ -19,8 +19,10 @@ internal static class DevelopmentCommand
             Console.WriteLine("       development --repo <checkout> --sandbox-run --source <snapshot-dir> --project <relative.csproj> --mode <build|run|test> --results-dir <absolute-dir>");
             Console.WriteLine("       development --repo <checkout> --sandbox-run-self-test");
             Console.WriteLine("       development --repo <checkout> --agent-self-test (offline, Akka + CLI parser)");
-            Console.WriteLine("       development --repo <checkout> --agent-run --results-dir <absolute-dir> [--contract contracts/development/agent-console-retry.json] [--live --model <model>]");
-            Console.WriteLine("Agent run: model generates only Program.cs; independent ephemeral Docker MicroVM per attempt, no GitHub writes.");
+            Console.WriteLine("       development --repo <checkout> --agent-run --results-dir <absolute-dir> [--contract contracts/development/agent-console-retry.json] [--live --model <model>] [--issue <number> [--publish-issue [--allow-followups]]]");
+            Console.WriteLine("Issue opt-in: --issue <number> [--publish-issue [--allow-followups]]. Requires approved owner-authored Issue and matching contract marker.");
+            Console.WriteLine("No GitHub writes without explicit --publish-issue; no issue permissions in sandbox/model. Host token: HAMI_AGENT_GITHUB_TOKEN.");
+            Console.WriteLine("Agent run: model generates only Program.cs; independent ephemeral Docker MicroVM per attempt.");
             Console.WriteLine("Contract checks are read-only. sandbox-poc runs the trusted RetryBudget fixture; sandbox-run executes a bounded project snapshot only in a fresh local MicroVM.");
             return 0;
         }
@@ -36,6 +38,9 @@ internal static class DevelopmentCommand
             string? mode = null;
             string? model = null;
             bool live = false;
+            int? issueNumber = null;
+            bool publishIssue = false;
+            bool allowFollowUps = false;
             string? action = null;
             for (int i = 0; i < args.Length; i++)
             {
@@ -57,6 +62,14 @@ internal static class DevelopmentCommand
                         if (live) throw new ArgumentException("Duplicate --live.");
                         live = true;
                         break;
+                    case "--publish-issue":
+                        if (publishIssue) throw new ArgumentException("Duplicate --publish-issue.");
+                        publishIssue = true;
+                        break;
+                    case "--allow-followups":
+                        if (allowFollowUps) throw new ArgumentException("Duplicate --allow-followups.");
+                        allowFollowUps = true;
+                        break;
                     case "--model":
                     case "--repo":
                     case "--results-dir":
@@ -65,6 +78,7 @@ internal static class DevelopmentCommand
                     case "--mode":
                     case "--contract":
                     case "--worktree":
+                    case "--issue":
                         string option = args[i];
                         if (i + 1 == args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
                             throw new ArgumentException("Missing value for " + option);
@@ -103,6 +117,11 @@ internal static class DevelopmentCommand
                                 if (worktree is not null) throw new ArgumentException("Duplicate --worktree.");
                                 worktree = value;
                                 break;
+                            case "--issue":
+                                if (issueNumber is not null || !int.TryParse(value, out int parsed) || parsed < 1)
+                                    throw new ArgumentException("Issue number must be a unique positive integer.");
+                                issueNumber = parsed;
+                                break;
                         }
                         break;
                     default:
@@ -113,6 +132,10 @@ internal static class DevelopmentCommand
             if (repo is null || action is null)
                 throw new ArgumentException("Development mode requires --repo and exactly one action.");
             repo = Path.GetFullPath(repo);
+            if ((issueNumber is not null || publishIssue || allowFollowUps) && action != "--agent-run")
+                throw new ArgumentException("GitHub Issue options require --agent-run.");
+            if (publishIssue && issueNumber is null || allowFollowUps && !publishIssue)
+                throw new ArgumentException("--publish-issue requires --issue; --allow-followups requires --publish-issue.");
 
             if (action == "--agent-self-test")
             {
@@ -131,7 +154,8 @@ internal static class DevelopmentCommand
                     || (model is not null && !live))
                     throw new ArgumentException("Agent run requires --results-dir and the reviewed fixture; --source is not authorized; --model only with --live.");
                 return await DevelopmentAgentCommand.RunAsync(repo,
-                    contractPath, source, resultsDir, live, model);
+                    contractPath, source, resultsDir, live, model,
+                    issueNumber, publishIssue, allowFollowUps);
             }
 
             if (model is not null || live)

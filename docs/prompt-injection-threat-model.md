@@ -93,3 +93,30 @@ Quellen:
 - [OWASP: Secure Coding with AI](https://cheatsheetseries.owasp.org/cheatsheets/Secure_Coding_with_AI_Cheat_Sheet.html)
 - [Microsoft: Defend against indirect prompt injection](https://learn.microsoft.com/en-us/security/zero-trust/sfi/defend-indirect-prompt-injection)
 - [Microsoft: Input, Context, and Retrieval Hygiene](https://learn.microsoft.com/en-us/security/zero-trust/catalog-ai-defense-capabilities/input-context-retrieval-hygiene)
+
+
+## Issue-Adapter: technische Vertrauensgrenze (Issue #40)
+
+Das Lesen eines Issue autorisiert keine Aktion. Für einen Development-Pilot verlangt der Host explizit ausgewählte Issue-Nummer, gepinnten Git-Origin, Eigentümer, workflow:in-progress, den passenden Contract-Marker und begrenzte Template-Felder. Nur die fachlichen Textfelder des ansonsten unverändert genehmigten Demo-Contracts erhalten diesen Kontext.
+
+Ein Issue ist weiterhin untrusted Prompt-Kontext. Modellseitige Tools, Hostbefehle oder zusätzliche Dateien können durch dessen Text nicht aktiviert werden. Das Host-Token HAMI_AGENT_GITHUB_TOKEN wird aus der sbx-Prozessumgebung entfernt und seine Abwesenheit im Gast geprüft.
+
+--publish-issue und --allow-followups sind separate Opt-ins. Es werden ausschließlich sichere Statuswörter, Codes, Versuche und Exitcodes veröffentlicht; keine Rohdiagnosen, Modelltexte, absolute lokale Pfade oder Zugangsdaten. Marker und Abfragen begrenzen Dubletten bei Retries, garantieren aber keine atomare GitHub-Transaktion.
+
+
+## Dedizierte Windows-Anmeldeinformation für Issues
+
+Der Host verwendet den Windows-Anmeldeinformationsmanager unter
+`HaMi-AI-Engineering-Agent/GitHub-Issues/Snahdul` als primäre Quelle
+für den auf das Agenten-Repository eingeschränkten GitHub-Issues-Token.
+Der Agent ruft dafür **nicht** `gh auth token` auf, speichert weder
+Token noch Passwort in Benutzerumgebungsvariablen und protokolliert
+keinen Secretwert. Der Prozess muss den Token für den HTTPS-Request
+kurzzeitig im Speicher halten; die Speicherung ersetzt keine
+Isolation bei einem kompromittierten Hostbenutzer.
+
+Die Authentifizierung ändert **nicht** die bereits geltenden
+Autorisierungsgrenzen: explizites `--publish-issue`, Host-Origin,
+Issue-Owner/Label/Contract-Marker und unveränderte MicroVM-Policy.
+Die begrenzten Fine-grained-Berechtigungen schützen zusätzlich;
+ein Benutzer-PAT ist aber keine separate GitHub-Bot-Identität.

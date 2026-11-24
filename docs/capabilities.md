@@ -12,6 +12,7 @@
 | MicroVM execution | Local experimental runner; real host checks documented, not a general security guarantee |
 | Structured logging | Implemented with correlated job and sandbox events |
 | Live model generation | Explicit opt-in, bounded experimental use |
+| GitHub issue-driven pilot | Implemented for the fixed demo contract; real issue #42 verified issue reading, comment updates and review label transition with explicit write opt-in |
 | General issue-driven autonomous development | Planned / evolving; not claimed as a completed capability |
 
 The next direction is longer autonomous execution within explicit contracts and independently enforced policies. Human approval remains necessary for consequential decisions and merges. See the [project board](https://github.com/users/Snahdul/projects/2/views/1) and [development history](development-history.md) for evidence and limitations.

@@ -18,12 +18,15 @@ internal static class DevelopmentAgentCommand
 {
     public static async Task<int> RunAsync(
         string repo, string? contractPath, string? sourceDirectory,
-        string resultsDirectory, bool live, string? requestedModel)
+        string resultsDirectory, bool live, string? requestedModel,
+        int? issueNumber = null, bool publishIssue = false, bool allowFollowUps = false)
     {
         string jobId = Guid.NewGuid().ToString("N");
         string phase = "logging";
         AgentLoggingSession? logging = null;
         Microsoft.Extensions.Logging.ILogger? logger = null;
+        GitHubIssueGateway? issues = null;
+        DevelopmentIssueWorkflow? journal = null;
         try
         {
             // One ILogger event is sent to both console and the rolling .clef file.
@@ -63,12 +66,39 @@ internal static class DevelopmentAgentCommand
                 return 2;
             }
 
+            phase = "issue-authorization";
+            if (publishIssue && issueNumber is null || allowFollowUps && !publishIssue)
+                throw new InvalidOperationException("GitHub write flags require --issue and explicit --publish-issue.");
+            if (issueNumber is not null)
+            {
+                if (issueNumber < 1) throw new InvalidOperationException("Issue number must be positive.");
+                await DevelopmentIssueWorkflow.VerifyOriginAsync(repo);
+                issues = new GitHubIssueGateway();
+                if (publishIssue) issues.RequireWriteAccess();
+                phase = "issue-fetch";
+                using JsonDocument issueJson = await issues.GetIssueAsync(issueNumber.Value, CancellationToken.None);
+                ApprovedDevelopmentIssue sourceIssue = ApprovedDevelopmentIssue.Parse(
+                    issueJson.RootElement, contract);
+                contract = sourceIssue.Bind(contract);
+                if (logging.Settings.LogSuccessfulSteps)
+                    DevelopmentLogEvents.IssueBound(logger, jobId, sourceIssue.Number);
+                if (publishIssue)
+                    journal = new DevelopmentIssueWorkflow(issues, sourceIssue, jobId, allowFollowUps, live);
+            }
+
             if (logging.Settings.LogSuccessfulSteps)
                 DevelopmentLogEvents.PreflightAccepted(logger, jobId, contract.TaskId,
                     contract.ProjectFile, contract.MaxAttempts);
             phase = "results-allocation";
             string runRoot = Path.Combine(resultsDirectory, "agent-job-" + jobId);
             Directory.CreateDirectory(runRoot);
+            if (journal is not null)
+            {
+                phase = "issue-publish-start";
+                await journal.PublishStartedAsync(CancellationToken.None);
+                if (logging.Settings.LogSuccessfulSteps)
+                    DevelopmentLogEvents.IssueJournalPublished(logger, jobId, issueNumber!.Value, "started");
+            }
 
             phase = "generator";
             using Microsoft.Extensions.AI.IChatClient? client =
@@ -98,6 +128,8 @@ internal static class DevelopmentAgentCommand
                     system, contract, generator, sandbox, logger: logger, jobId: jobId,
                     logSuccessfulSteps: logging.Settings.LogSuccessfulSteps,
                     logDecisionSummaries: logging.Settings.LogDecisionSummaries);
+                if (issueNumber.HasValue)
+                    result = result with { IssueNumber = issueNumber.Value };
 
                 phase = "report";
                 string jsonPath = Path.Combine(runRoot, "agent-report.json");
@@ -106,6 +138,13 @@ internal static class DevelopmentAgentCommand
                 if (logging.Settings.LogSuccessfulSteps)
                     DevelopmentLogEvents.JobFinished(logger, jobId, result.Status,
                         result.ModelCalls, result.Attempts.Length, jsonPath);
+                if (journal is not null)
+                {
+                    phase = "issue-publish-result";
+                    await journal.PublishFinishedAsync(result, CancellationToken.None);
+                    if (logging.Settings.LogSuccessfulSteps)
+                        DevelopmentLogEvents.IssueJournalPublished(logger, jobId, issueNumber!.Value, "completed");
+                }
                 return result.Status == "passed" ? 0 : 1;
             }
             finally
@@ -132,6 +171,9 @@ internal static class DevelopmentAgentCommand
                 "storage" => "RESULTS_PATH_REJECTED",
                 "snapshot" => "SNAPSHOT_REJECTED",
                 "api-key" => "API_KEY_INVALID",
+                "issue-authorization" => "ISSUE_AUTHORIZATION_REJECTED",
+                "issue-fetch" => "ISSUE_NOT_APPROVED_OR_UNAVAILABLE",
+                "issue-publish-start" or "issue-publish-result" => "ISSUE_PUBLICATION_FAILED",
                 "results-allocation" => "RESULTS_DIRECTORY_UNWRITABLE",
                 "generator" => "GENERATOR_INITIALIZATION_FAILED",
                 "host" => "HOST_START_FAILED",
@@ -147,6 +189,8 @@ internal static class DevelopmentAgentCommand
                 "source-override" => "--source entfernen; der gepruefte Agent-Contract bestimmt die einzige Fixture.",
                 "snapshot" => "Die freigegebene Demo-Fixture und erlaubte Dateien kontrollieren.",
                 "api-key" => "Host-API-Schluessel pruefen.",
+                "issue-authorization" or "issue-fetch" => "GitHub-Origin, freigegebenes Issue, Contract-Marker und Label workflow:in-progress pruefen.",
+                "issue-publish-start" or "issue-publish-result" => "GitHub Issues-Berechtigung und Netzwerk pruefen; Job/Issue-Kommentar anhand der Job-ID abgleichen, keinen Job blind neu starten.",
                 "results-allocation" or "report" => "Dateiberechtigungen und freien Speicher im Ergebnisverzeichnis pruefen.",
                 "generator" => "Modell-/Provider-Konfiguration pruefen.",
                 "host" => "Akka.Hosting-Konfiguration und DI pruefen.",
@@ -163,6 +207,7 @@ internal static class DevelopmentAgentCommand
         }
         finally
         {
+            issues?.Dispose();
             logging?.Dispose();
         }
     }
@@ -171,6 +216,7 @@ internal static class DevelopmentAgentCommand
     {
         CommandLineRouter.SelfTest();
         DevelopmentAgentContract.SelfTest();
+        await DevelopmentIssueWorkflowTests.SelfTestAsync();
         DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, null);
         await DevelopmentAiGenerator.SelfTestAsync(contract);
 

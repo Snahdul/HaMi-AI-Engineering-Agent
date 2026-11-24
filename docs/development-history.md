@@ -718,3 +718,60 @@ prueft standardmaessig den PR-#39-Review-Branch und akzeptiert optional
 `-ExpectedRef`. Mit `-VerifyOnly -ReportPath <bestehender-agent-report.json>`
 kontrolliert es bestehende Reports und die unabhaengige Abwesenheit der
 MicroVMs, ohne neuen Build oder Modellaufruf.
+
+
+## Issue-driven Development – Pilot (Issue #40)
+
+GitHub Issues führen den fachlichen Auftrag und den verdichteten Verlauf; Serilog und lokale Berichte enthalten technische Nachweise. Der Agent bleibt für diesen ersten Durchstich auf den geprüften Demo-Contract (Demo.csproj / Program.cs) beschränkt.
+
+Ein zulässiges Pilot-Issue muss offen, vom Eigentümer Snahdul erstellt und mit workflow:in-progress markiert sein. Im Body stehen exakt die Zeile HaMi-Agent-Task: sandbox-console-retry, der Abschnitt ### Ziel und Nutzen und 1–4 begrenzte Akzeptanzkriterien unter ### Akzeptanzkriterien. Der lokale Git-Origin wird geprüft.
+
+**Read-only Issue-Modus:** Entwicklung mit der bisherigen CLI plus --issue <NUMMER> starten. Der Agent liest und bindet die fachliche Aufgabe; GitHub wird nicht verändert.
+
+**GitHub-Write-Opt-in:** --publish-issue ergänzt einen zu derselben Job-ID korrelierten Kommentar, aktualisiert ihn mit sicher verdichteten Ausführungsberichten und löst nach einem erfolgreichen Job das Label workflow:review aus. Optional erlaubt --allow-followups bei persistentem failed/exhausted einen deduplizierten Folgeauftrag ohne automatischen Neustart.
+
+Die Schreibfunktion benötigt einen dedizierten, auf dieses Repository begrenzten GitHub-Issues-Token (Issues: Read and write). Unter Windows liest der Agent ausschließlich den Eintrag aus der Windows-Anmeldeinformationsverwaltung; auf anderen Plattformen ist eine ausdrücklich konfigurierte Prozessvariable `HAMI_AGENT_GITHUB_TOKEN` möglich. Nicht den Project-Token `HAMI_PROJECT_TOKEN` verwenden. Tokens niemals in Quelltext, Shell-Historie, Issues, Prompts oder Logs veröffentlichen. Keine GitHub-Credentials gelangen in die MicroVM.
+
+**Beispiel: **
+
+    dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- development --repo . --agent-run --results-dir G:\HaMi\Sandbox\PoC\Runs --issue <NUMMER> --publish-issue
+
+Der Host verwendet nur feste Statuswörter, numerische Exitcodes und Zeit-/Job-Korrelation, keine Rohlogs oder lokale absolute Pfade. Die vorhandenen Project-#2-Actions bleiben die einzige Statusautomatisierung; weder PR-Merge noch Folgejob werden ohne neue Autorisierung ausgeführt.
+
+Offline-Selbsttest: development --repo . --agent-self-test. Reale GitHub-Abnahme vor Merge ausstehend.
+
+
+### Dedizierter GitHub-Issues-Token unter Windows (HaMi11)
+
+Der HaMi Developer verwendet ein auf `Snahdul/HaMi-AI-Engineering-Agent`
+beschränktes **Fine-grained Personal Access Token** mit ausschließlich
+`Issues: Read and write` (und obligatorischem `Metadata: Read-only`).
+Die persönliche GitHub-CLI-Anmeldung wird nicht verwendet.
+
+**Einrichtung und Rotation:** `Win + R` → `control /name Microsoft.CredentialManager`
+→ **Windows-Anmeldeinformationen** → **Generische Anmeldeinformation hinzufügen**
+(bei Rotation bestehenden Eintrag bearbeiten):
+
+- Internet-/Netzwerkadresse: `HaMi-AI-Engineering-Agent/GitHub-Issues/Snahdul`
+- Benutzername: `Snahdul`
+- Kennwort: ausschließlich der dedizierte `github_pat_...`-Token aus dem sicheren Tresor
+
+Der vorherige Konsolenbefehl `config --store-github-issues-token` wurde nach
+mehrfachen fehlgeschlagenen interaktiven HaMi11-Tests **entfernt**. Den Token
+nicht als PowerShell-Argument oder Prozess-/Benutzer-Umgebungsvariable
+speichern. Auf HaMi11 wird ausschließlich der benutzerspezifische Windows
+Credential Manager gelesen.
+
+**Prüfung ohne Ausgabe des Tokenwerts:**
+
+```powershell
+dotnet run --project .\src\HaMi.Agentic.Cli -c Release -- config --check-github-issues-token
+```
+
+`available` bestätigt das Vorhandensein des Credentials. Der erfolgreiche
+echte GitHub-Issue-Pilot #42 (24.11.2026) bestätigt darüber hinaus, dass
+der gespeicherte Token für das Issue-Lesen, Aktualisieren eines Kommentars
+und den Labelwechsel auf `workflow:review` verwendet werden konnte.
+Beim Ablaufdatum 22.02.2027 den Token bei GitHub erneuern und den
+bestehenden Credential-Manager-Eintrag bearbeiten. Keine Secretwerte in
+Logs oder Issues kopieren.

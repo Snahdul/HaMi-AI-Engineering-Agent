@@ -63,6 +63,14 @@ internal static partial class DevelopmentLogEvents
     internal static partial void SandboxPhase(ILogger logger, string jobId, int attempt,
         string description, string sandboxName, string phaseCode, long elapsedMs, int exitCode);
 
+    [LoggerMessage(EventId = 3612, Level = LogLevel.Information,
+        Message = "IssueBound job={JobId} issue={IssueNumber} source=approved-github-issue scope=reviewed-contract")]
+    internal static partial void IssueBound(ILogger logger, string jobId, int issueNumber);
+
+    [LoggerMessage(EventId = 3613, Level = LogLevel.Information,
+        Message = "IssueJournalPublished job={JobId} issue={IssueNumber} phase={Phase}")]
+    internal static partial void IssueJournalPublished(ILogger logger, string jobId, int issueNumber, string phase);
+
     [LoggerMessage(EventId = 3610, Level = LogLevel.Debug,
         Message = "ActorMessageIgnored job={JobId} attempt={Attempt} stage={Stage} reason=stale-or-duplicate")]
     internal static partial void MessageIgnored(ILogger logger, string jobId, int attempt, string stage);
