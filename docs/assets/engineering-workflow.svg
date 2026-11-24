@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 154" role="img" aria-labelledby="title desc">
+<title id="title">Human-led engineering workflow</title>
+<desc id="desc">Human defines intent, agent executes within limits, compiler and tests validate, human reviews results. Validation can return to the agent for bounded correction.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#64748b"/></marker></defs>
+<g fill="#eef2ff" stroke="#818cf8" stroke-width="1.5">
+<rect x="12" y="18" width="190" height="76" rx="8"/>
+<rect x="250" y="18" width="190" height="76" rx="8"/>
+<rect x="520" y="18" width="190" height="76" rx="8"/>
+<rect x="758" y="18" width="190" height="76" rx="8"/>
+</g>
+<g fill="#1e293b" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="middle">
+<text x="107" y="49">Human defines<tspan x="107" dy="22">intent</tspan></text>
+<text x="345" y="49">Agent executes<tspan x="345" dy="22">within limits</tspan></text>
+<text x="615" y="49">Compiler and<tspan x="615" dy="22">test validation</tspan></text>
+<text x="853" y="49">Human reviews<tspan x="853" dy="22">results</tspan></text>
+</g>
+<g fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)">
+<path d="M202 56 H244"/><path d="M440 56 H514"/><path d="M710 56 H752"/>
+<path d="M615 94 V128 H345 V100"/>
+</g>
+<rect x="399" y="116" width="162" height="24" rx="5" fill="#eef2ff"/>
+<text x="480" y="133" fill="#334155" font-family="Arial, Helvetica, sans-serif" font-size="13" text-anchor="middle">Bounded correction</text>
+</svg>
