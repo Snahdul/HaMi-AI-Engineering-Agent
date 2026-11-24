@@ -57,6 +57,21 @@ jobs:
       - name: Validate System.CommandLine and actor-driven retry workflow (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
 
+      - name: Verify production-verify CLI dispatch reaches reviewed contract gate (offline)
+        shell: bash
+        run: |
+          set +e
+          output="$(dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --production-verify --contract contracts/development/invalid.json --worktree "$RUNNER_TEMP/nonexistent-candidate" --results-dir "$RUNNER_TEMP/production-results" 2>&1)"
+          result=$?
+          set -e
+          if [ "$result" -ne 1 ] || ! grep -Fq "Unreviewed production verification contract." <<< "$output"; then
+            echo "::error::The CLI did not dispatch production verification to its fail-closed contract gate."
+            printf '%s\n' "$output"
+            exit 1
+          fi
+          echo "Production verification dispatch reached the contract gate without MicroVM, model, or GitHub writes."
+
+
       - name: Validate general C# sandbox runner input isolation (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-run-self-test
 
