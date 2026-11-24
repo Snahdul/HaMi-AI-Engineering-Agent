@@ -50,11 +50,15 @@ internal static class DevelopmentAgentCommand
 
             phase = "snapshot";
             string source = Path.Combine(repo,
-                contract.FixtureDirectory?.Replace('/', Path.DirectorySeparatorChar)
-                ?? Path.Combine("samples", "SandboxCoding"));
+                contract.IsProduction ? Path.Combine("samples", "RetryBudget")
+                : contract.FixtureDirectory?.Replace('/', Path.DirectorySeparatorChar)
+                    ?? Path.Combine("samples", "SandboxCoding"));
             if (!Path.IsPathFullyQualified(source))
                 throw new InvalidOperationException("Agent source snapshot must be absolute.");
-            DevelopmentIsolatedRunner.VerifyFixture(contract, source);
+            if (contract.IsProduction)
+                await DevelopmentProductionIsolatedRunner.PreflightAsync(repo, resultsDirectory);
+            else
+                DevelopmentIsolatedRunner.VerifyFixture(contract, source);
 
             phase = "storage";
             DevelopmentIsolatedRunner.ValidateStoragePaths(repo, source, resultsDirectory);
@@ -108,8 +112,9 @@ internal static class DevelopmentAgentCommand
             IDevelopmentCandidateGenerator generator = live
                 ? new DevelopmentAiGenerator(client!, requestedModel ?? "gpt-5.4-mini")
                 : new DevelopmentScriptedGenerator();
-            IDevelopmentIsolatedRunner sandbox =
-                new DevelopmentIsolatedRunner(repo, source, runRoot, logger, jobId,
+            IDevelopmentIsolatedRunner sandbox = contract.IsProduction
+                ? new DevelopmentProductionIsolatedRunner(repo, runRoot)
+                : new DevelopmentIsolatedRunner(repo, source, runRoot, logger, jobId,
                     logging.Settings.LogSuccessfulSteps);
 
             phase = "host";
@@ -218,6 +223,8 @@ internal static class DevelopmentAgentCommand
     {
         CommandLineRouter.SelfTest();
         DevelopmentAgentContract.SelfTest();
+        DevelopmentProductionExpression.SelfTest();
+        await DevelopmentProductionVerifier.ScopeSelfTestAsync(repo);
         DevelopmentOutputAcceptance.SelfTest();
         await DevelopmentIssueWorkflowTests.SelfTestAsync();
         DevelopmentAgentContract contract = DevelopmentAgentContract.Load(repo, null);
@@ -226,17 +233,31 @@ internal static class DevelopmentAgentCommand
             repo, DevelopmentAgentContract.PairPath);
         DevelopmentCandidateFiles.SelfTest(pair);
         await DevelopmentAiGenerator.SelfTestPairAsync(pair);
+        DevelopmentAgentContract production = DevelopmentAgentContract.Load(
+            repo, DevelopmentAgentContract.ProductionPath);
+        await DevelopmentAiGenerator.SelfTestProductionAsync(production);
 
-        // A denied destination must create no folder, stage no source
-        // and make no model call. No Docker is involved in this test.
+        // Exercise the same trusted path gate without invoking RunAsync:
+        // an EXPECTED denial must not emit a misleading red JobFailed event.
+        // No outputs, models or Docker are involved in this test.
         string rejectedResults = Path.Combine(repo, ".hami-invalid-agent-results");
         if (Directory.Exists(rejectedResults))
             throw new InvalidOperationException("Preflight test destination unexpectedly already exists.");
-        int denied = await RunAsync(repo, null, null, rejectedResults, live: false, requestedModel: null);
-        if (denied != 1 || Directory.Exists(rejectedResults))
-            throw new InvalidOperationException("Results inside repository were not rejected before writes.");
-        DevelopmentIsolatedRunner.ValidateStoragePaths(repo,
-            Path.Combine(repo, "samples", "SandboxCoding"),
+        string fixture = Path.Combine(repo, "samples", "SandboxCoding");
+        bool rejected = false;
+        try
+        {
+            DevelopmentIsolatedRunner.ValidateStoragePaths(repo, fixture, rejectedResults);
+        }
+        catch (InvalidOperationException ex) when (
+            ex.Message == "Agent results must be separate from the repository and its fixture.")
+        {
+            rejected = true;
+        }
+        if (!rejected || Directory.Exists(rejectedResults))
+            throw new InvalidOperationException("Results inside repository were not safely rejected.");
+        Console.WriteLine("PASS - erwartete Ablehnung: Ergebnisverzeichnis im Repository blockiert.");
+        DevelopmentIsolatedRunner.ValidateStoragePaths(repo, fixture,
             Path.Combine(Path.GetTempPath(), "hami-safe-output-external"));
         // Use the same Akka.Hosting composition root in CI as in the real
         // agent command; this catches DI/host startup errors without Docker.
@@ -296,6 +317,49 @@ internal static class DevelopmentAgentCommand
                 || pairJob.Attempts[1].OutputAccepted != true)
                 throw new InvalidOperationException(
                     "Actor failed reviewed multi-file retry and acceptance flow.");
+
+            var productionRunner = new SimulatedIsolatedRunner();
+            DevelopmentJobReport productionJob = await DevelopmentActorCoordinator.RunAsync(
+                system, production, new DevelopmentScriptedGenerator(), productionRunner);
+            if (productionJob.Status != "passed" || productionJob.ModelCalls != 2
+                || productionRunner.Calls != 2 || productionJob.Attempts.Length != 2
+                || productionJob.Attempts[0].Status != "run-failed"
+                || productionJob.Attempts[1].Status != "passed")
+                throw new InvalidOperationException(
+                    "Production actor did not correct an independently failing program.");
+
+            // A faulted Task must retain the host-defined production phase,
+            // even when wrapped by the Task's AggregateException.
+            DevelopmentJobReport productionStageFault = await DevelopmentActorCoordinator.RunAsync(
+                system, production, new DevelopmentScriptedGenerator(),
+                new StageFaultIsolatedRunner());
+            if (productionStageFault.Status != "failed"
+                || productionStageFault.ModelCalls != 1
+                || productionStageFault.Attempts.Length != 0
+                || productionStageFault.Failure != "sandbox:PRODUCTION_SCOPE_AND_MICROVM")
+                throw new InvalidOperationException(
+                    "Production stage code was lost while unwrapping a faulted Task.");
+
+            var noOpProductionRunner = new SimulatedIsolatedRunner();
+            DevelopmentJobReport noOpProduction = await DevelopmentActorCoordinator.RunAsync(
+                system, production, new NoOpProductionGenerator(), noOpProductionRunner);
+            if (noOpProduction.Status != "exhausted"
+                || noOpProduction.ModelCalls != 2
+                || noOpProduction.Attempts.Length != 2
+                || noOpProduction.Attempts.Any(a => a.Status != "source-rejected"))
+                throw new InvalidOperationException(
+                    "No-op production source must exhaust safely without a MicroVM.");
+
+            var invalidProduction = new InvalidProductionGenerator();
+            var invalidRunner = new SimulatedIsolatedRunner();
+            DevelopmentJobReport rejectedProduction = await DevelopmentActorCoordinator.RunAsync(
+                system, production, invalidProduction, invalidRunner);
+            if (rejectedProduction.Status != "exhausted"
+                || rejectedProduction.Attempts.Length != 2
+                || rejectedProduction.Attempts.All(a => a.Status != "source-rejected")
+                || invalidRunner.Calls != 0)
+                throw new InvalidOperationException(
+                    "Production actor executed malformed source or ignored retry budget.");
 
             var limited = contract with { MaxAttempts = 1 };
             var budgetSandbox = new SimulatedIsolatedRunner();
@@ -427,6 +491,17 @@ internal static class DevelopmentAgentCommand
         }
     }
 
+    private sealed class StageFaultIsolatedRunner : IDevelopmentIsolatedRunner
+    {
+        public Task<DevelopmentSandboxAttempt> ExecuteAsync(
+            DevelopmentAgentContract contract, string generatedSource, int attempt,
+            CancellationToken cancellationToken) =>
+            Task.FromException<DevelopmentSandboxAttempt>(
+                new DevelopmentProductionStageException(
+                    "PRODUCTION_SCOPE_AND_MICROVM",
+                    new InvalidOperationException("Opaque host-only failure.")));
+    }
+
     private sealed class DelayedIsolatedRunner : IDevelopmentIsolatedRunner
     {
         private readonly TaskCompletionSource<DevelopmentSandboxAttempt> finished =
@@ -452,6 +527,30 @@ internal static class DevelopmentAgentCommand
 
         public void Finish(DevelopmentSandboxAttempt result) =>
             finished.TrySetResult(result);
+    }
+
+    private sealed class NoOpProductionGenerator : IDevelopmentCandidateGenerator
+    {
+        public Task<string> GenerateAsync(
+            DevelopmentAgentContract contract, string feedback, int attempt,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(DevelopmentProductionExpression.Serialize(
+                "attempt >= 1 && maxCalls >= 1 && attempt < maxCalls"));
+        }
+    }
+
+    private sealed class InvalidProductionGenerator : IDevelopmentCandidateGenerator
+    {
+        public Task<string> GenerateAsync(
+            DevelopmentAgentContract contract, string feedback, int attempt,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(
+                DevelopmentProductionExpression.Serialize("Environment.Exit(0) == 0"));
+        }
     }
 
     private sealed class SemanticRepairGenerator : IDevelopmentCandidateGenerator
@@ -496,6 +595,21 @@ internal static class DevelopmentAgentCommand
             if (timeout)
                 return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 0, -1,
                     true, true, "Simulated timeout", null));
+            if (contract.IsProduction)
+            {
+                string expression = DevelopmentProductionExpression.Parse(generatedSource);
+                if (expression == "attempt >= 1 && maxCalls >= 1 && attempt < maxCalls")
+                    return Task.FromResult(new DevelopmentSandboxAttempt(false, -1, -1, -1,
+                        false, true, "Proposed source was identical to main.", null,
+                        SourceRejected: true));
+                if (expression == "attempt < maxCalls")
+                    return Task.FromResult(new DevelopmentSandboxAttempt(false, 0, 0, 1,
+                        false, true, "FAIL attempt=0 maxCalls=1", null, OutputAccepted: false));
+                if (expression == "attempt > 0 && maxCalls > 0 && attempt < maxCalls")
+                    return Task.FromResult(new DevelopmentSandboxAttempt(true, 0, 0, 0,
+                        false, true, "", null, OutputAccepted: true));
+                throw new InvalidOperationException("Unexpected production fake expression.");
+            }
             if (contract.IsPair)
             {
                 IReadOnlyDictionary<string, string> code =

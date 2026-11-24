@@ -14,6 +14,7 @@ namespace HaMi.Agentic.Cli.Features.Development;
 internal static class DevelopmentProductionVerifier
 {
     internal const string ContractPath = "contracts/development/retry-budget-refinement.json";
+    internal const string AgentContractPath = DevelopmentAgentContract.ProductionScopePath;
     internal const string SourcePath = "src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs";
     private const string OtherAllowedPath = "src/HaMi.Agentic.Cli/Features/Coding/CodingTaskDefinition.cs";
     private const string HarnessPath = "samples/RetryBudget/Program.cs";
@@ -34,7 +35,7 @@ internal static class DevelopmentProductionVerifier
     internal static async Task<int> RunAsync(
         string repository, string candidate, string contractPath, string resultsRoot)
     {
-        if (contractPath != ContractPath)
+        if (contractPath is not (ContractPath or AgentContractPath))
             throw new InvalidOperationException("Unreviewed production verification contract.");
         if (!Path.IsPathFullyQualified(candidate) || !Path.IsPathFullyQualified(resultsRoot))
             throw new InvalidOperationException("Candidate and results root must be absolute.");
@@ -52,7 +53,7 @@ internal static class DevelopmentProductionVerifier
             "rev-parse", "--verify", "refs/heads/main")).Trim();
 
         string[] changes = await DevelopmentWorktreeGuard.CheckAsync(
-            repo, worktree, ContractPath);
+            repo, worktree, contractPath);
         if (changes.Length != 1 || changes[0] != SourcePath)
             throw new InvalidOperationException(
                 "Production verification requires only a modified RetryBudget.cs.");
@@ -64,13 +65,10 @@ internal static class DevelopmentProductionVerifier
             throw new InvalidOperationException(
                 "Only one unstaged tracked source modification is authorized.");
 
-        DevelopmentContract scope = DevelopmentContract.Parse(
-            await DevelopmentWorktreeGuard.GitAsync(repo, "show",
-                "refs/heads/main:" + ContractPath));
-        if (scope.TaskId != "retry-budget-refinement"
-            || !scope.AllowedWritePaths.SequenceEqual(
-                [SourcePath, OtherAllowedPath], StringComparer.Ordinal))
-            throw new InvalidOperationException("Production scope changed unexpectedly.");
+        // The exact scope used by the worktree guard MUST also be the scope
+        // independently loaded here. Never substitute the older demo scope
+        // when verifying the production-agent contract.
+        await ValidateReviewedScopeAsync(repo, contractPath);
 
         string baseline = await File.ReadAllTextAsync(ToPath(repo, SourcePath));
         string source = await File.ReadAllTextAsync(ToPath(worktree, SourcePath));
@@ -159,6 +157,54 @@ internal static class DevelopmentProductionVerifier
         return passed ? 0 : 1;
     }
 
+    internal static async Task ValidateReviewedScopeAsync(string repository, string contractPath)
+    {
+        if (contractPath is not (ContractPath or AgentContractPath))
+            throw new InvalidOperationException("Unreviewed production verification contract.");
+        DevelopmentContract scope = DevelopmentContract.Parse(
+            await DevelopmentWorktreeGuard.GitAsync(repository, "show",
+                "refs/heads/main:" + contractPath));
+        ValidateReviewedScope(contractPath, scope);
+    }
+
+    internal static void ValidateReviewedScope(string contractPath, DevelopmentContract scope)
+    {
+        bool reviewedDemo = contractPath == ContractPath
+            && scope.TaskId == "retry-budget-refinement"
+            && scope.AllowedWritePaths.SequenceEqual(
+                [SourcePath, OtherAllowedPath], StringComparer.Ordinal);
+        bool reviewedAgent = contractPath == AgentContractPath
+            && scope.TaskId == "production-retry-budget"
+            && scope.AllowedWritePaths.SequenceEqual([SourcePath], StringComparer.Ordinal);
+        if (!reviewedDemo && !reviewedAgent)
+            throw new InvalidOperationException("Production scope changed unexpectedly.");
+    }
+
+    internal static async Task ScopeSelfTestAsync(string repo)
+    {
+        // The CI checks out PR commits as detached HEAD and deliberately
+        // has no refs/heads/main. Inspect the immutable tested HEAD object
+        // here; only real production execution uses refs/heads/main.
+        string agentJson = await DevelopmentWorktreeGuard.GitAsync(
+            repo, "show", "HEAD:" + AgentContractPath);
+        string demoJson = await DevelopmentWorktreeGuard.GitAsync(
+            repo, "show", "HEAD:" + ContractPath);
+        DevelopmentContract agentScope = DevelopmentContract.Parse(agentJson);
+        DevelopmentContract demoScope = DevelopmentContract.Parse(demoJson);
+        ValidateReviewedScope(AgentContractPath, agentScope);
+        ValidateReviewedScope(ContractPath, demoScope);
+        ExpectRejected(() => ValidateReviewedScope(ContractPath, agentScope));
+        ExpectRejected(() => ValidateReviewedScope(AgentContractPath, demoScope));
+        ExpectRejected(() => ValidateReviewedScope("contracts/development/unknown.json", agentScope));
+    }
+
+    private static void ExpectRejected(Action action)
+    {
+        try { action(); }
+        catch (InvalidOperationException) { return; }
+        throw new InvalidOperationException("Wrong production scope was accepted.");
+    }
+
     internal static void ValidateSourceChange(string baseline, string candidate)
     {
         if (string.IsNullOrWhiteSpace(candidate) || candidate.Length > 16 * 1024
@@ -173,18 +219,26 @@ internal static class DevelopmentProductionVerifier
         if (end < 0)
             throw new InvalidOperationException("Approved method expression is missing.");
         string expression = candidate[start..end].Trim();
-        if (expression.Length is < 1 or > 350
+        ValidateExpression(expression);
+        if (!string.Equals(CodingTaskDefinition.RetryBudget.ReplaceExpression(
+                baseline, expression), candidate, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                "Production edit changes more than the approved expression.");
+
+    }
+
+    internal static void ValidateExpression(string expression)
+    {
+        if (string.IsNullOrWhiteSpace(expression)
+            || expression.Length > 350
             || expression.Contains('\n') || expression.Contains('\r')
             || !AllowedExpression.IsMatch(expression)
             || expression.Contains("//", StringComparison.Ordinal)
             || expression.Contains("/*", StringComparison.Ordinal)
             || expression.Contains("*/", StringComparison.Ordinal)
             || Identifiers.Matches(expression).Cast<Match>()
-                .Any(m => !CodingTaskDefinition.RetryBudget.AllowedIdentifiers.Contains(m.Value))
-            || !string.Equals(CodingTaskDefinition.RetryBudget.ReplaceExpression(
-                baseline, expression), candidate, StringComparison.Ordinal))
-            throw new InvalidOperationException(
-                "Production edit changes more than the approved expression or contains forbidden syntax.");
+                .Any(m => !CodingTaskDefinition.RetryBudget.AllowedIdentifiers.Contains(m.Value)))
+            throw new InvalidOperationException("Production expression contains forbidden syntax.");
     }
 
     internal static void ValidateManifest(string[] manifest)

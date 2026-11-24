@@ -23,7 +23,7 @@ internal static class DevelopmentCommand
             Console.WriteLine("       development --repo <checkout> --agent-run --results-dir <absolute-dir> [--contract contracts/development/agent-console-retry.json] [--live --model <model>] [--issue <number> [--publish-issue [--allow-followups]]]");
             Console.WriteLine("Issue opt-in: --issue <number> [--publish-issue [--allow-followups]]. Requires approved owner-authored Issue and matching contract marker.");
             Console.WriteLine("No GitHub writes without explicit --publish-issue; no issue permissions in sandbox/model. Host token: HAMI_AGENT_GITHUB_TOKEN.");
-            Console.WriteLine("Agent run: model generates only Program.cs; independent ephemeral Docker MicroVM per attempt.");
+            Console.WriteLine("Agent run: reviewed console, pair or production expression task; independent ephemeral Docker MicroVM per eligible attempt.");
             Console.WriteLine("Contract checks are read-only. sandbox-poc runs the trusted RetryBudget fixture; sandbox-run executes a bounded project snapshot only in a fresh local MicroVM.");
             return 0;
         }

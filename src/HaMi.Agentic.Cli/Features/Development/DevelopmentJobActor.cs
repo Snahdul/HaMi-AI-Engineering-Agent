@@ -23,12 +23,15 @@ internal interface IDevelopmentIsolatedRunner
 internal sealed record DevelopmentSandboxAttempt(
     bool Succeeded, int RestoreExitCode, int BuildExitCode, int RunExitCode,
     bool TimedOut, bool CleanupSucceeded, string Feedback, string? ReportPath,
-    string? InfrastructureError = null, bool? OutputAccepted = null);
+    string? InfrastructureError = null, bool? OutputAccepted = null,
+    string? CandidateWorktree = null, string? DiffPath = null,
+    bool SourceRejected = false);
 
 internal sealed record DevelopmentJobAttempt(
     int Number, string Status, int RestoreExitCode, int BuildExitCode,
     int RunExitCode, bool TimedOut, bool CleanupSucceeded, string? ReportPath,
-    bool? OutputAccepted = null);
+    bool? OutputAccepted = null,
+    string? CandidateWorktree = null, string? DiffPath = null);
 
 internal sealed record DevelopmentJobReport(
     string JobId, string Status, int ModelCalls, DevelopmentJobAttempt[] Attempts,
@@ -48,7 +51,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
     internal sealed record Cancel;
     private sealed record Generated(int Attempt, string Source);
     private sealed record Executed(int Attempt, DevelopmentSandboxAttempt Result);
-    private sealed record Faulted(int Attempt, string Stage, string FailureType);
+    private sealed record Faulted(int Attempt, string Stage, string FailureType,
+        string? ProductionStageCode = null);
 
     private readonly DevelopmentAgentContract contract;
     private readonly IDevelopmentCandidateGenerator generator;
@@ -124,6 +128,26 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 return;
             }
 
+            if (contract.IsProduction)
+            {
+                try
+                {
+                    _ = DevelopmentProductionExpression.Parse(message.Source);
+                }
+                catch (InvalidOperationException)
+                {
+                    attempts.Add(new DevelopmentJobAttempt(attempt, "source-rejected",
+                        -1, -1, -1, false, true, null));
+                    feedback = "Return only a valid bounded JSON object with one C# expression, "
+                        + "using attempt and maxCalls with approved operators.";
+                    if (logger is not null)
+                        DevelopmentLogEvents.AttemptFailed(logger, jobId, attempt,
+                            "source-rejected", "PRODUCTION_EXPRESSION_INVALID");
+                    RetryOrFinish("SOURCE_REJECTED");
+                    return;
+                }
+            }
+
             stage = Stage.Executing;
             sandboxStarted = Stopwatch.GetTimestamp();
             if (logger is not null && logSuccessfulSteps) DevelopmentLogEvents.SandboxStarted(logger, jobId, attempt);
@@ -133,7 +157,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             try { task = isolatedRunner.ExecuteAsync(contract, message.Source, current, cancellation.Token); }
             catch (Exception ex)
             {
-                self.Tell(new Faulted(current, "sandbox", ex.GetType().Name));
+                self.Tell(new Faulted(current, "sandbox", ex.GetType().Name,
+                    (ex as DevelopmentProductionStageException)?.StageCode));
                 return;
             }
             _ = task.ContinueWith(t =>
@@ -141,8 +166,15 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 if (t.IsCompletedSuccessfully)
                     self.Tell(new Executed(current, t.Result));
                 else
+                {
+                    // Preserve the trusted production-stage wrapper: GetBaseException()
+                    // would discard it and lose its host-defined stage code.
+                    Exception? failure = t.Exception is { InnerExceptions.Count: 1 } aggregate
+                        ? aggregate.InnerExceptions[0] : t.Exception;
                     self.Tell(new Faulted(current, "sandbox",
-                        t.IsCanceled ? "OperationCanceled" : t.Exception?.GetBaseException().GetType().Name ?? "Unknown"));
+                        t.IsCanceled ? "OperationCanceled" : failure?.GetType().Name ?? "Unknown",
+                        (failure as DevelopmentProductionStageException)?.StageCode));
+                }
             }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         });
 
@@ -168,7 +200,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 result.TimedOut, result.CleanupSucceeded, result.ReportPath,
                 result.BuildExitCode == 0 && result.RunExitCode == 0
                     && result.CleanupSucceeded && result.InfrastructureError is null
-                    ? result.OutputAccepted : null));
+                    ? result.OutputAccepted : null,
+                result.CandidateWorktree, result.DiffPath));
 
             // A coordinator deadline stops NEW attempts, but must not stop the
             // actor or its host until the already-running sbx task has returned
@@ -189,7 +222,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             // No automatic retry after infrastructure, restore, timeout or
             // unconfirmed cleanup failure. The next attempt may run ONLY after
             // a completed isolated compiler/program failure with confirmed cleanup.
-            if (status is not ("build-failed" or "run-failed" or "acceptance-failed"))
+            if (status is not ("build-failed" or "run-failed" or "acceptance-failed"
+                or "source-rejected"))
             {
                 if (logger is not null)
                     DevelopmentLogEvents.JobFailed(logger, jobId, "sandbox", status, "none",
@@ -209,7 +243,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                     RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
                 DevelopmentLogEvents.AttemptFailed(logger, jobId, attempt, status,
                     diagnostic.Success ? diagnostic.Value.ToUpperInvariant()
-                        : status == "acceptance-failed" ? "ACCEPTANCE_MISMATCH" : "EXECUTION_NONZERO");
+                        : status == "acceptance-failed" ? "ACCEPTANCE_MISMATCH"
+                        : status == "source-rejected" ? "SOURCE_REJECTED" : "EXECUTION_NONZERO");
             }
 
             feedback = DevelopmentSandboxRunner.SafeLogPreview(result.Feedback);
@@ -223,12 +258,13 @@ internal sealed class DevelopmentJobActor : ReceiveActor
         {
             if (message.Attempt != attempt || stage == Stage.Finished) return;
             if (logger is not null)
-                DevelopmentLogEvents.JobFailed(logger, jobId, message.Stage, "OPERATION_FAULT",
+                DevelopmentLogEvents.JobFailed(logger, jobId, message.Stage,
+                    message.ProductionStageCode ?? "OPERATION_FAULT",
                     message.FailureType, message.Stage == "generator"
                         ? "Modell-/Generator-Konfiguration und Auftragsbudget pruefen."
                         : "Sandbox-Report und lokalen MicroVM-Zustand pruefen.");
             Finish(cancelRequested ? "cancelled" : "failed",
-                message.Stage + ":" + message.FailureType);
+                message.Stage + ":" + (message.ProductionStageCode ?? message.FailureType));
         });
 
         Receive<Cancel>(_ =>
@@ -251,6 +287,10 @@ internal sealed class DevelopmentJobActor : ReceiveActor
     {
         if (!result.CleanupSucceeded) return "cleanup-failed";
         if (result.TimedOut) return "timed-out";
+        if (result.SourceRejected && result.InfrastructureError is null
+            && result.RestoreExitCode == -1 && result.BuildExitCode == -1
+            && result.RunExitCode == -1)
+            return "source-rejected";
         if (result.InfrastructureError is not null || result.RestoreExitCode != 0
             || result.BuildExitCode < 0)
             return "infrastructure-failed";

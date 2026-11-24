@@ -4,8 +4,8 @@ using System.Text.Json.Serialization;
 namespace HaMi.Agentic.Cli.Features.Development;
 
 /// <summary>
-/// Versioned, human-reviewed task for the first actor-driven C# vertical slice.
-/// This intentionally permits exactly one generated file and no host commands.
+/// Pinned, human-reviewed execution tasks for the isolated C# actor flow.
+/// No model response can broaden the reviewed source scope or run host commands.
 /// </summary>
 internal sealed record DevelopmentAgentContract(
     int SchemaVersion,
@@ -25,6 +25,8 @@ internal sealed record DevelopmentAgentContract(
     internal const string ReviewedPairStdout = "HaMi pair acceptance passed";
     internal const string TrustedPath = "contracts/development/agent-console-retry.json";
     internal const string PairPath = "contracts/development/agent-pair.json";
+    internal const string ProductionPath = "contracts/development/agent-production-retry-budget.json";
+    internal const string ProductionScopePath = "contracts/development/agent-production-retry-budget-scope.json";
     internal const string PairScopePath = "contracts/development/sandbox-pair.json";
     internal const string PairFixture = "samples/SandboxCodingPair";
     internal const string PairFirst = "src/HaMi.Agentic.Cli/Features/Development/PairCalculator.cs";
@@ -39,6 +41,9 @@ internal sealed record DevelopmentAgentContract(
     internal bool IsPair => TaskId == "sandbox-pair";
 
     [JsonIgnore]
+    internal bool IsProduction => TaskId == "production-retry-budget";
+
+    [JsonIgnore]
     internal string[] GeneratedPaths => ReviewedScope?.AllowedWritePaths ?? [SourceFile];
 
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web)
@@ -50,7 +55,7 @@ internal sealed record DevelopmentAgentContract(
     public static DevelopmentAgentContract Load(string repository, string? contractPath)
     {
         string selected = contractPath ?? TrustedPath;
-        if (selected is not (TrustedPath or PairPath))
+        if (selected is not (TrustedPath or PairPath or ProductionPath))
             throw new InvalidOperationException("Agent run requires a reviewed development contract.");
         string text = File.ReadAllText(Path.Combine(repository, selected.Replace('/', Path.DirectorySeparatorChar)));
         using var document = JsonDocument.Parse(text);
@@ -66,16 +71,18 @@ internal sealed record DevelopmentAgentContract(
                 throw new InvalidOperationException("Duplicate agent contract fields are forbidden.");
         DevelopmentAgentContract contract = JsonSerializer.Deserialize<DevelopmentAgentContract>(text, Options)
             ?? throw new InvalidOperationException("Agent contract is empty.");
-        if (selected == PairPath)
+        if (selected is PairPath or ProductionPath)
         {
-            if (contract.ScopeContract != PairScopePath)
-                throw new InvalidOperationException("Unreviewed multi-file scope contract.");
+            string reviewedPath = selected == PairPath ? PairScopePath : ProductionScopePath;
+            if (contract.ScopeContract != reviewedPath)
+                throw new InvalidOperationException("Unreviewed development scope contract.");
             string scopeText = File.ReadAllText(Path.Combine(repository,
-                PairScopePath.Replace('/', Path.DirectorySeparatorChar)));
+                reviewedPath.Replace('/', Path.DirectorySeparatorChar)));
             contract = contract with { ReviewedScope = DevelopmentContract.Parse(scopeText) };
         }
         contract.Validate();
-        if ((selected == PairPath) != contract.IsPair)
+        if ((selected == PairPath) != contract.IsPair
+            || (selected == ProductionPath) != contract.IsProduction)
             throw new InvalidOperationException("Task and agent contract path do not match.");
         return contract;
     }
@@ -94,9 +101,20 @@ internal sealed record DevelopmentAgentContract(
                 [PairFirst, PairSecond], StringComparer.Ordinal)
             && ExpectedStdout == ReviewedPairStdout
             && MaxAttempts == 2;
+        bool production = TaskId == "production-retry-budget"
+            && ProjectFile == "samples/RetryBudget/RetryBudget.csproj"
+            && SourceFile == DevelopmentProductionVerifier.SourcePath
+            && ScopeContract == ProductionScopePath
+            && FixtureDirectory is null
+            && ReviewedScope is { TaskId: "production-retry-budget", TargetFramework: "net11.0" }
+            && ReviewedScope.AllowedWritePaths.SequenceEqual(
+                [DevelopmentProductionVerifier.SourcePath], StringComparer.Ordinal)
+            && ExpectedStdout == DevelopmentOutputAcceptance.ReviewedProductionStdout
+            && MaxAttempts == 2;
         if (SchemaVersion != 1 || TargetFramework != "net11.0"
-            || ProjectFile != "Demo.csproj" || Mode != "run"
-            || !(single || pair))
+            || Mode != "run"
+            || (!production && ProjectFile != "Demo.csproj")
+            || !(single || pair || production))
             throw new InvalidOperationException("Agent contract scope or version is not approved.");
         if (MaxAttempts is < 1 or > 3)
             throw new InvalidOperationException("Agent retry budget must be between 1 and 3.");
@@ -141,6 +159,33 @@ internal sealed record DevelopmentAgentContract(
         ExpectInvalid(pair with { ExpectedStdout = "wrong" }, "Changed pair stdout accepted.");
         ExpectInvalid(pair with { FixtureDirectory = "../unsafe" }, "Changed fixture accepted.");
         ExpectInvalid(pair with { MaxAttempts = 3 }, "Unapproved retry expansion accepted.");
+        var productionScope = DevelopmentContract.Parse(JsonSerializer.Serialize(new
+        {
+            schemaVersion = 1,
+            taskId = "production-retry-budget",
+            description = "One approved production file.",
+            targetFramework = "net11.0",
+            allowedWritePaths = new[] { DevelopmentProductionVerifier.SourcePath },
+            acceptanceCriteria = new[] { "Trusted host tests verify the candidate." }
+        }));
+        var production = test with
+        {
+            TaskId = "production-retry-budget",
+            ProjectFile = "samples/RetryBudget/RetryBudget.csproj",
+            SourceFile = DevelopmentProductionVerifier.SourcePath,
+            ExpectedStdout = DevelopmentOutputAcceptance.ReviewedProductionStdout,
+            ScopeContract = ProductionScopePath,
+            ReviewedScope = productionScope
+        };
+        production.Validate();
+        ExpectInvalid(production with { ReviewedScope = null },
+            "Production scope was not required.");
+        ExpectInvalid(production with { MaxAttempts = 3 },
+            "Production retry budget could be widened.");
+        ExpectInvalid(production with { SourceFile = PairFirst },
+            "Production source path could be changed.");
+        ExpectInvalid(production with { ScopeContract = PairScopePath },
+            "Production scope could be changed.");
     }
 
     private static void ExpectInvalid(DevelopmentAgentContract contract, string message)

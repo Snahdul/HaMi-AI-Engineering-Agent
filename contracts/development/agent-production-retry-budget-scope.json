@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "taskId": "production-retry-budget",
+  "description": "A reviewed, model-generated expression change in the real RetryBudget.cs source file, built and executed only inside the existing offline MicroVM production verifier.",
+  "targetFramework": "net11.0",
+  "allowedWritePaths": [
+    "src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs"
+  ],
+  "acceptanceCriteria": [
+    "Only the RetryBudget.HasAnotherAttempt expression may change in a detached production worktree.",
+    "The host-owned RetryBudget fixture, project and 268 boundary tests remain immutable.",
+    "A fresh isolated MicroVM verifies every generated candidate. No model code runs on the host.",
+    "The original main checkout must remain unmodified; no automatic commit, PR or merge."
+  ]
+}
