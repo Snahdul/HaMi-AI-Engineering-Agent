@@ -338,6 +338,7 @@ internal static class DevelopmentAgentCommand
         DevelopmentJobStateRoot.SelfTest();
         DevelopmentJobIdentityFactory.SelfTest();
         DevelopmentJobEvidenceTests.SelfTest();
+        await DevelopmentRecoveryTests.SelfTestAsync(repo);
         await DevelopmentPublicationGatewayTests.SelfTestAsync(repo);
         DevelopmentProductionExpression.SelfTest();
         await DevelopmentProductionVerifier.ScopeSelfTestAsync(repo);
