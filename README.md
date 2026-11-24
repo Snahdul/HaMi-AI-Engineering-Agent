@@ -704,3 +704,15 @@ Terminale Fehler nennen einen geprueften Grundcode und eine Massnahme.
 Ein Report wird nur dann angegeben, wenn er wirklich geschrieben wurde.
 Die historischen impliziten Option-first-Aufrufe sind entfernt:
 `replay --check .` verwenden, nicht `--check .`.
+
+
+**Sandbox-Phasen seit PR #39:** Ein Agentenlauf dokumentiert die
+MicroVM-Meilensteine als strukturierte `SandboxPhase`-Events in Konsole,
+`agent-*.log` und `agent-*.clef`. Raw-Compiler-Diagnosen bleiben
+ausschliesslich im gesonderten Sandbox-Report.
+
+Das Abnahmeskript `scripts/acceptance/Invoke-HaMiDeveloperAcceptance.ps1`
+prueft standardmaessig den PR-#39-Review-Branch und akzeptiert optional
+`-ExpectedRef`. Mit `-VerifyOnly -ReportPath <bestehender-agent-report.json>`
+kontrolliert es bestehende Reports und die unabhaengige Abwesenheit der
+MicroVMs, ohne neuen Build oder Modellaufruf.
