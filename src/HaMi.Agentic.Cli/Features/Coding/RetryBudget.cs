@@ -8,5 +8,5 @@ namespace HaMi.Agentic.Cli.Features.Coding;
 internal static class RetryBudget
 {
     internal static bool HasAnotherAttempt(int attempt, int maxCalls) =>
-        attempt >= 1 && maxCalls >= 1 && attempt < maxCalls;
+        attempt > 0 && maxCalls > 0 && attempt < maxCalls;
 }
