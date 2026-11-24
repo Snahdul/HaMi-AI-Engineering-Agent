@@ -96,7 +96,7 @@ internal sealed record ApprovedDevelopmentIssue(
 /// </summary>
 internal sealed class DevelopmentIssueWorkflow(
     IDevelopmentIssueGateway gateway, ApprovedDevelopmentIssue issue, string jobId,
-    bool allowFollowUps)
+    bool allowFollowUps, bool liveGeneration)
 {
     internal static async Task VerifyOriginAsync(string repo)
     {
@@ -136,6 +136,7 @@ internal sealed class DevelopmentIssueWorkflow(
             + "- Issue: #" + issue.Number + "\n"
             + "- Job: " + jobId + "\n"
             + "- Auftrag: geprüft und auf den versionierten Demo-Contract begrenzt\n"
+            + "- Generierung: " + (liveGeneration ? "live (API-Kosten möglich)" : "offline-scripted") + "\n"
             + "- Status: **In Progress**\n"
             + "- Nächster Schritt: isolierte Codegenerierung und Prüfung\n\n"
             + "_Automatischer, redigierter Fortschrittsbericht; keine vollständigen Logs oder Secrets._";
@@ -161,10 +162,11 @@ internal sealed class DevelopmentIssueWorkflow(
         body.AppendLine("- Job: " + jobId);
         body.AppendLine("- Ergebnis: **" + status + "**");
         body.AppendLine("- Generatoraufrufe: " + report.ModelCalls
-            + " (im Offline-Modus scripted, ohne API-Kosten)");
+            + (liveGeneration ? " (live; API-Kosten möglich)" : " (offline-scripted, ohne API-Kosten)"));
         body.AppendLine("- Isolierte Versuche: " + report.Attempts.Length);
-        foreach (DevelopmentJobAttempt attempt in report.Attempts)
+        for (int index = 0; index < report.Attempts.Length; index++)
         {
+            DevelopmentJobAttempt attempt = report.Attempts[index];
             // Status is a fixed vocabulary controlled by the host; never copy
             // compiler diagnostics, raw model text or local report paths.
             string classification = attempt.Status switch
@@ -178,7 +180,13 @@ internal sealed class DevelopmentIssueWorkflow(
                 + ", Build=" + attempt.BuildExitCode
                 + ", Run=" + attempt.RunExitCode
                 + ", Cleanup=" + (attempt.CleanupSucceeded ? "bestätigt" : "NICHT bestätigt"));
+            if (index < report.Attempts.Length - 1 && classification is "build-failed" or "run-failed")
+                body.AppendLine("  - Entscheidung: RETRY_APPROVED (korrigierbarer Fehler, Cleanup bestätigt).");
+            if (!attempt.CleanupSucceeded || attempt.TimedOut)
+                body.AppendLine("  - Entscheidung: kein automatischer Retry bei fehlendem Cleanup oder Timeout.");
         }
+        if (status == "exhausted")
+            body.AppendLine("- Entscheidung: Retry-Budget ausgeschöpft; keine automatische Budgeterhöhung.");
         body.AppendLine("- Technischer Nachweis: lokaler agent-report.json, Serilog und Sandbox-Reports");
         body.AppendLine("- Freigabe: menschliches Review erforderlich; kein automatischer Merge");
         body.AppendLine();
