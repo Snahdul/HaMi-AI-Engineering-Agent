@@ -140,6 +140,39 @@ internal static class DevelopmentJobStateRoot
         ValidateWindowsEntry(root, true, user);
     }
 
+    // A default Windows token owner can be the Administrators group, not
+    // WindowsIdentity.User. Assign the approved owner at creation, not by
+    // repairing an existing claim. Use the platform ACL API.
+    [SupportedOSPlatform("windows")]
+    internal static FileStream CreateWindowsPrivateFile(string path, FileOptions options)
+    {
+        using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+        SecurityIdentifier user = identity.User
+            ?? throw new InvalidOperationException("Recovery account SID missing.");
+        var security = new FileSecurity();
+        security.SetOwner(user);
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        foreach (SecurityIdentifier sid in new[]
+        {
+            user,
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null)
+        })
+            security.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl, AccessControlType.Allow));
+        var stream = new FileInfo(path).Create(FileMode.CreateNew, FileSystemRights.FullControl,
+            FileShare.None, 4096, options, security);
+        try
+        {
+            ValidateWindowsSecurity(stream.GetAccessControl(), false, user);
+            return stream;
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+    }
+
     [SupportedOSPlatform("windows")]
     private static void ValidateWindowsEntry(string path, bool directory, SecurityIdentifier user)
     {
@@ -147,11 +180,29 @@ internal static class DevelopmentJobStateRoot
         FileSystemSecurity security = directory
             ? new DirectoryInfo(path).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access)
             : new FileInfo(path).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access);
-        if (security.GetOwner(typeof(SecurityIdentifier)) is not SecurityIdentifier owner
-            || !owner.Equals(user) || !security.AreAccessRulesCanonical
-            || new RawSecurityDescriptor(security.GetSecurityDescriptorBinaryForm(), 0).DiscretionaryAcl is null
-            || (directory && !security.AreAccessRulesProtected))
-            throw new InvalidOperationException("Recovery owner or ACL boundary rejected.");
+        ValidateWindowsSecurity(security, directory, user);
+    }
+
+    [SupportedOSPlatform("windows")]
+    internal static void ValidateWindowsSecurity(FileSystemSecurity security, bool directory, SecurityIdentifier user)
+    {
+        string kind = directory ? "directory" : "file";
+        if (security.GetOwner(typeof(SecurityIdentifier)) is not SecurityIdentifier owner)
+            throw new InvalidOperationException("Recovery Windows " + kind + " owner missing.");
+        if (!owner.Equals(user))
+        {
+            // Report only the fixed classification, never account names or SIDs.
+            string classification = owner.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid)
+                ? "administrators" : owner.IsWellKnown(WellKnownSidType.LocalSystemSid)
+                    ? "system" : "other";
+            throw new InvalidOperationException("Recovery Windows " + kind + " owner rejected: " + classification + ".");
+        }
+        if (!security.AreAccessRulesCanonical)
+            throw new InvalidOperationException("Recovery Windows " + kind + " ACL is not canonical.");
+        if (new RawSecurityDescriptor(security.GetSecurityDescriptorBinaryForm(), 0).DiscretionaryAcl is null)
+            throw new InvalidOperationException("Recovery Windows " + kind + " ACL missing.");
+        if (directory && !security.AreAccessRulesProtected)
+            throw new InvalidOperationException("Recovery Windows directory ACL is not protected.");
         bool userFullControl = false;
         foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
         {
