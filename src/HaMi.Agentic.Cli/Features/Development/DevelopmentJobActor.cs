@@ -51,7 +51,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
     internal sealed record Cancel;
     private sealed record Generated(int Attempt, string Source);
     private sealed record Executed(int Attempt, DevelopmentSandboxAttempt Result);
-    private sealed record Faulted(int Attempt, string Stage, string FailureType);
+    private sealed record Faulted(int Attempt, string Stage, string FailureType,
+        string? ProductionStageCode = null);
 
     private readonly DevelopmentAgentContract contract;
     private readonly IDevelopmentCandidateGenerator generator;
@@ -156,7 +157,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             try { task = isolatedRunner.ExecuteAsync(contract, message.Source, current, cancellation.Token); }
             catch (Exception ex)
             {
-                self.Tell(new Faulted(current, "sandbox", ex.GetType().Name));
+                self.Tell(new Faulted(current, "sandbox", ex.GetType().Name,
+                    (ex as DevelopmentProductionStageException)?.StageCode));
                 return;
             }
             _ = task.ContinueWith(t =>
@@ -164,8 +166,12 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 if (t.IsCompletedSuccessfully)
                     self.Tell(new Executed(current, t.Result));
                 else
+                {
+                    Exception? failure = t.Exception?.GetBaseException();
                     self.Tell(new Faulted(current, "sandbox",
-                        t.IsCanceled ? "OperationCanceled" : t.Exception?.GetBaseException().GetType().Name ?? "Unknown"));
+                        t.IsCanceled ? "OperationCanceled" : failure?.GetType().Name ?? "Unknown",
+                        (failure as DevelopmentProductionStageException)?.StageCode));
+                }
             }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         });
 
@@ -249,12 +255,13 @@ internal sealed class DevelopmentJobActor : ReceiveActor
         {
             if (message.Attempt != attempt || stage == Stage.Finished) return;
             if (logger is not null)
-                DevelopmentLogEvents.JobFailed(logger, jobId, message.Stage, "OPERATION_FAULT",
+                DevelopmentLogEvents.JobFailed(logger, jobId, message.Stage,
+                    message.ProductionStageCode ?? "OPERATION_FAULT",
                     message.FailureType, message.Stage == "generator"
                         ? "Modell-/Generator-Konfiguration und Auftragsbudget pruefen."
                         : "Sandbox-Report und lokalen MicroVM-Zustand pruefen.");
             Finish(cancelRequested ? "cancelled" : "failed",
-                message.Stage + ":" + message.FailureType);
+                message.Stage + ":" + (message.ProductionStageCode ?? message.FailureType));
         });
 
         Receive<Cancel>(_ =>
