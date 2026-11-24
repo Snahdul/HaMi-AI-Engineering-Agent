@@ -30,7 +30,8 @@ internal static class DevelopmentProductionVerifier
         string Status, string BaseCommit, string SourcePath,
         string SourceSha256, string DiffPath, string? SandboxReport,
         int RestoreExitCode, int BuildExitCode, int RunExitCode,
-        bool CleanupSucceeded, bool OutputAccepted, bool CheckoutUnchanged);
+        bool CleanupSucceeded, bool OutputAccepted, bool CheckoutUnchanged,
+        string DiffSha256);
 
     internal static async Task<int> RunAsync(
         string repository, string candidate, string contractPath, string resultsRoot)
@@ -88,7 +89,9 @@ internal static class DevelopmentProductionVerifier
         CopyTrusted(repo, snapshot, ProjectPath);
         string target = ToPath(snapshot, SourcePath);
         Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-        await File.WriteAllTextAsync(target, source);
+        await File.WriteAllBytesAsync(target, File.ReadAllBytes(ToPath(worktree, SourcePath)));
+        if (FileHash(target) != sourceHash)
+            throw new InvalidOperationException("Candidate snapshot bytes differ from reviewed source.");
 
         string[] manifest = DevelopmentSandboxRunner.InspectSnapshot(snapshot, ProjectPath)
             .Select(s => s.Replace('\\', '/')).ToArray();
@@ -99,6 +102,7 @@ internal static class DevelopmentProductionVerifier
 
         string diffPath = Path.Combine(root, "candidate.patch");
         await File.WriteAllTextAsync(diffPath, diff);
+        string diffHash = FileHash(diffPath);
 
         // Suppress guest-produced console text; the complete diagnostics
         // stay within the local sandbox report directory.
@@ -132,6 +136,11 @@ internal static class DevelopmentProductionVerifier
             "--untracked-files=all", "--ignore-submodules=none");
         bool unchanged = string.Equals(afterStatus, expectedStatus, StringComparison.Ordinal)
             && FileHash(ToPath(worktree, SourcePath)) == sourceHash
+            && FileHash(target) == sourceHash
+            && FileHash(diffPath) == diffHash
+            && string.Equals(await DevelopmentWorktreeGuard.GitAsync(worktree,
+                "diff", "--no-ext-diff", "--no-textconv", "--", SourcePath),
+                diff, StringComparison.Ordinal)
             && (await DevelopmentWorktreeGuard.GitAsync(worktree, "rev-parse", "HEAD")).Trim() == baseSha
             && (await DevelopmentWorktreeGuard.GitAsync(repo, "rev-parse", "HEAD")).Trim() == baseSha
             && (await DevelopmentWorktreeGuard.GitAsync(repo,
@@ -143,7 +152,7 @@ internal static class DevelopmentProductionVerifier
             passed ? "passed" : "failed", baseSha, SourcePath, sourceHash,
             diffPath, reportPath, report.RestoreExitCode, report.BuildExitCode,
             report.ExecutionExitCode, report.SandboxRemovalSucceeded,
-            outputAccepted, unchanged);
+            outputAccepted, unchanged, diffHash);
         string evidencePath = Path.Combine(root, "production-report.json");
         await File.WriteAllTextAsync(evidencePath, JsonSerializer.Serialize(
             evidence, new JsonSerializerOptions(JsonSerializerDefaults.Web)
