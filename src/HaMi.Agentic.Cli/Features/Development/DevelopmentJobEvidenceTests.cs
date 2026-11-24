@@ -71,6 +71,44 @@ internal static class DevelopmentJobEvidenceTests
             string projection = Path.Combine(jobRoot, "agent-report.json");
             string originalPath = Path.Combine(jobRoot, DevelopmentJobEvidence.OriginalReportName);
             File.WriteAllBytes(originalPath, original);
+            string privateRoot = Path.Combine(root, "state-fixture");
+            Directory.CreateDirectory(privateRoot);
+            var store = new DevelopmentJobStateStore(privateRoot);
+            byte[] sealedBytes = JsonSerializer.SerializeToUtf8Bytes(manifest, JsonOptions);
+            string manifestPath = Path.Combine(jobRoot, DevelopmentJobEvidence.ManifestName);
+            File.WriteAllBytes(manifestPath, sealedBytes);
+            using (var owner = store.Acquire(identity.IssueNumber))
+            {
+                owner.Claim(DevelopmentJobState.Create(identity));
+                owner.Commit(owner.Current!.Start());
+                Reject(() => DevelopmentJobEvidence.ReadVerified(owner));
+                owner.Commit(owner.Current!.Verify(2, 2, DevelopmentJobState.Hash(sealedBytes)));
+            }
+            using (var owner = store.AcquireJob(identity.JobId))
+            {
+                var opened = DevelopmentJobEvidence.ReadVerified(owner);
+                if (opened.Report.JobId != identity.JobId
+                    || opened.Evidence.SandboxRunIds.Length != 2)
+                    throw new InvalidOperationException("Verified reentry evidence differs.");
+                File.AppendAllText(manifestPath, " ");
+                Reject(() => DevelopmentJobEvidence.ReadVerified(owner));
+                File.WriteAllBytes(manifestPath, sealedBytes);
+                File.AppendAllText(originalPath, " ");
+                Reject(() => DevelopmentJobEvidence.ReadVerified(owner));
+                File.WriteAllBytes(originalPath, original);
+                File.WriteAllText(log, originalOutput + " ");
+                Reject(() => DevelopmentJobEvidence.ReadVerified(owner));
+                File.WriteAllText(log, originalOutput);
+                // Even a semantically equivalent output modification must
+                // fail the manifest hash comparison, not only the stdout gate.
+                File.WriteAllText(log, originalOutput + "\n");
+                Reject(() => DevelopmentJobEvidence.ReadVerified(owner));
+                File.WriteAllText(log, originalOutput);
+                owner.Commit(owner.Current!.ReservePublication());
+                _ = DevelopmentJobEvidence.ReadVerified(owner);
+                owner.Commit(owner.Current!.ConfirmPublication(59));
+                _ = DevelopmentJobEvidence.ReadVerified(owner);
+            }
             DevelopmentJobEvidence.WriteProjection(identity, job);
             var published = job with { DraftPullRequestNumber = 59 };
             DevelopmentJobEvidence.WriteProjection(identity, published);
