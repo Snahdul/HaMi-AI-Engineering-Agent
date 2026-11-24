@@ -45,6 +45,45 @@ internal static class DevelopmentJobEvidence
         return DevelopmentJobState.Hash(bytes);
     }
 
+    // The private, locked checkpoint is the trust anchor. Never accept a
+    // report path or manifest digest from command-line arguments.
+    internal static (DevelopmentJobReport Report, Manifest Evidence) ReadVerified(
+        DevelopmentJobStateStore.Lease owner)
+    {
+        var state = owner.Current
+            ?? throw new InvalidOperationException("Recovery checkpoint missing.");
+        state.Validate();
+        if (state.Stage is not (DevelopmentJobState.CandidateVerified
+            or DevelopmentJobState.PublicationPending or DevelopmentJobState.Published))
+            throw new InvalidOperationException("Recovery stage is not eligible.");
+        string root = JobRoot(state.Identity);
+        byte[] bytes = ReadBoundedFile(Path.Combine(root, ManifestName), 64 * 1024);
+        if (DevelopmentJobState.Hash(bytes) != state.EvidenceHash)
+            throw new InvalidOperationException("Recovery manifest differs from private checkpoint.");
+        var expected = JsonSerializer.Deserialize<Manifest>(bytes, JsonOptions)
+            ?? throw new InvalidOperationException("Recovery manifest missing.");
+        if (expected.SchemaVersion != 1 || expected.JobId != state.Identity.JobId
+            || expected.Artifacts is null || expected.Artifacts.Length is < 1 or > 16
+            || expected.SandboxRunIds is null || expected.SandboxRunIds.Length is < 1 or > 2)
+            throw new InvalidOperationException("Recovery manifest identity or bounds rejected.");
+        var original = expected.Artifacts.SingleOrDefault(a => a.Path == OriginalReportName)
+            ?? throw new InvalidOperationException("Recovery original report missing from manifest.");
+        byte[] reportBytes = ReadBoundedFile(Path.Combine(root, OriginalReportName), 64 * 1024);
+        if (original.Bytes != reportBytes.Length || original.Sha256 != DevelopmentJobState.Hash(reportBytes))
+            throw new InvalidOperationException("Recovery original report changed.");
+        var report = JsonSerializer.Deserialize<DevelopmentJobReport>(reportBytes, JsonOptions)
+            ?? throw new InvalidOperationException("Recovery original report missing.");
+        if (report.ModelCalls != state.ModelCalls || report.Attempts.Length != state.Attempts)
+            throw new InvalidOperationException("Recovery attempt consumption changed.");
+
+        // Rebuild from the fixed host-derived paths. Exact serialized bytes
+        // also reject duplicated, reordered or unknown manifest fields.
+        Manifest actual = BuildManifest(state.Identity, report, reportBytes);
+        if (!bytes.SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(actual, JsonOptions)))
+            throw new InvalidOperationException("Recovery evidence no longer matches sealed manifest.");
+        return (report, actual);
+    }
+
     internal static Manifest BuildManifest(
         DevelopmentJobIdentity identity, DevelopmentJobReport report, byte[] originalReport)
     {
