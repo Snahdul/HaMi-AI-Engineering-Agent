@@ -62,3 +62,17 @@ and existing log file-lock rules. On HaMi11, run
 after review; the real MicroVM smoke test is a separate gate.
 
 **Merge remains human-approved.**
+
+
+## Follow-up: trusted phase events
+
+The standalone sandbox command retains its console behavior.
+When the Development job supplies a typed progress observer,
+only fixed host-defined phase codes, sandbox IDs, timings and exit
+codes become structured `SandboxPhase` events (3611). Raw guest and
+compiler output remains exclusively in separate per-attempt diagnostics.
+The agent path suppresses the old direct console preview. Routine
+Akka shutdown INFO messages are filtered; warnings and errors remain.
+The final log uses `generatorCalls` while the JSON report preserves
+`modelCalls` for stored report compatibility. The offline-scripted mode
+never contacts a paid model.
