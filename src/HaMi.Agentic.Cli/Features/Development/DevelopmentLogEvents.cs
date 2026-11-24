@@ -59,9 +59,9 @@ internal static partial class DevelopmentLogEvents
         string status, int generatorCalls, int attemptCount, string reportPath);
 
     [LoggerMessage(EventId = 3611, Level = LogLevel.Information,
-        Message = "SandboxPhase job={JobId} attempt={Attempt} sandbox={SandboxName} phase={PhaseCode} elapsedMs={ElapsedMs} exitCode={ExitCode}")]
+        Message = "SandboxPhase job={JobId} attempt={Attempt}: {Description}; sandbox={SandboxName} phase={PhaseCode} elapsedMs={ElapsedMs} exitCode={ExitCode}")]
     internal static partial void SandboxPhase(ILogger logger, string jobId, int attempt,
-        string sandboxName, string phaseCode, long elapsedMs, int exitCode);
+        string description, string sandboxName, string phaseCode, long elapsedMs, int exitCode);
 
     [LoggerMessage(EventId = 3610, Level = LogLevel.Debug,
         Message = "ActorMessageIgnored job={JobId} attempt={Attempt} stage={Stage} reason=stale-or-duplicate")]
