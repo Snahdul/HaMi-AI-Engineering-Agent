@@ -23,11 +23,12 @@ internal interface IDevelopmentIsolatedRunner
 internal sealed record DevelopmentSandboxAttempt(
     bool Succeeded, int RestoreExitCode, int BuildExitCode, int RunExitCode,
     bool TimedOut, bool CleanupSucceeded, string Feedback, string? ReportPath,
-    string? InfrastructureError = null);
+    string? InfrastructureError = null, bool? OutputAccepted = null);
 
 internal sealed record DevelopmentJobAttempt(
     int Number, string Status, int RestoreExitCode, int BuildExitCode,
-    int RunExitCode, bool TimedOut, bool CleanupSucceeded, string? ReportPath);
+    int RunExitCode, bool TimedOut, bool CleanupSucceeded, string? ReportPath,
+    bool? OutputAccepted = null);
 
 internal sealed record DevelopmentJobReport(
     string JobId, string Status, int ModelCalls, DevelopmentJobAttempt[] Attempts,
@@ -164,7 +165,10 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                     (long)Stopwatch.GetElapsedTime(sandboxStarted).TotalMilliseconds);
             attempts.Add(new DevelopmentJobAttempt(attempt, status,
                 result.RestoreExitCode, result.BuildExitCode, result.RunExitCode,
-                result.TimedOut, result.CleanupSucceeded, result.ReportPath));
+                result.TimedOut, result.CleanupSucceeded, result.ReportPath,
+                result.BuildExitCode == 0 && result.RunExitCode == 0
+                    && result.CleanupSucceeded && result.InfrastructureError is null
+                    ? result.OutputAccepted : null));
 
             // A coordinator deadline stops NEW attempts, but must not stop the
             // actor or its host until the already-running sbx task has returned
@@ -185,7 +189,7 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             // No automatic retry after infrastructure, restore, timeout or
             // unconfirmed cleanup failure. The next attempt may run ONLY after
             // a completed isolated compiler/program failure with confirmed cleanup.
-            if (status is not ("build-failed" or "run-failed"))
+            if (status is not ("build-failed" or "run-failed" or "acceptance-failed"))
             {
                 if (logger is not null)
                     DevelopmentLogEvents.JobFailed(logger, jobId, "sandbox", status, "none",
@@ -204,7 +208,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
                 Match diagnostic = Regex.Match(result.Feedback, @"\bCS\d{4}\b",
                     RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
                 DevelopmentLogEvents.AttemptFailed(logger, jobId, attempt, status,
-                    diagnostic.Success ? diagnostic.Value.ToUpperInvariant() : "EXECUTION_NONZERO");
+                    diagnostic.Success ? diagnostic.Value.ToUpperInvariant()
+                        : status == "acceptance-failed" ? "ACCEPTANCE_MISMATCH" : "EXECUTION_NONZERO");
             }
 
             feedback = DevelopmentSandboxRunner.SafeLogPreview(result.Feedback);
@@ -249,7 +254,8 @@ internal sealed class DevelopmentJobActor : ReceiveActor
         if (result.InfrastructureError is not null || result.RestoreExitCode != 0
             || result.BuildExitCode < 0)
             return "infrastructure-failed";
-        if (result.Succeeded && result.BuildExitCode == 0 && result.RunExitCode == 0)
+        if (result.Succeeded && result.BuildExitCode == 0 && result.RunExitCode == 0
+            && result.OutputAccepted == true)
             return "passed";
 
         // Only C# compiler diagnostics from the completed build are eligible
@@ -260,6 +266,12 @@ internal sealed class DevelopmentJobActor : ReceiveActor
             return "build-failed";
         if (result.BuildExitCode == 0 && result.RunExitCode > 0)
             return "run-failed";
+        // The guest may exit successfully while violating the human-reviewed
+        // stdout contract. This is a correctable task failure, not success or
+        // a sandbox infrastructure failure.
+        if (result.BuildExitCode == 0 && result.RunExitCode == 0
+            && result.OutputAccepted == false)
+            return "acceptance-failed";
         return "infrastructure-failed";
     }
 

@@ -74,10 +74,21 @@ internal sealed class DevelopmentIsolatedRunner(
             await File.ReadAllTextAsync(reportPath, CancellationToken.None), JsonOptions)
             ?? throw new InvalidOperationException("Sandbox report could not be parsed.");
 
-        bool passed = cliExit == 0 && report.Error is null
+        bool executionSucceeded = cliExit == 0 && report.Error is null
             && report.RestoreExitCode == 0 && report.BuildExitCode == 0
             && report.ExecutionExitCode == 0
             && !report.TimedOut && report.SandboxRemovalSucceeded;
+
+        // Exitcode zero alone cannot satisfy a human-reviewed task.
+        // The expected value is pinned in the versioned contract; read only
+        // the retained guest output, after bounded sandbox cleanup.
+        string executionLog = Path.Combine(dirs[0], "execution.log");
+        bool? outputAccepted = executionSucceeded
+            ? File.Exists(executionLog) && DevelopmentOutputAcceptance.Matches(
+                await File.ReadAllTextAsync(executionLog, CancellationToken.None),
+                contract.ExpectedStdout)
+            : null;
+        bool passed = outputAccepted == true;
 
         // Restore/preflight failures are infrastructure failures, NOT
         // compiler failures. Return their status explicitly to the actor.
@@ -86,13 +97,17 @@ internal sealed class DevelopmentIsolatedRunner(
         string file = Path.Combine(dirs[0], log);
         string feedback = File.Exists(file)
             ? await File.ReadAllTextAsync(file, CancellationToken.None) : "No sandbox diagnostics recorded.";
-        string boundedFeedback = DevelopmentSandboxRunner.SafeLogPreview(feedback);
+        // Never send untrusted guest stdout to the model when the semantic
+        // check fails. A fixed, reviewer-owned correction hint is sufficient.
+        string boundedFeedback = outputAccepted == false
+            ? DevelopmentOutputAcceptance.CorrectionFeedback
+            : DevelopmentSandboxRunner.SafeLogPreview(feedback);
         if (boundedFeedback.Length > 1200) boundedFeedback = boundedFeedback[..1200];
 
         return new DevelopmentSandboxAttempt(
             passed, report.RestoreExitCode, report.BuildExitCode, report.ExecutionExitCode,
             report.TimedOut, report.SandboxRemovalSucceeded,
-            boundedFeedback, reportPath, report.Error);
+            boundedFeedback, reportPath, report.Error, OutputAccepted: outputAccepted);
     }
 
     // Phase descriptions are trusted host-owned vocabulary, not guest text.

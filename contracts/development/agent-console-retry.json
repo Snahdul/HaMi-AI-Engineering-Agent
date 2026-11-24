@@ -6,6 +6,7 @@
   "projectFile": "Demo.csproj",
   "sourceFile": "Program.cs",
   "mode": "run",
+  "expectedStdout": "HaMi isolated correction passed",
   "maxAttempts": 2,
   "acceptanceCriteria": [
     "Restore and build succeed in an offline .NET 11 sandbox.",
