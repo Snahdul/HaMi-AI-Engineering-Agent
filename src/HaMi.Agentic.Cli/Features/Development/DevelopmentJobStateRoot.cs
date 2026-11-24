@@ -88,7 +88,9 @@ internal static class DevelopmentJobStateRoot
         DirectorySecurity security = new DirectoryInfo(parent).GetAccessControl(
             AccessControlSections.Owner | AccessControlSections.Access);
         if (security.GetOwner(typeof(SecurityIdentifier)) is not SecurityIdentifier owner
-            || !TrustedWindowsSid(owner, user))
+            || !TrustedWindowsSid(owner, user)
+            || !security.AreAccessRulesCanonical
+            || new RawSecurityDescriptor(security.GetSecurityDescriptorBinaryForm(), 0).DiscretionaryAcl is null)
             throw new InvalidOperationException("Recovery account directory owner rejected.");
         const FileSystemRights writes = FileSystemRights.WriteData | FileSystemRights.AppendData
             | FileSystemRights.WriteAttributes | FileSystemRights.WriteExtendedAttributes
@@ -136,7 +138,9 @@ internal static class DevelopmentJobStateRoot
             ? new DirectoryInfo(path).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access)
             : new FileInfo(path).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access);
         if (security.GetOwner(typeof(SecurityIdentifier)) is not SecurityIdentifier owner
-            || !owner.Equals(user) || (directory && !security.AreAccessRulesProtected))
+            || !owner.Equals(user) || !security.AreAccessRulesCanonical
+            || new RawSecurityDescriptor(security.GetSecurityDescriptorBinaryForm(), 0).DiscretionaryAcl is null
+            || (directory && !security.AreAccessRulesProtected))
             throw new InvalidOperationException("Recovery owner or ACL boundary rejected.");
         bool userFullControl = false;
         foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
