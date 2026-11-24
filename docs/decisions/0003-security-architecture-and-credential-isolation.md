@@ -1,6 +1,6 @@
 # Architecture decision 0003: Security architecture and credential isolation
 
-**Status:** Proposed for Issue #55 / Draft PR #56, 24 November 2026.
+**Status:** Architecture decision agreed by the project owner, pending implementation verification and merge in Issue #55 / Draft PR #56, 24 November 2026.
 **Related:** [ADR-0001](0001-commandline-akka-isolated-coding.md), [ADR-0002](0002-development-logging-and-explicit-cli.md), [SECURITY.md](../../SECURITY.md), [architecture guidelines](../architecture-guidelines.md), [prompt-injection threat model](../prompt-injection-threat-model.md), security baseline #1, sandbox evaluation #33, issue integration #40 and roadmap #48.
 
 ## Context
@@ -30,7 +30,7 @@ M4 introduces a new privileged capability: publication of an independently verif
 | Issue gateway | Explicitly authorized issue journal | Publication token; raw logs |
 | Future security reviewer | Redacted evidence and read-only architecture context | Credentials, policy editing, autonomous writes or approval |
 
-## Future Security Architecture Agent (proposed, not implemented)
+## Future Security Architecture Agent (#57, backlog, not implemented)
 
 A distinct review capability can assess proposed changes against approved ADRs, threat models and security invariants; flag privilege expansion, new trust boundaries, credential flow, unsafe CI, dependency changes and missing negative tests. Start with a read-only, bounded review of a pinned diff and existing architecture decisions, reporting finding ID, severity, affected path, rule/reference, evidence, confidence and recommended test/remediation. A missing or inconclusive review is never a clean bill of health. Findings may request human review; no autonomous merge, policy changes, credentials or authority to override deterministic gates. The human decides whether and when a review is required. Do not introduce a second runtime agent, ActorSystem, persistent monitoring service or new framework in M4. Validate usefulness on actual historical issues before assigning implementation priority.
 
