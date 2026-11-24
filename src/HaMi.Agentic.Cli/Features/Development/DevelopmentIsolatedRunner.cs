@@ -199,6 +199,17 @@ internal sealed class DevelopmentScriptedGenerator : IDevelopmentCandidateGenera
         string feedback, int attempt, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (contract.IsProduction)
+        {
+            if (attempt == 1 && string.IsNullOrEmpty(feedback))
+                return Task.FromResult(DevelopmentProductionExpression.Serialize("attempt < maxCalls"));
+            if (attempt == 2
+                && feedback.Contains("FAIL attempt=", StringComparison.Ordinal))
+                return Task.FromResult(DevelopmentProductionExpression.Serialize(
+                    "attempt > 0 && maxCalls > 0 && attempt < maxCalls"));
+            throw new InvalidOperationException(
+                "Production generator received unexpected retry feedback.");
+        }
         if (contract.IsPair)
         {
             if (attempt == 1 && string.IsNullOrEmpty(feedback))
