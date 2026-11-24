@@ -100,6 +100,20 @@ internal static class DevelopmentJobStateTests
                 Reject(() => owner.Claim(initial));
             }
 
+            // Reentry selects only the private registry's original identity.
+            using (var reopened = store.AcquireJob(identity.JobId))
+            {
+                if (reopened.Current?.Stage != DevelopmentJobState.Published
+                    || reopened.Current.Identity != identity)
+                    throw new InvalidOperationException("Recovery lookup selected a different job.");
+                Reject(() => store.AcquireJob(identity.JobId).Dispose());
+            }
+            Reject(() => store.AcquireJob(new string('f', 32)).Dispose());
+            Reject(() => store.AcquireJob("../other").Dispose());
+            using (var duplicate = store.Acquire(67))
+                duplicate.Claim(DevelopmentJobState.Create(identity with { IssueNumber = 67 }));
+            Reject(() => store.AcquireJob(identity.JobId).Dispose());
+
             foreach (string terminal in new[]
             {
                 DevelopmentJobState.Failed, DevelopmentJobState.Exhausted, DevelopmentJobState.Cancelled
