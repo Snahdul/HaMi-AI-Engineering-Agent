@@ -110,3 +110,23 @@ unbereinigte Exceptiontexte landen in den Betriebslogs.
 
 Der CLI-Aufruf muss einen benannten Unterbefehl verwenden, z. B.
 `replay --check .` statt veraltetes `--check .`.
+
+
+### Isolierte Sandbox-Phasen im Development-Job
+
+Der Agent uebergibt dem Sandbox-Runner einen typisierten Callback mit
+**hostdefinierten Phasencodes**, generierter Sandbox-ID, Laufzeit und Exitcode.
+Event **3611 `SandboxPhase`** protokolliert MicroVM, Isolation,
+SDK, Snapshot, Offline-Restore, Build, Ausfuehrung und Cleanup.
+Die Haupt-Logs enthalten weder rohe Compilertexte noch fremde
+Exception-Nachrichten. Die vollstaendigen Gast-Diagnosen bleiben in
+den separaten Sandbox-Berichten.
+
+Bei einem Agentenlauf ersetzt dieser Observer die bisherigen separaten
+Konsolentexte und Preview-Ausgaben; ein eigenstaendiger Sandbox-Befehl
+behaelt seine bisherige Konsolendarstellung.
+
+Die Abschlussmeldung verwendet `generatorCalls`; dies sind bei
+`offline-scripted` simulierte Generatoraufrufe, **keine API-Anfragen**.
+Das gespeicherte JSON-Feld `modelCalls` wird aus Gruenden der
+Berichtskompatibilitaet weiterhin verwendet.
