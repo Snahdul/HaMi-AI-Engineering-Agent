@@ -25,7 +25,8 @@ internal static class HaMiFormatterRegressionFixture
 {
     internal static int Value() => 42;
 }
-'@ + "`n"
+'@
+    $expected += "`n"
     $bad = $expected.Replace('    internal static int Value()', ' internal static int Value()')
     if ($bad -ceq $expected) { throw 'Fixture whitespace anchor missing.' }
     [IO.File]::WriteAllText($target, $bad, [Text.UTF8Encoding]::new($false))
@@ -61,10 +62,42 @@ internal static class HaMiFormatterRegressionFixture
         if ($LASTEXITCODE -ne 0 -or $status.Count -ne 1 -or $status[0] -cne "?? $relative") {
             throw 'Fixture checkout contains unexpected changes.'
         }
-        Remove-Item -LiteralPath $target
+        # Create a test-only detached commit to exercise the CI correction
+        # helper against a committed bad source. No branch or remote is updated.
+        [IO.File]::WriteAllText($target, $bad, [Text.UTF8Encoding]::new($false))
+        & git add -- $relative
+        if ($LASTEXITCODE -ne 0) { throw 'Fixture index setup failed.' }
+        & git -c 'user.name=HaMi Formatter Test' -c 'user.email=formatter-test@example.invalid' -c commit.gpgsign=false commit --no-verify -m 'Temporary formatter regression fixture'
+        if ($LASTEXITCODE -ne 0) { throw 'Fixture commit failed.' }
+        $fixtureHead = (& git rev-parse HEAD).Trim()
+        if ($LASTEXITCODE -ne 0 -or $fixtureHead -ceq $base) { throw 'Fixture commit identity missing.' }
+        $beforePatch = (Get-FileHash -LiteralPath $target).Hash
+        $patchOutput = @(& ./scripts/quality/Show-HaMiFormatPatch.ps1 -Base $base)
+        $startMarker = [Array]::IndexOf($patchOutput, "FORMAT PATCH FOR HEAD $fixtureHead")
+        $endMarker = [Array]::IndexOf($patchOutput, 'END FORMAT PATCH')
+        if ($startMarker -lt 0 -or $endMarker -le ($startMarker + 1)) {
+            throw 'Expected head-correlated formatter correction patch missing.'
+        }
+        $patchLines = $patchOutput[($startMarker + 1)..($endMarker - 1)]
+        if (-not ($patchLines -contains "+    internal static int Value() => 42;") -or
+            -not ($patchLines -contains "- internal static int Value() => 42;")) {
+            throw 'Formatter patch did not contain the expected correction.'
+        }
+        $patchFile = Join-Path ([IO.Path]::GetTempPath()) ('hami-format-patch-test-' + [Guid]::NewGuid().ToString('N') + '.patch')
+        try {
+            [IO.File]::WriteAllText($patchFile, ($patchLines -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+            & git apply --check -- $patchFile
+            if ($LASTEXITCODE -ne 0) { throw 'Formatter correction patch is not applicable.' }
+        }
+        finally {
+            if (Test-Path -LiteralPath $patchFile) { Remove-Item -LiteralPath $patchFile }
+        }
         $status = @(& git status --porcelain=v1 --untracked-files=all)
-        if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0) {
-            throw 'Fixture checkout did not return to clean state.'
+        if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0 -or
+            (Get-FileHash -LiteralPath $target).Hash -cne $beforePatch -or
+            (Get-FileHash -LiteralPath $control).Hash -cne $controlHash -or
+            (& git rev-parse HEAD).Trim() -cne $fixtureHead) {
+            throw 'Patch generator modified its calling checkout.'
         }
         $denied = $false
         try { & (Join-Path $repo 'scripts/quality/Invoke-HaMiFormat.ps1') -Base $base -Mode Apply }
@@ -74,7 +107,7 @@ internal static class HaMiFormatterRegressionFixture
             $denied = $true
         }
         if (-not $denied) { throw 'Apply accepted the primary checkout.' }
-        Write-Host 'PASS: Microsoft formatter rejects, corrects and verifies scoped source; primary checkout protected.'
+        Write-Host 'PASS: Microsoft formatter rejects, corrects, verifies and emits an applicable patch; primary checkout protected.'
     }
     finally { Pop-Location }
 }
