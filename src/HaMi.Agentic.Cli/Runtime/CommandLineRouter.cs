@@ -36,13 +36,14 @@ internal static class CommandLineRouter
         foreach (string name in new[]
         {
             "--repo", "--results-dir", "--source", "--project", "--mode",
-            "--contract", "--worktree", "--model"
+            "--contract", "--worktree", "--model", "--issue"
         }) Add(development, name);
         foreach (string name in new[]
         {
             "--self-test", "--contract-check", "--worktree-check",
             "--sandbox-poc", "--sandbox-poc-self-test", "--sandbox-run",
-            "--sandbox-run-self-test", "--agent-run", "--agent-self-test", "--live"
+            "--sandbox-run-self-test", "--agent-run", "--agent-self-test", "--live",
+            "--publish-issue", "--allow-followups"
         }) Add(development, name, flag: true);
         development.SetAction((_, _) => DevelopmentCommand.RunAsync(args[1..]));
         root.Subcommands.Add(development);
@@ -91,6 +92,8 @@ internal static class CommandLineRouter
             || valid.Parse(["coding", "--repo", ".", "--unattended", "--task", "clamp-kata"]).Errors.Count != 0
             || valid.Parse(["workflow", "--repo", ".", "--manifest", "workflows/mvp02.json", "--validate"]).Errors.Count != 0
             || valid.Parse(["development", "--repo", ".", "--model"]).Errors.Count == 0
+            || valid.Parse(["development", "--repo", ".", "--agent-run", "--results-dir", "C:/reports",
+                "--issue", "42", "--publish-issue", "--allow-followups"]).Errors.Count != 0
             || valid.Parse(["development", "--unknown-option"]).Errors.Count == 0
             || valid.Parse(["--check", "."]).Errors.Count == 0
             || valid.Parse(["--unattended"]).Errors.Count == 0)
