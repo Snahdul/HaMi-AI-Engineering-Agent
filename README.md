@@ -23,20 +23,6 @@ This is our engineering vision. The current implementation is an incremental, de
 
 General autonomous issue-to-PR development remains a goal, not a completed capability. See [capabilities and limitations](docs/capabilities.md).
 
-## See it in action
-
-With Git and the .NET SDK specified in [global.json](global.json), clone the repository and run:
-
-```sh
-git clone https://github.com/Snahdul/HaMi-AI-Engineering-Agent.git
-cd HaMi-AI-Engineering-Agent
-dotnet run --project src/HaMi.Agentic.Cli -c Release -- development --repo . --agent-self-test
-```
-
-The offline self-test exercises a failed compilation scenario, successful correction, exhausted retry budget and timeout handling. No API key, Docker or paid model call is needed. It uses controlled test components.
-
-For real compiler and deterministic test validation on a restricted C# task, see the [coding retry example](docs/examples/coding-retry.md).
-
 ## Getting started
 
 Read the [developer quickstart](docs/getting-started.md) for prerequisites and CLI commands.
