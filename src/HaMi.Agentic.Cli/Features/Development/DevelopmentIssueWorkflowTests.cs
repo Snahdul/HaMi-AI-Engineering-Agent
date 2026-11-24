@@ -47,12 +47,14 @@ internal static class DevelopmentIssueWorkflowTests
         var report = new DevelopmentJobReport(jobId, "passed", 2,
         [
             new DevelopmentJobAttempt(1, "build-failed", 0, 1, -1, false, true, "C:\\secret\\build.log"),
-            new DevelopmentJobAttempt(2, "passed", 0, 0, 0, false, true, "C:\\secret\\run.log")
+            new DevelopmentJobAttempt(2, "passed", 0, 0, 0, false, true, "C:\\secret\\run.log", true)
         ], null, issue.Number);
         await workflow.PublishFinishedAsync(report, CancellationToken.None);
         if (gateway.CreatedComments != 1 || gateway.ReviewCalls != 1
             || !gateway.CommentBody.Contains("Build=1", StringComparison.Ordinal)
             || !gateway.CommentBody.Contains("passed", StringComparison.Ordinal)
+            || !gateway.CommentBody.Contains("Output=bestätigt", StringComparison.Ordinal)
+            || !gateway.CommentBody.Contains("Output=nicht geprüft", StringComparison.Ordinal)
             || gateway.CommentBody.Contains("C:\\secret", StringComparison.Ordinal)
             || !gateway.CommentBody.Contains("RETRY_APPROVED", StringComparison.Ordinal)
             || !gateway.CommentBody.Contains("offline-scripted", StringComparison.Ordinal))
