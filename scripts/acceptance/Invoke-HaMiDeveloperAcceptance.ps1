@@ -11,6 +11,9 @@
 param(
     [string]$ResultsRoot = 'G:\HaMi\Sandbox\PoC\Runs',
     [string]$ExpectedRef = 'origin/feature/issue38-development-narrative-logging-cleanup',
+    [ValidateSet('contracts/development/agent-console-retry.json',
+                 'contracts/development/agent-pair.json')]
+    [string]$ContractPath = 'contracts/development/agent-console-retry.json',
     [switch]$VerifyOnly,
     [string]$ReportPath
 )
@@ -19,6 +22,10 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 $project = Join-Path $repo 'src\HaMi.Agentic.Cli'
+$contract = Get-Content -LiteralPath (Join-Path $repo $ContractPath) -Raw | ConvertFrom-Json
+if ($contract.taskId -notin @('sandbox-console-retry', 'sandbox-pair')) {
+    throw 'Contract task is not approved.'
+}
 $head = (& git -C $repo rev-parse HEAD)
 if ($LASTEXITCODE -ne 0) { throw 'Git checkout unavailable.' }
 $expected = (& git -C $repo rev-parse --verify $ExpectedRef)
@@ -54,7 +61,7 @@ if ($VerifyOnly) {
     )
     
     & dotnet run --project $project -c Release -- `
-        development --repo $repo --agent-run --results-dir $ResultsRoot
+        development --repo $repo --agent-run --contract $ContractPath --results-dir $ResultsRoot
     if ($LASTEXITCODE -ne 0) {
         throw 'The real MicroVM correction loop failed; inspect its agent-job report.'
     }
@@ -125,10 +132,42 @@ $actual = [IO.File]::ReadAllText($executionLog).Replace("`r`n", "`n").Replace("`
 if ($actual.EndsWith("`n", [StringComparison]::Ordinal)) {
     $actual = $actual.Substring(0, $actual.Length - 1)
 }
-if ($actual -cne 'HaMi isolated correction passed') {
+if ($actual -cne $contract.expectedStdout) {
     throw 'Semantic acceptance failed: guest stdout differs from the reviewed contract.'
 }
 Write-Host 'PASS: exact reviewed console output verified from guest execution.log.'
+
+# For the pair case verify immutable harness/project copies and the
+# exact two generated target paths, rather than trusting a green model run.
+if ($contract.taskId -eq 'sandbox-pair') {
+    $fixture = Join-Path $repo 'samples\SandboxCodingPair'
+    $jobRoot = [IO.Path]::GetDirectoryName($reportPath)
+    $allowed = @(
+        'src/HaMi.Agentic.Cli/Features/Development/PairCalculator.cs',
+        'src/HaMi.Agentic.Cli/Features/Development/PairFormatter.cs'
+    )
+    foreach ($attempt in 1..2) {
+        $candidate = Join-Path $jobRoot ('candidates\{0:d2}' -f $attempt)
+        foreach ($trusted in @('Program.cs', 'Demo.csproj')) {
+            $sourceHash = (Get-FileHash -LiteralPath (Join-Path $fixture $trusted) -Algorithm SHA256).Hash
+            $actualHash = (Get-FileHash -LiteralPath (Join-Path $candidate $trusted) -Algorithm SHA256).Hash
+            if ($sourceHash -ne $actualHash) {
+                throw ('Immutable trusted harness changed: {0}, attempt {1}' -f $trusted, $attempt)
+            }
+        }
+        $actualFiles = @(
+            Get-ChildItem -LiteralPath $candidate -File -Recurse |
+                ForEach-Object {
+                    [IO.Path]::GetRelativePath($candidate, $_.FullName).Replace('\', '/')
+                }
+        )
+        $expectedFiles = @('Demo.csproj', 'Program.cs') + $allowed
+        if (@(Compare-Object $actualFiles $expectedFiles).Count -ne 0) {
+            throw ('Candidate manifest differs from approved pair on attempt {0}' -f $attempt)
+        }
+    }
+    Write-Host 'PASS: exactly two allowlisted C# files and immutable harness verified for both attempts.'
+}
 
 $after = @(& git -C $repo status --porcelain=v1)
 if ($LASTEXITCODE -ne 0) { throw 'Could not read Git checkout status.' }
