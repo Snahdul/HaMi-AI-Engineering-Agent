@@ -454,8 +454,11 @@ internal static class CodingCommand
     {
         var info = new ProcessStartInfo("git")
         {
-            WorkingDirectory = directory, RedirectStandardOutput = true,
-            RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+            WorkingDirectory = directory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
         };
         foreach (string arg in args) info.ArgumentList.Add(arg);
         using Process process = Process.Start(info)
@@ -654,92 +657,91 @@ internal static class CodingCommand
             CodingTaskDefinition retryTask = CodingTaskDefinition.RetryBudget;
             CodingExecutionPolicy retryPolicy = CodingExecutionPolicy.Load(repo, retryTask);
             CodingPromptTemplate retryPrompt = CodingPromptTemplate.Load(repo, retryTask);
-            string retryRoot = Path.Combine(temp, "retry-worktree");
-            string retryFixture = Path.Combine(retryRoot,
-                retryTask.FixtureDirectory.Replace('/', Path.DirectorySeparatorChar));
-            string retrySource = Path.Combine(retryRoot,
-                retryTask.TargetPath.Replace('/', Path.DirectorySeparatorChar));
-            Directory.CreateDirectory(retryFixture);
-            Directory.CreateDirectory(Path.GetDirectoryName(retrySource)!);
-            File.Copy(Path.Combine(repo, retryTask.TargetPath.Replace('/', Path.DirectorySeparatorChar)),
-                retrySource);
-            foreach (string filename in new[] { retryTask.ProjectFile, "Program.cs" })
-                File.Copy(Path.Combine(repo, retryTask.FixtureDirectory.Replace(
-                    '/', Path.DirectorySeparatorChar), filename),
-                    Path.Combine(retryFixture, filename));
-
-            int retryCalls = 0;
-            CodingRunResult retryResult = await ExecuteAttemptsAsync(
-                retryFixture, retrySource, retryTask, retryPrompt, retryPolicy, prompt =>
-                {
-                    retryCalls++;
-                    if (retryCalls == 2 && !prompt.User.Contains("Fixed tests failed:",
-                        StringComparison.Ordinal))
-                        throw new InvalidOperationException(
-                            "Trusted RetryBudget tests did not trigger bounded correction feedback.");
-                    return Task.FromResult(new CodingDraft("Implement retry eligibility",
-                        retryCalls == 1 ? "true" : retryExpression));
-                });
-            CodingRunReport retryReport = CodingRunReport.From(retryResult);
-            if (retryResult is not CodingRunSucceeded
-                || !retryReport.Success || retryReport.ModelCalls != 2
-                || retryReport.Attempts.Count != 2
-                || retryReport.Attempts[0].Status != "tests_failed"
-                || retryReport.Attempts[1].Status != "passed"
-                || await File.ReadAllTextAsync(retrySource) != await File.ReadAllTextAsync(
-                    Path.Combine(repo, retryTask.TargetPath.Replace('/',
-                        Path.DirectorySeparatorChar))))
-                throw new InvalidOperationException(
-                    "Production RetryBudget coding task did not recover using real compiler/tests.");
-
-            string reportDir = Path.Combine(temp, "retry-report");
-            Directory.CreateDirectory(reportDir);
-            await WriteReportAsync(reportDir, "offline-stub", "trusted-baseline", retryRoot,
-                retryResult, " M " + retryTask.TargetPath, "offline-fake",
-                retryPrompt, retryPolicy, retryTask);
-            using (JsonDocument report = JsonDocument.Parse(
-                await File.ReadAllTextAsync(Path.Combine(reportDir, "report.json"))))
+            // Exercise both a no-op correction and a changed expression against
+            // explicitly controlled baselines, never the current production spelling.
+            foreach (string baselineExpression in new[]
             {
-                JsonElement resultJson = report.RootElement;
-                if (resultJson.GetProperty("task").GetString() != retryTask.Id
-                    || resultJson.GetProperty("promptAsset").GetString() != retryTask.PromptAsset
-                    || resultJson.GetProperty("policyAsset").GetString() != retryTask.PolicyAsset
-                    || resultJson.GetProperty("modifiedPath").GetString() != retryTask.TargetPath
-                    || resultJson.GetProperty("modelCalls").GetInt32() != 2
-                    || resultJson.GetProperty("status").GetString() != "generated"
-                    || resultJson.GetProperty("attempts").GetArrayLength() != 2)
-                    throw new InvalidOperationException("RetryBudget report task/asset mapping changed.");
-            }
-
-            // A task can pass all tests while proposing an expression already
-            // present in source. In that case no file is modified.
-            string unchangedReportDir = Path.Combine(temp, "retry-unchanged-report");
-            Directory.CreateDirectory(unchangedReportDir);
-            await WriteReportAsync(unchangedReportDir, "offline-stub", "trusted-baseline",
-                retryRoot, retryResult, "", "offline-fake",
-                retryPrompt, retryPolicy, retryTask);
-            using (JsonDocument unchangedReport = JsonDocument.Parse(
-                await File.ReadAllTextAsync(Path.Combine(
-                    unchangedReportDir, "report.json"))))
+                retryExpression, "attempt > 0 && maxCalls > 0 && attempt < maxCalls"
+            })
             {
-                JsonElement unchanged = unchangedReport.RootElement;
-                if (unchanged.GetProperty("modifiedPath").ValueKind != JsonValueKind.Null
-                    || unchanged.GetProperty("status").GetString() != "generated")
+                string retryRoot = Path.Combine(temp, "retry-worktree-" +
+                    (baselineExpression == retryExpression ? "one-based" : "positive"));
+                string retryFixture = Path.Combine(retryRoot,
+                    retryTask.FixtureDirectory.Replace('/', Path.DirectorySeparatorChar));
+                string retrySource = Path.Combine(retryRoot,
+                    retryTask.TargetPath.Replace('/', Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(retryFixture);
+                Directory.CreateDirectory(Path.GetDirectoryName(retrySource)!);
+                string productionSource = await File.ReadAllTextAsync(Path.Combine(repo,
+                    retryTask.TargetPath.Replace('/', Path.DirectorySeparatorChar)));
+                string pristineRetrySource = retryTask.ReplaceExpression(productionSource, baselineExpression);
+                string expectedRetrySource = retryTask.ReplaceExpression(pristineRetrySource, retryExpression);
+                await File.WriteAllTextAsync(retrySource, pristineRetrySource);
+                foreach (string filename in new[] { retryTask.ProjectFile, "Program.cs" })
+                    File.Copy(Path.Combine(repo, retryTask.FixtureDirectory.Replace(
+                        '/', Path.DirectorySeparatorChar), filename),
+                        Path.Combine(retryFixture, filename));
+
+                int retryCalls = 0;
+                CodingRunResult retryResult = await ExecuteAttemptsAsync(
+                    retryFixture, retrySource, retryTask, retryPrompt, retryPolicy, prompt =>
+                    {
+                        retryCalls++;
+                        if (retryCalls == 2 && !prompt.User.Contains("Fixed tests failed:",
+                            StringComparison.Ordinal))
+                            throw new InvalidOperationException(
+                                "Trusted RetryBudget tests did not trigger bounded correction feedback.");
+                        return Task.FromResult(new CodingDraft("Implement retry eligibility",
+                            retryCalls == 1 ? "true" : retryExpression));
+                    });
+                CodingRunReport retryReport = CodingRunReport.From(retryResult);
+                if (retryResult is not CodingRunSucceeded
+                    || !retryReport.Success || retryReport.ModelCalls != 2
+                    || retryReport.Attempts.Count != 2
+                    || retryReport.Attempts[0].Status != "tests_failed"
+                    || retryReport.Attempts[1].Status != "passed"
+                    || !(await File.ReadAllBytesAsync(retrySource)).SequenceEqual(
+                        Encoding.UTF8.GetBytes(expectedRetrySource)))
                     throw new InvalidOperationException(
-                        "Unchanged successful coding run incorrectly reports a modified file.");
-            }
+                        "Production RetryBudget coding task did not recover using real compiler/tests.");
 
-            // A hostile/unrelated model expression must not survive a failed run.
-            string pristineRetrySource = File.ReadAllText(Path.Combine(repo,
-                retryTask.TargetPath.Replace('/', Path.DirectorySeparatorChar)));
-            await File.WriteAllTextAsync(retrySource, pristineRetrySource);
-            CodingRunResult retryExhausted = await ExecuteAttemptsAsync(
-                retryFixture, retrySource, retryTask, retryPrompt, retryPolicy,
-                _ => Task.FromResult(new CodingDraft("Plan",
-                    "System.IO.File.Delete(\"anything\")")));
-            if (retryExhausted is not CodingRunExhausted
-                || await File.ReadAllTextAsync(retrySource) != pristineRetrySource)
-                throw new InvalidOperationException("Retry task did not fail closed and restore source.");
+                // Feed the report writer the status corresponding to the actual
+                // final fixture bytes, rather than inventing a modification.
+                bool changed = !(await File.ReadAllBytesAsync(retrySource)).SequenceEqual(
+                    Encoding.UTF8.GetBytes(pristineRetrySource));
+                if (changed != (baselineExpression != retryExpression))
+                    throw new InvalidOperationException("RetryBudget fixture change classification incorrect.");
+                string reportDir = Path.Combine(retryRoot, "retry-report");
+                Directory.CreateDirectory(reportDir);
+                await WriteReportAsync(reportDir, "offline-stub", "trusted-baseline", retryRoot,
+                    retryResult, changed ? " M " + retryTask.TargetPath : "", "offline-fake",
+                    retryPrompt, retryPolicy, retryTask);
+                using (JsonDocument report = JsonDocument.Parse(
+                    await File.ReadAllTextAsync(Path.Combine(reportDir, "report.json"))))
+                {
+                    JsonElement resultJson = report.RootElement;
+                    if (resultJson.GetProperty("task").GetString() != retryTask.Id
+                        || resultJson.GetProperty("promptAsset").GetString() != retryTask.PromptAsset
+                        || resultJson.GetProperty("policyAsset").GetString() != retryTask.PolicyAsset
+                        || resultJson.GetProperty("modifiedPath").GetString() !=
+                            (changed ? retryTask.TargetPath : null)
+                        || resultJson.GetProperty("modelCalls").GetInt32() != 2
+                        || resultJson.GetProperty("status").GetString() != "generated"
+                        || resultJson.GetProperty("attempts").GetArrayLength() != 2)
+                        throw new InvalidOperationException("RetryBudget report task/asset mapping changed.");
+                }
+
+                // A hostile/unrelated model expression must not survive a failed run.
+                await File.WriteAllTextAsync(retrySource, pristineRetrySource);
+                CodingRunResult retryExhausted = await ExecuteAttemptsAsync(
+                    retryFixture, retrySource, retryTask, retryPrompt, retryPolicy,
+                    _ => Task.FromResult(new CodingDraft("Plan",
+                        "System.IO.File.Delete(\"anything\")")));
+                if (retryExhausted is not CodingRunExhausted
+                    || !(await File.ReadAllBytesAsync(retrySource)).SequenceEqual(
+                        Encoding.UTF8.GetBytes(pristineRetrySource)))
+                    throw new InvalidOperationException("Retry task did not fail closed and restore source.");
+            }
 
             Console.WriteLine("Coding self-test passed: C# 15 unions, two bounded tasks (ClampKata "
                 + "and production RetryBudget), strict path/policy contracts, real build/test "

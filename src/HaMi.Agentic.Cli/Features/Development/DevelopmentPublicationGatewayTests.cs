@@ -12,6 +12,15 @@ internal static class DevelopmentPublicationGatewayTests
 {
     internal static async Task SelfTestAsync(string repository)
     {
+        const string oneBased = "attempt >= 1 && maxCalls >= 1 && attempt < maxCalls";
+        const string positive = "attempt > 0 && maxCalls > 0 && attempt < maxCalls";
+        await SelfTestVariantAsync(repository, oneBased, positive);
+        await SelfTestVariantAsync(repository, positive, oneBased);
+    }
+
+    private static async Task SelfTestVariantAsync(string repository,
+        string baselineExpression, string candidateExpression)
+    {
         string root = Path.Combine(Path.GetTempPath(), "hami-publish-" + Guid.NewGuid().ToString("N"));
         string repo = Path.Combine(root, "repo");
         string results = Path.Combine(root, "results");
@@ -33,8 +42,13 @@ internal static class DevelopmentPublicationGatewayTests
             {
                 string target = Local(repo, path);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                await File.WriteAllTextAsync(target, (await File.ReadAllTextAsync(Local(repository, path)))
-                    .Replace("\r\n", "\n", StringComparison.Ordinal));
+                string content = (await File.ReadAllTextAsync(Local(repository, path)))
+                    .Replace("\r\n", "\n", StringComparison.Ordinal);
+                // The disposable fixture owns its starting expression, regardless
+                // of the spelling in the production checkout being tested.
+                if (path == sourcePath)
+                    content = CodingTaskDefinition.RetryBudget.ReplaceExpression(content, baselineExpression);
+                await File.WriteAllTextAsync(target, content);
             }
             await Git(repo, "add", ".");
             await Git(repo, "commit", "-m", "trusted fixture");
@@ -43,7 +57,7 @@ internal static class DevelopmentPublicationGatewayTests
             string source = Local(candidate, sourcePath);
             string original = await File.ReadAllTextAsync(source);
             string changed = CodingTaskDefinition.RetryBudget.ReplaceExpression(original,
-                "attempt > 0 && maxCalls > 0 && attempt < maxCalls");
+                candidateExpression);
             if (changed == original)
                 throw new InvalidOperationException("Publication fixture unexpectedly unchanged.");
             await File.WriteAllTextAsync(source, changed);
