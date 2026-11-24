@@ -128,22 +128,27 @@ internal static class DevelopmentPublicationGatewayTests
                 || (await Git(repo, "status", "--porcelain")).Length != 0
                 || (await Git(repo, "rev-parse", "HEAD")).Trim() != baseline)
                 throw new InvalidOperationException("Conflict modified publication or baseline.");
-            transport.Conflict = false;
-            foreach (string conflict in new[] { "closed", "ready", "body", "multiple", "missing-ref" })
+            if (recoveryMatrix)
             {
-                transport.PullConflict = conflict;
+                transport.Conflict = false;
+                foreach (string conflict in new[] { "closed", "ready", "body", "multiple", "missing-ref" })
+                {
+                    transport.PullConflict = conflict;
+                    await RejectAsync(() => Publish());
+                    if (transport.Posts != postsBeforeRecovery)
+                        throw new InvalidOperationException("Conflicting existing PR caused remote writes.");
+                }
+                transport.PullConflict = null;
+                transport.TamperedTree = true;
+                await RejectAsync(() => Publish());
+                transport.TamperedTree = false;
+                transport.ConflictingCommit = true;
                 await RejectAsync(() => Publish());
                 if (transport.Posts != postsBeforeRecovery)
-                    throw new InvalidOperationException("Conflicting existing PR caused remote writes.");
-            }
-            transport.PullConflict = null;
-            transport.TamperedTree = true;
-            await RejectAsync(() => Publish());
-            if (transport.Posts != postsBeforeRecovery)
-                throw new InvalidOperationException("Conflicting existing tree caused remote writes.");
-            transport.TamperedTree = false;
-            if (recoveryMatrix)
+                    throw new InvalidOperationException("Conflicting existing tree or commit caused remote writes.");
+                transport.ConflictingCommit = false;
                 await VerifyRecoveryAsync(repo, results, root, baseline, changed);
+            }
         }
         finally
         {
@@ -421,7 +426,7 @@ internal static class DevelopmentPublicationGatewayTests
         private string? commitMessage;
         private JsonElement commitAuthor, commitCommitter;
         private bool branch;
-        internal bool Denied, Stale, TamperedTree, InterruptPull, Conflict, RateLimited;
+        internal bool Denied, Stale, TamperedTree, InterruptPull, Conflict, RateLimited, ConflictingCommit;
         internal string? InterruptEndpoint, PullConflict;
         internal int Calls, Posts, BranchCreates, PullCreates;
         internal List<string> PostPaths { get; } = [];
@@ -477,7 +482,7 @@ internal static class DevelopmentPublicationGatewayTests
                     sha = Commit,
                     tree = new { sha = NextTree },
                     parents = new[] { new { sha = baseline } },
-                    message = commitMessage,
+                    message = ConflictingCommit ? "Different job marker" : commitMessage,
                     author = commitAuthor,
                     committer = commitCommitter
                 });
