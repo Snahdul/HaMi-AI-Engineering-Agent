@@ -35,18 +35,28 @@ internal static class PersistenceBridgeProbe
                 using (Process child = start(unknown ? "bridge-unknown" : "bridge-hold", root))
                 {
                     Task<string> stderr = child.StandardError.ReadToEndAsync();
+                    var startup = Stopwatch.StartNew();
                     try
                     {
                         await WaitForMarkerAsync(child, unknown ? "BRIDGE_RESERVED" : "BRIDGE_ACCEPTED").WaitAsync(Deadline);
+                        Console.WriteLine($"Bridge fixture startup/acceptance: {startup.ElapsedMilliseconds} ms.");
                         if (child.HasExited)
                             throw new InvalidOperationException("Bridge owner stopped before the crash test.");
                         await expectOwnership(root, "BUSY");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"Bridge startup failed after {startup.ElapsedMilliseconds} ms: {ex.GetType().Name}: {ex.Message}");
+                        throw;
                     }
                     finally
                     {
                         if (!child.HasExited)
                             child.Kill(entireProcessTree: true);
                         await child.WaitForExitAsync().WaitAsync(Deadline);
+                        string diagnostics = await stderr.WaitAsync(Deadline);
+                        if (diagnostics.Length > 0)
+                            Console.Error.WriteLine(diagnostics[^Math.Min(diagnostics.Length, 16 * 1024)..]);
                     }
 
                     if (child.ExitCode == 0)
@@ -130,6 +140,9 @@ internal static class PersistenceBridgeProbe
     {
         while (await child.StandardOutput.ReadLineAsync() is string line)
         {
+            // The fixture is synthetic and has no credentials or live model
+            // output. Keep child diagnostics visible even if readiness times out.
+            Console.WriteLine("[bridge child] " + line);
             if (line == expected)
                 return;
         }
@@ -192,6 +205,7 @@ internal static class PersistenceBridgeProbe
             Console.WriteLine("SQLite native version: " + version.ExecuteScalar());
         }
 
+        Console.WriteLine("BRIDGE_PHASE: identity validated; initializing provider.");
         var guard = new ProviderConnectionGuard();
         var options = new DataOptions()
             .UseConnectionString(ProviderName.SQLiteMS, connection)
@@ -214,15 +228,20 @@ internal static class PersistenceBridgeProbe
                     throw new InvalidOperationException("Persisted transition was not acknowledged.");
             }
 
+            Console.WriteLine("BRIDGE_PHASE: host started; awaiting replay.");
+            var recovery = Stopwatch.StartNew();
             BridgeState current = await ReadAsync();
             guard.RequireObserved();
+            Console.WriteLine($"BRIDGE_PHASE: replay state {current.Stage}; {recovery.ElapsedMilliseconds} ms.");
             string artifact = database + ".s01";
             if (first)
             {
                 if (current.Stage != 0 || File.Exists(artifact))
                     throw new InvalidOperationException("New journal is not empty.");
                 await AdvanceAsync("order-accepted:" + claim.ArchiveHash, 1);
+                Console.WriteLine("BRIDGE_PHASE: order accepted.");
                 await AdvanceAsync("s01-operation-reserved", 2);
+                Console.WriteLine("BRIDGE_PHASE: operation reserved.");
                 if (mode == "bridge-unknown")
                 {
                     Console.WriteLine("BRIDGE_RESERVED");
@@ -231,6 +250,7 @@ internal static class PersistenceBridgeProbe
                 {
                     string hash = owner.StoreOrderArtifact("S01", AcceptedBytes);
                     await AdvanceAsync("s01-accepted:" + hash, 3);
+                    Console.WriteLine("BRIDGE_PHASE: S01 persisted; opening rollback transaction.");
                     // Hold an actual native rollback transaction across process kill.
                     // This table is a test fixture; Akka event rows are untouched.
                     using var crashConnection = new SqliteConnection(connection);
@@ -340,13 +360,18 @@ internal static class PersistenceBridgeProbe
         {
             CheckDurability(connection);
             _ = configured.GetValue(connection, _ => new object());
+            Console.WriteLine("BRIDGE_GUARD: configured connection " + connection.GetType().FullName);
         }
 
         public override DbCommand CommandInitialized(CommandEventData eventData, DbCommand command)
         {
             if (command.Connection is not DbConnection connection
                 || !configured.TryGetValue(connection, out _))
+            {
+                Console.Error.WriteLine("BRIDGE_GUARD: command connection not configured: "
+                    + (command.Connection?.GetType().FullName ?? "null"));
                 throw new InvalidOperationException("Provider used a connection without the durability callback.");
+            }
             Interlocked.Increment(ref commands);
             return command;
         }
