@@ -478,18 +478,18 @@ internal static class PersistenceBridgeProbe
                     || current.S01 is not null || current.S02 is not null || current.ArtifactHash is not null || File.Exists(artifact))
                     throw new InvalidOperationException("Known failure did not recover.");
                 VerifyFixtureFailure(owner, claim, failed, candidate);
-                string receipt = database + ".evidence-1";
-                byte[] originalReceipt = File.ReadAllBytes(receipt);
-                File.WriteAllBytes(receipt, [.. originalReceipt, 0x20]);
+                string failureReceipt = database + ".evidence-1";
+                byte[] originalFailureReceipt = File.ReadAllBytes(failureReceipt);
+                File.WriteAllBytes(failureReceipt, [.. originalFailureReceipt, 0x20]);
                 try { Reject(() => VerifyFixtureFailure(owner, claim, failed, candidate)); }
-                finally { File.WriteAllBytes(receipt, originalReceipt); }
+                finally { File.WriteAllBytes(failureReceipt, originalFailureReceipt); }
                 VerifyFixtureFailure(owner, claim, failed, candidate);
 
-                long originalStart = current.Ledger.StartedUtcTicks;
+                long originalRetryStart = current.Ledger.StartedUtcTicks;
                 var retry = current.Ledger.Propose(claim.JobId, "S01", "model", 30, DateTime.UtcNow.Ticks);
                 current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(retry), 2);
                 if (retry.OperationId != claim.JobId + ":2" || current.Ledger.Models != 2
-                    || current.Ledger.ReservedSeconds != 60 || current.Ledger.StartedUtcTicks != originalStart
+                    || current.Ledger.ReservedSeconds != 60 || current.Ledger.StartedUtcTicks != originalRetryStart
                     || current.Ledger.LatestCandidate != candidate)
                     throw new InvalidOperationException("Retry reset original reservation or candidate.");
                 Reject(() => owner.RequireOrderOperationEvidence(retry, failed.Completion));
@@ -551,7 +551,7 @@ internal static class PersistenceBridgeProbe
                 || current.Ledger.StartedUtcTicks != originalStart || current.Ledger.Models != 1
                 || current.Ledger.ReservedSeconds != 30)
                 throw new InvalidOperationException("Budget extension reset prior work.");
-            limits = current.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
+            var extendedLimits = current.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
             Console.WriteLine("BRIDGE_PHASE: recovered budget stop; synthetic approved extension persisted.");
 
             // Reusing S01 is not a second write to its exclusive effect file.
@@ -560,7 +560,7 @@ internal static class PersistenceBridgeProbe
             if (current.Ledger.Pending != next || current.Ledger.Models != 2
                 || current.Ledger.ReservedSeconds != 130)
                 throw new InvalidOperationException("S02 reservation acknowledgement differs.");
-            _ = current.Ledger.DispatchAllowance(limits, next.OperationId, DateTime.UtcNow.Ticks);
+            _ = current.Ledger.DispatchAllowance(extendedLimits, next.OperationId, DateTime.UtcNow.Ticks);
             string outputHash = owner.StoreOrderArtifact("S02", input);
             _ = owner.RequireOrderArtifact("S02", outputHash);
             var finalCompletion = ObserveFixtureOutcome(owner, claim, next, outputHash);
