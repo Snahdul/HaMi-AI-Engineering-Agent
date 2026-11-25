@@ -17,3 +17,7 @@ Sources: https://getakka.net/articles/persistence/event-sourcing.html ; https://
 - Test actual journal and native SQLite on both OS, not an in-memory journal or an ActorSystem-only restart. Existing V1 probe unchanged except invocation of the extra test.
 - These are synthetic effects, not real external operation reconciliation or proof of durable storage through power loss. No proof of production ACLs/Unix file modes for database and sidecars, link/rollback protection, backups or migration. The simple event vocabulary is not the eventual production contract. No dual state authority; production decision and concrete private storage integration require S02 review. No CI bypass or separate workflow.
 
+
+## S01 result and S02 decision
+
+CI 45613428906 passed on both OS including the actual journal process-kill/reentry marker. The owner approved the standard-journal bridge direction (Issue #70 comment 7162605006). [ADR-0006](decisions/0006-persistent-development-order-journal.md) records the production boundary and staged implementation. S03.1 replaces the fixture's conceptual V1 sentinel with a separate versioned order-claim primitive in the host code; the existing probe still tests the original isolated S01 experiment until S03.2 integrates the protected journal. No claim of completed production journal integration or package/security acceptance.

@@ -26,6 +26,7 @@ internal static class DevelopmentOrderHandoverTests
 
         DevelopmentOrderApproval Approve(OrderIssueObservation observation) => DevelopmentOrderApproval.Observe(observation, profile);
         DevelopmentOrderApproval approved = Approve(issue);
+        DevelopmentOrderClaimTests.SelfTest(approved);
 
         void Reject(Action action, string reason)
         {

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 
 namespace HaMi.Agentic.Cli.Features.Development;
 
@@ -10,7 +11,11 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
 {
     private readonly string root = ValidateRoot(trustedRoot);
 
-    internal Lease Acquire(int issue)
+    internal Lease Acquire(int issue) => AcquireCore(issue, orderClaim: false);
+
+    internal Lease AcquireOrder(int issue) => AcquireCore(issue, orderClaim: true);
+
+    private Lease AcquireCore(int issue, bool orderClaim)
     {
         if (issue <= 0)
             throw new InvalidOperationException("Recovery issue identity rejected.");
@@ -19,7 +24,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         // One canonical repository is supported by this vertical slice.
         // The key deliberately excludes checkout, base, task and results path.
         string prefix = Path.Combine(root, "issue-" + issue.ToString(CultureInfo.InvariantCulture));
-        return new Lease(prefix, issue, validatePrivateEntry);
+        return new Lease(prefix, issue, validatePrivateEntry, orderClaim);
     }
 
     // Locate the original issue through the private registry only. The
@@ -45,7 +50,16 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             if (!RegularFileExists(path))
                 throw new InvalidOperationException("Recovery registry entry disappeared.");
             validatePrivateEntry?.Invoke(path, false);
-            var state = ReadState(path, issue);
+            byte[] bytes = ReadClaimBytes(path);
+            using var document = JsonDocument.Parse(bytes, new JsonDocumentOptions { MaxDepth = 8 });
+            if (document.RootElement.GetProperty("schemaVersion").GetInt32() == DevelopmentOrderClaim.Version)
+            {
+                DevelopmentOrderClaim order = DevelopmentOrderClaim.Parse(bytes, issue);
+                if (order.JobId == jobId)
+                    throw new InvalidOperationException("Mehrschrittauftrag requires order recovery, not V1 recovery.");
+                continue;
+            }
+            var state = ParseState(bytes, issue);
             if (state.Identity.JobId != jobId)
                 continue;
             if (selected is not null)
@@ -61,7 +75,9 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         throw new InvalidOperationException("Recovery job identity changed during acquisition.");
     }
 
-    private static DevelopmentJobState ReadState(string path, int issue)
+    private static DevelopmentJobState ReadState(string path, int issue) => ParseState(ReadClaimBytes(path), issue);
+
+    private static byte[] ReadClaimBytes(string path)
     {
         // Atomic replacement can occur while scanning other issues. The
         // open handle observes a complete old or new checkpoint, not a mix.
@@ -73,6 +89,11 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         stream.ReadExactly(bytes);
         if (stream.ReadByte() != -1)
             throw new InvalidOperationException("Recovery state changed during read.");
+        return bytes;
+    }
+
+    private static DevelopmentJobState ParseState(byte[] bytes, int issue)
+    {
         var state = DevelopmentJobState.Parse(bytes);
         if (state.Identity.IssueNumber != issue)
             throw new InvalidOperationException("Recovery state belongs to a different issue.");
@@ -116,18 +137,22 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         private readonly string statePath;
         private readonly string nextPath;
         private readonly string legacyPath;
+        private readonly string approvalPath;
+        private readonly bool orderClaim;
         private byte[]? legacyClaim;
         private readonly int issue;
         private readonly Action<string, bool>? validatePrivateEntry;
         private bool disposed;
 
-        internal Lease(string prefix, int issue, Action<string, bool>? validatePrivateEntry)
+        internal Lease(string prefix, int issue, Action<string, bool>? validatePrivateEntry, bool orderClaim)
         {
+            this.orderClaim = orderClaim;
             this.issue = issue;
             this.validatePrivateEntry = validatePrivateEntry;
             statePath = prefix + ".json";
             nextPath = prefix + ".next";
             legacyPath = prefix + ".legacy-active";
+            approvalPath = prefix + ".order-approval";
             string lockPath = prefix + ".lock";
             bool lockExists = RegularFileExists(lockPath);
             if (lockExists)
@@ -145,7 +170,20 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                     throw new InvalidOperationException("Uncommitted recovery state requires reconciliation.");
                 if (RegularFileExists(legacyPath))
                     throw new InvalidOperationException("Previous non-recoverable issue execution requires reconciliation.");
-                Current = Read();
+                if (orderClaim)
+                {
+                    CurrentOrder = ReadOrder();
+                    if (CurrentOrder is not null)
+                        _ = RequireArchivedOrder();
+                    else if (RegularFileExists(approvalPath))
+                        throw new InvalidOperationException("Order archive exists without its claim.");
+                }
+                else
+                {
+                    Current = Read();
+                    if (RegularFileExists(approvalPath))
+                        throw new InvalidOperationException("Order archive requires order recovery.");
+                }
             }
             catch
             {
@@ -155,10 +193,60 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         }
 
         internal DevelopmentJobState? Current { get; private set; }
+        internal DevelopmentOrderClaim? CurrentOrder { get; private set; }
+
+        private DevelopmentOrderClaim? ReadOrder()
+        {
+            if (!RegularFileExists(statePath))
+                return null;
+            validatePrivateEntry?.Invoke(statePath, false);
+            return DevelopmentOrderClaim.Parse(ReadClaimBytes(statePath), issue);
+        }
+
+        internal DevelopmentOrderArchive RequireArchivedOrder()
+        {
+            CheckOpen();
+            if (!orderClaim || CurrentOrder is null || ReadOrder() != CurrentOrder
+                || !RegularFileExists(approvalPath))
+                throw new InvalidOperationException("Order claim or archive missing or changed.");
+            validatePrivateEntry?.Invoke(approvalPath, false);
+            byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(approvalPath, DevelopmentOrderArchive.MaxBytes);
+            return DevelopmentOrderArchive.Parse(bytes, CurrentOrder);
+        }
+
+        internal void ClaimOrder(string jobId, DevelopmentOrderApproval approval)
+        {
+            CheckOpen();
+            if (!orderClaim || CurrentOrder is not null || ReadOrder() is not null
+                || RegularFileExists(legacyPath) || RegularFileExists(approvalPath)
+                || RegularFileExists(nextPath) || approval.Binding.IssueNumber != issue)
+                throw new InvalidOperationException("Existing order claim cannot be replaced.");
+
+            var archive = DevelopmentOrderArchive.From(approval);
+            byte[] bytes = archive.Serialize();
+            var claim = DevelopmentOrderClaim.Create(jobId, approval.Binding, DevelopmentJobState.Hash(bytes));
+            byte[] claimBytes = claim.Serialize();
+            // Claim first: a crash before the archive is durable must block
+            // this issue, not silently create a new job. No effects here.
+            WriteNew(nextPath, claimBytes);
+            File.Move(nextPath, statePath, overwrite: false);
+            CurrentOrder = ReadOrder();
+            if (CurrentOrder != claim)
+                throw new InvalidOperationException("Order claim readback failed.");
+            WriteNew(approvalPath, bytes);
+            _ = RequireArchivedOrder();
+        }
+
+        private void RequireV1()
+        {
+            CheckOpen();
+            if (orderClaim)
+                throw new InvalidOperationException("V1 operation rejected on an order lease.");
+        }
 
         internal DevelopmentJobState RequireCurrent()
         {
-            CheckOpen();
+            RequireV1();
             if (Current is null || Read() != Current)
                 throw new InvalidOperationException("Recovery claim missing or changed.");
             return Current;
@@ -174,7 +262,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
 
         internal void Claim(DevelopmentJobState initial)
         {
-            CheckOpen();
+            RequireV1();
             initial.Validate();
             if (legacyClaim is not null || RegularFileExists(legacyPath)
                 || Current is not null || initial.Stage != DevelopmentJobState.Accepted
@@ -188,7 +276,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         // durable blocker on interruption rather than bypassing ownership.
         internal void ClaimLegacy(string jobId)
         {
-            CheckOpen();
+            RequireV1();
             if (!DevelopmentPublicationPolicy.IsSha(jobId, 32)
                 || legacyClaim is not null || Current is not null || Read() is not null
                 || RegularFileExists(legacyPath))
@@ -205,7 +293,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
 
         internal void CompleteLegacy()
         {
-            CheckOpen();
+            RequireV1();
             if (legacyClaim is null || !RegularFileExists(legacyPath))
                 throw new InvalidOperationException("Non-recoverable issue claim missing.");
             validatePrivateEntry?.Invoke(legacyPath, false);
@@ -217,7 +305,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
 
         internal void Commit(DevelopmentJobState next)
         {
-            CheckOpen();
+            RequireV1();
             if (Current is null || Read() != Current)
                 throw new InvalidOperationException("Recovery claim missing or changed.");
             DevelopmentJobState.ValidateTransition(Current, next);
@@ -232,16 +320,21 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             // Same-directory temporary file, exclusively created. Flush the
             // contents before rename. This is a process-crash checkpoint,
             // not a claim of guaranteed durability through power loss.
-            using (var stream = OpenPrivateFile(nextPath, FileMode.CreateNew, FileOptions.WriteThrough))
-            {
-                stream.Write(bytes);
-                stream.Flush(flushToDisk: true);
-            }
-            validatePrivateEntry?.Invoke(nextPath, false);
+            WriteNew(nextPath, bytes);
             File.Move(nextPath, statePath, overwrite: replace);
             Current = Read();
             if (Current != next)
                 throw new InvalidOperationException("Recovery checkpoint readback failed.");
+        }
+
+        private void WriteNew(string path, byte[] bytes)
+        {
+            using (var stream = OpenPrivateFile(path, FileMode.CreateNew, FileOptions.WriteThrough))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+            validatePrivateEntry?.Invoke(path, false);
         }
 
         private FileStream OpenPrivateFile(string path, FileMode mode, FileOptions options)
