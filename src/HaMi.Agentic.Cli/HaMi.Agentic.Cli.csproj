@@ -7,9 +7,13 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="../../contracts/development/development-order.schema.json" LogicalName="HaMi.DevelopmentOrder.Schema" />
+  </ItemGroup>
+  <ItemGroup>
     <InternalsVisibleTo Include="HaMi.Agentic.JobState.Probe" />
   </ItemGroup>
   <ItemGroup>
+    <PackageReference Include="Corvus.Text.Json.Validator" Version="5.8.12" />
     <PackageReference Include="YamlDotNet" Version="18.1.0" />
     <PackageReference Include="System.CommandLine" Version="3.0.0" />
     <PackageReference Include="Akka.Hosting" Version="1.5.74" />

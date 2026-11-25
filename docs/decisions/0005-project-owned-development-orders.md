@@ -1,6 +1,6 @@
 # Architecture decision 0005: Project-owned development orders and provenance
 
-**Status:** Proposed concrete contract for human review, 25 November 2026, [Issue #67](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/67). The principles were approved by the project owner; this specification and the implementation are not yet accepted.
+**Status:** Contract direction approved by project owner, 25 November 2026; implementation and acceptance in progress, [Issue #67](https://github.com/Snahdul/HaMi-AI-Engineering-Agent/issues/67). The direction and contract draft were approved; implementation, dependency review and acceptance remain open.
 **Related:** [ADR-0001](0001-commandline-akka-isolated-coding.md), [ADR-0003](0003-security-architecture-and-credential-isolation.md), [ADR-0004](0004-durable-developer-job-recovery.md), roadmap #48, #19. Reviewed baseline: `9fa33db907c0a65e3766ed95f3e1e75dd40e25f3`.
 
 ## Context and decision
@@ -25,7 +25,7 @@ Keep the existing Developer slice and Akka technical coordinator. MEAI remains t
 
 ## Scope and consequences
 
-[Contract and evidence design](../developer-order-contract.md), [draft order schema](../../contracts/development/development-order.schema.json), [synthetic reference order](../../samples/DevelopmentOrder/pair-order.json) specify the proposed M5b boundary. M5b read-only parsing/validation and deterministic offline tests; no new runtime dispatch, GitHub write capability, live model, guest execution or publication. M5c implements actual safe checkpoints, artifact retention and idempotent projection; M5d specialist selection and productive integration. Total host loss requires a separately approved backup/restore strategy. A checksum verifies bytes, not authenticity, availability or human authorship. No new dependencies selected by this ADR.
+[Contract and evidence design](../developer-order-contract.md), [draft order schema](../../contracts/development/development-order.schema.json), [synthetic reference order](../../samples/DevelopmentOrder/pair-order.json) specify the proposed M5b boundary. M5b read-only parsing/validation and deterministic offline tests; no new runtime dispatch, GitHub write capability, live model, guest execution or publication. M5c implements actual safe checkpoints, artifact retention and idempotent projection; M5d specialist selection and productive integration. Total host loss requires a separately approved backup/restore strategy. A checksum verifies bytes, not authenticity, availability or human authorship. The first schema-validation increment uses Corvus.Text.Json.Validator 5.8.12; see the contract design for rationale and pending dependency checks.
 
 ## References
 

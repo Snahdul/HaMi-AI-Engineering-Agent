@@ -333,6 +333,7 @@ internal static class DevelopmentAgentCommand
     {
         CommandLineRouter.SelfTest();
         DevelopmentAgentContract.SelfTest();
+        DevelopmentOrderTests.SelfTest(repo);
         DevelopmentPublicationPolicy.SelfTest();
         DevelopmentJobStateTests.SelfTest();
         DevelopmentJobStateRoot.SelfTest();
