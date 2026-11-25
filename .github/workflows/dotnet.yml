@@ -2,19 +2,31 @@ name: HaMi Agent .NET 11 CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Optional manual diagnostic; never a required PR check'
+        required: true
+        default: both
+        type: choice
+        options: [linux, windows, both]
 
 permissions:
   contents: read
 
-# Only the newest pull-request revision needs the full CI. Manual runs
-# have their own group and never cancel a PR or another manual run.
+# Only the newest PR event needs CI. Manual diagnostic runs have their own
+# group and never cancel a PR or another manual run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build:
+  # IDs are deliberately different from the required check names. Even
+  # a skipped draft job must not publish a check called 'build'.
+  linux-tests:
+    name: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false && 'build' || (github.event_name == 'workflow_dispatch' && 'Manual Linux build' || 'Draft Linux build') }}
+    if: ${{ (github.event_name == 'pull_request' && (github.event.pull_request.draft == false || contains(github.event.pull_request.labels.*.name, 'ci:full') || !contains(github.event.pull_request.labels.*.name, 'ci:windows'))) || (github.event_name == 'workflow_dispatch' && (inputs.platform == 'linux' || inputs.platform == 'both')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
@@ -197,8 +209,9 @@ jobs:
             exit 1
           fi
 
-  windows-logging:
-    name: Windows file-handle logging regression
+  windows-tests:
+    name: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false && 'Windows file-handle logging regression' || (github.event_name == 'workflow_dispatch' && 'Manual Windows regression' || 'Draft Windows regression') }}
+    if: ${{ (github.event_name == 'pull_request' && (github.event.pull_request.draft == false || contains(github.event.pull_request.labels.*.name, 'ci:full') || contains(github.event.pull_request.labels.*.name, 'ci:windows'))) || (github.event_name == 'workflow_dispatch' && (inputs.platform == 'windows' || inputs.platform == 'both')) }}
     runs-on: windows-latest
     timeout-minutes: 12
     steps:
