@@ -236,7 +236,7 @@ jobs:
           $template = Get-Content 'scripts/acceptance/HostIsolationProbe.cs.txt' -Raw
           $program = $template.Replace('__DRIVE__', 'g').Replace('__RELATIVE__', 'dummy.txt').Replace('__WINJSON__', '"G:\\dummy.txt"')
           [IO.File]::WriteAllText((Join-Path $target 'Program.cs'), $program)
-          [IO.File]::WriteAllText((Join-Path $target 'GuestProbe.csproj'), '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net11.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>')
+          [IO.File]::WriteAllText((Join-Path $target 'GuestProbe.csproj'), '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net11.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup></Project>')
           dotnet build (Join-Path $target 'GuestProbe.csproj') -c Release -p:NuGetAudit=false --nologo
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
