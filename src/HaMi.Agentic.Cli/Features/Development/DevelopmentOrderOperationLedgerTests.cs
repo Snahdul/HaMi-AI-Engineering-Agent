@@ -9,10 +9,17 @@ internal static class DevelopmentOrderOperationLedgerTests
         string job = new('a', 32);
         string hash = new('A', 64);
         long now = new DateTime(2026, 11, 25, 10, 0, 0, DateTimeKind.Utc).Ticks;
+        var agent = new OrderAgentIdentity("fixture-agent", "1", hash, "offline", "synthetic", hash);
+        OrderAssignment Assignment(string step) => new(approval.Binding, Guid.ParseExact(job, "N"), step, 1,
+            agent, "Synthetic reviewed assignment.", approval.ObservedAt);
+        OrderOperationReservation Propose(DevelopmentOrderOperationLedger state, string step, string kind, int seconds, long observed) =>
+            state.Propose(job, step, kind, seconds, observed,
+                kind == "model" ? OrderOperationAgentBinding.FromAssignment(Assignment(step)) : null);
+
         var start = new OrderExecutionStart(1, hash, now);
         var initial = new DevelopmentOrderOperationLedger().Start(
             DevelopmentOrderOperationLedger.DecodeStart(DevelopmentOrderOperationLedger.EncodeStart(start)), hash, limits, policy);
-        var reserve = initial.Propose(job, "S01", "model", 30, now);
+        var reserve = Propose(initial, "S01", "model", 30, now);
         Reject(() => new DevelopmentOrderOperationLedger().Reserve(job, limits, reserve));
         Reject(() => initial.Start(start, hash, limits, policy));
         Reject(() => initial.Reserve(job, limits, reserve with { ObservedUtcTicks = now - 1 }));
@@ -21,7 +28,7 @@ internal static class DevelopmentOrderOperationLedgerTests
         if (reserved.Sequence != 1 || reserved.Models != 1 || reserved.Guests != 0
             || reserved.ReservedSeconds != 30 || reserved.Pending != reserve)
             throw new InvalidOperationException("Reservation was not charged.");
-        Reject(() => reserved.Reserve(job, limits, reserved.Propose(job, "S02", "guest", 1, now)));
+        Reject(() => reserved.Reserve(job, limits, Propose(reserved, "S02", "guest", 1, now)));
         Reject(() => initial.Reserve(job, limits, reserve with { Version = 1 }));
         Reject(() => initial.Reserve(job, limits, reserve with { OperationId = new string('b', 32) + ":1" }));
         Reject(() => initial.Reserve(job, limits, reserve with { ReservedSeconds = 0 }));
@@ -46,25 +53,25 @@ internal static class DevelopmentOrderOperationLedgerTests
         Reject(() => reserved.DispatchAllowance(limits, job + ":2", now));
         Reject(() => reserved.DispatchAllowance(limits, reserve.OperationId, now + 30 * TimeSpan.TicksPerSecond));
         var failed = reserved.Complete(completion with { Outcome = "failed", ObservedUtcTicks = afterTen });
-        var retry = failed.Propose(job, "S01", "model", 30, afterTen);
+        var retry = Propose(failed, "S01", "model", 30, afterTen);
         if (failed.LastOutcome != "failed" || failed.LastEvidenceHash != hash || retry.OperationId == reserve.OperationId)
             throw new InvalidOperationException("Failure/retry identity differs.");
         var retried = failed.Reserve(job, limits, retry);
         if (retried.Models != 2 || retried.ReservedSeconds != 60)
             throw new InvalidOperationException("Retry refunded prior budget.");
         long expired = now + (long)limits.Seconds * TimeSpan.TicksPerSecond;
-        Reject(() => settled.Reserve(job, limits, settled.Propose(job, "S02", "model", 1, expired)));
-        Reject(() => failed.Reserve(job, limits, failed.Propose(job, "S02", "model", 1, now)));
+        Reject(() => settled.Reserve(job, limits, Propose(settled, "S02", "model", 1, expired)));
+        Reject(() => failed.Reserve(job, limits, Propose(failed, "S02", "model", 1, now)));
         if (failed.Remaining(limits, afterTen) != TimeSpan.FromSeconds(limits.Seconds - 10))
             throw new InvalidOperationException("Recovery window reset.");
         var late = reserved.Complete(completion with { ObservedUtcTicks = expired });
         if (late.Remaining(limits, expired) != TimeSpan.Zero)
             throw new InvalidOperationException("Late completion extended deadline.");
-        Reject(() => late.Reserve(job, limits, late.Propose(job, "S02", "model", 1, expired)));
+        Reject(() => late.Reserve(job, limits, Propose(late, "S02", "model", 1, expired)));
 
         DevelopmentOrderOperationLedger Spend(DevelopmentOrderOperationLedger state, string step, string kind)
         {
-            var request = state.Propose(job, step, kind, step == "FINAL" ? policy.FinalVerificationSeconds : 1, now);
+            var request = Propose(state, step, kind, step == "FINAL" ? policy.FinalVerificationSeconds : 1, now);
             return state.Reserve(job, limits, request).Complete(new(2, request.OperationId, hash, "succeeded", now));
         }
 
@@ -92,7 +99,7 @@ internal static class DevelopmentOrderOperationLedgerTests
         Reject(() => Spend(time, "S01", "model"));
         Reject(() => initial.Reserve(job, limits with { Models = 0 }, reserve));
         Reject(() => initial.Reserve(job, limits with { Guests = limits.FinalGuests },
-            initial.Propose(job, "S01", "guest", 1, now)));
+            Propose(initial, "S01", "guest", 1, now)));
         // Re-fold the same events without effects.
         var replay = initial.Reserve(job, limits, DevelopmentOrderOperationLedger.DecodeReservation(evt))
             .Complete(DevelopmentOrderOperationLedger.DecodeCompletion(complete));
@@ -104,7 +111,7 @@ internal static class DevelopmentOrderOperationLedgerTests
         var small = limits with { Seconds = 120 };
         var smallStart = new DevelopmentOrderOperationLedger().Start(start, hash, small, policy);
         var first = smallStart.Reserve(job, small, reserve).Complete(completion);
-        var blockedRequest = first.Propose(job, "S02", "model", 100, now);
+        var blockedRequest = Propose(first, "S02", "model", 100, now);
         var stop = new OrderBudgetExhausted(1, blockedRequest, "time");
         if (first.BudgetDenial(job, small, blockedRequest) != "time")
             throw new InvalidOperationException("Closing time reserve not protected.");
@@ -112,9 +119,9 @@ internal static class DevelopmentOrderOperationLedgerTests
         Reject(() => first.StopForBudget(job, small, stop with { Reason = "count" }));
         var stopped = first.StopForBudget(job, small,
             DevelopmentOrderOperationLedger.DecodeBudgetStop(DevelopmentOrderOperationLedger.EncodeBudgetStop(stop)));
-        Reject(() => stopped.Reserve(job, small, stopped.Propose(job, "S02", "model", 1, now)));
+        Reject(() => stopped.Reserve(job, small, Propose(stopped, "S02", "model", 1, now)));
         Reject(() => stopped.Reserve(job, limits, blockedRequest));
-        Reject(() => smallStart.Reserve(job, small, reserve with { Step = "FINAL", Kind = "guest", ReservedSeconds = 1 }));
+        Reject(() => smallStart.Reserve(job, small, reserve with { Step = "FINAL", Kind = "guest", ReservedSeconds = 1, Assignment = null }));
         var extension = new OrderBudgetExtensionApproved(1, job, hash, 0, limits, new string('B', 64), afterTen);
         Reject(() => first.Extend(job, policy, extension));
         Reject(() => reserved.Extend(job, policy, extension));
@@ -134,7 +141,7 @@ internal static class DevelopmentOrderOperationLedgerTests
             || resumed.ReservedSeconds != 30 || resumed.LastEvidenceHash != hash)
             throw new InvalidOperationException("Budget extension reset prior work.");
         Reject(() => resumed.Extend(job, policy, extension));
-        var next = resumed.Propose(job, "S02", "model", 100, afterTen);
+        var next = Propose(resumed, "S02", "model", 100, afterTen);
         var resumedReservation = resumed.Reserve(job, limits, next);
         if (resumedReservation.ReservedSeconds != 130 || resumedReservation.Sequence != 2)
             throw new InvalidOperationException("Continuation did not preserve charge.");
@@ -162,7 +169,7 @@ internal static class DevelopmentOrderOperationLedgerTests
         Reject(() => reserved.Checkpoint(claim, candidate with { OperationId = job + ":2" }));
         Reject(() => reserved.Checkpoint(claim, candidate with { OperationId = job + ":01" }));
         Reject(() => reserved.Checkpoint(claim, candidate with { ObservedUtcTicks = now - 1 }));
-        Reject(() => checkpointed.Reserve(job, limits, checkpointed.Propose(job, "S01", "model", 1, now)));
+        Reject(() => checkpointed.Reserve(job, limits, Propose(checkpointed, "S01", "model", 1, now)));
         Reject(() => DevelopmentOrderOperationLedger.DecodeCandidate(candidateEvent + " "));
         if (checkpointed.Complete(completion with { Outcome = "failed" }).LatestCandidate != candidate)
             throw new InvalidOperationException("Known failure discarded candidate.");
@@ -202,7 +209,7 @@ internal static class DevelopmentOrderOperationLedgerTests
             throw new InvalidOperationException("Retry checkpoint changed operation identity or charge.");
         Console.WriteLine("PASS: checkpoint provenance, byte integrity and charged retry identity.");
 
-        var observation = new OrderOperationEvidence(1, hash, reserve, OrderOperationEvidence.FixtureObserver,
+        var observation = new OrderOperationEvidence(2, hash, reserve, OrderOperationEvidence.FixtureObserver,
             "succeeded", claim.Binding.CalculatorBaselineHash, claim.Binding.CalculatorBaselineHash,
             actualCandidate.ArtifactHash, afterTen);
         var observedCompletion = observation.Completion();
@@ -222,6 +229,42 @@ internal static class DevelopmentOrderOperationLedgerTests
         if (reserved.Complete(knownFailure.Completion()).ReservedSeconds != 30)
             throw new InvalidOperationException("Known failure evidence refunded charge.");
         Console.WriteLine("PASS: exact operation evidence binds reservation, outcome, observer and completion digest.");
+
+        var assignment = Assignment("S01");
+        var agentBinding = reserve.Assignment ?? throw new InvalidOperationException("Model assignment missing.");
+        agentBinding.RequireAssignment(assignment);
+        Reject(() => initial.Reserve(job, limits, reserve with { Assignment = null }));
+        Reject(() => initial.Reserve(job, limits, reserve with { Version = 2 }));
+        Reject(() => initial.Reserve(job, limits, reserve with { Assignment = agentBinding with { Revision = 0 } }));
+        Reject(() => initial.Reserve(job, limits, reserve with { Assignment = agentBinding with { AssignmentHash = "invalid" } }));
+        Reject(() => agentBinding.RequireAssignment(assignment with { Revision = 2 }));
+        Reject(() => agentBinding.RequireAssignment(Assignment("S02")));
+        Reject(() => agentBinding.RequireAssignment(assignment with { JobId = Guid.ParseExact(new string('b', 32), "N") }));
+        Reject(() => agentBinding.RequireAssignment(assignment with { Agent = agent with { Version = "2" } }));
+        Reject(() => agentBinding.RequireAssignment(assignment with { Agent = agent with { ConfigurationHash = new string('C', 64) } }));
+        // A self-consistent replacement receipt with a different identity or
+        // revision must still fail against the original journal reservation.
+        foreach (var changedAssignment in new[]
+        {
+            assignment with { Revision = 2 },
+            assignment with { Agent = agent with { Id = "foreign-agent" } },
+            assignment with { Agent = agent with { Version = "2" } },
+            assignment with { Agent = agent with { Model = "other-model" } },
+            assignment with { Agent = agent with { Provider = "other-provider" } },
+            assignment with { Agent = agent with { ProfileHash = new string('B', 64) } },
+            assignment with { Agent = agent with { ConfigurationHash = new string('C', 64) } },
+            Assignment("S02")
+        })
+        {
+            var substituted = observation with
+            {
+                Reservation = reserve with { Assignment = OrderOperationAgentBinding.FromAssignment(changedAssignment) }
+            };
+            Reject(() => substituted.ValidateCompletion(claim, reserve, substituted.Completion()));
+        }
+        Reject(() => observation.ValidateCompletion(claim, retry, observation.Completion()));
+        Reject(() => DevelopmentOrderOperationLedger.DecodeReservation(evt.Replace("reserve-v3:", "reserve-v2:", StringComparison.Ordinal)));
+        Console.WriteLine("PASS: journaled model assignment binds agent version, revision, configuration and attempt; substituted receipts rejected.");
     }
 
     private static void Reject(Action action)

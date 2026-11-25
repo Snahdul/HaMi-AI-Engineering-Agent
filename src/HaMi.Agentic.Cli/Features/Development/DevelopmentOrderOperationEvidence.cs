@@ -18,8 +18,9 @@ internal sealed record OrderOperationEvidence(
         var operation = Reservation ?? throw new InvalidOperationException("ORDER_EVIDENCE_RESERVATION");
         string prefix = claim.JobId + ":";
         string baseline = operation.Step == "S01" ? claim.Binding.CalculatorBaselineHash : claim.Binding.FormatterBaselineHash;
-        OrderCheck.Require(Version == 1 && ArchiveHash == claim.ArchiveHash
-            && Observer == FixtureObserver && operation.Version == 2 && operation.Kind == "model"
+        (operation.Assignment ?? throw new InvalidOperationException("ORDER_EVIDENCE_ASSIGNMENT")).Validate();
+        OrderCheck.Require(Version == 2 && ArchiveHash == claim.ArchiveHash
+            && Observer == FixtureObserver && operation.Version == 3 && operation.Kind == "model"
             && operation.Step is "S01" or "S02"
             && operation.ReservedSeconds > 0 && operation.ObservedUtcTicks > 0
             && ObservedUtcTicks >= operation.ObservedUtcTicks && ObservedUtcTicks <= DateTime.MaxValue.Ticks

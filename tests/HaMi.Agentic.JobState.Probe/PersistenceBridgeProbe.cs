@@ -28,6 +28,29 @@ internal static class PersistenceBridgeProbe
     private static readonly byte[] PartialBytes = Encoding.UTF8.GetBytes("internal static class PartialCalculator {");
     private static readonly string PartialHash = DevelopmentJobState.Hash(PartialBytes);
 
+    // Fixed reviewed offline catalog; not runtime agent selection. Construct
+    // the historical decision from immutable archived inputs, never from a
+    // mutable current model profile during replay.
+    private static OrderAssignment FixtureAssignment(DevelopmentOrderClaim claim,
+        DevelopmentOrderArchive archive, string step)
+    {
+        if (step is not ("S01" or "S02"))
+            throw new InvalidOperationException("Unknown fixture assignment step.");
+        var agent = new OrderAgentIdentity("fixture-" + step, "1",
+            DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("fixture profile " + step)),
+            "offline", "synthetic",
+            DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("fixture configuration " + step)));
+        return new(claim.Binding, Guid.ParseExact(claim.JobId, "N"), step, 1, agent,
+            "Reviewed offline C# fixture assignment.", archive.ObservedAt);
+    }
+
+    private static void VerifyFixtureAssignment(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive,
+        OrderOperationReservation operation)
+    {
+        (operation.Assignment ?? throw new InvalidOperationException("Missing model assignment."))
+            .RequireAssignment(FixtureAssignment(claim, archive, operation.Step));
+    }
+
     // Controlled host observation, separate from the synthetic generator.
     // This is not an independent real model/guest verifier.
     private static OrderOperationCompletion ObserveFixtureOutcome(DevelopmentJobStateStore.Lease owner,
@@ -38,7 +61,7 @@ internal static class PersistenceBridgeProbe
             throw new InvalidOperationException("Fixture output differs from trusted reference.");
         string baseline = operation.Step == "S01" ? claim.Binding.CalculatorBaselineHash : claim.Binding.FormatterBaselineHash;
         string inputHash = operation.Step == "S01" ? baseline : DevelopmentJobState.Hash(owner.RequireOrderArtifact("S01", AcceptedHash));
-        var evidence = new OrderOperationEvidence(1, claim.ArchiveHash, operation, OrderOperationEvidence.FixtureObserver,
+        var evidence = new OrderOperationEvidence(2, claim.ArchiveHash, operation, OrderOperationEvidence.FixtureObserver,
             "succeeded", baseline, inputHash, outputHash, DateTime.UtcNow.Ticks);
         var completion = owner.StoreOrderOperationEvidence(evidence);
         Reject(() => owner.StoreOrderOperationEvidence(evidence));
@@ -206,6 +229,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: unaccepted source checkpoint survives process kill; pending model remains blocked.");
         Console.WriteLine("PASS: immutable operation outcome receipts survive process kill; missing, tampered and mismatched evidence rejected.");
         Console.WriteLine("PASS: known failed fixture operation survives process kill; verified receipt and retained candidate permit one newly charged retry.");
+        Console.WriteLine("PASS: exact historical model assignment survives process kill with reservation and receipts.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -271,6 +295,21 @@ internal static class PersistenceBridgeProbe
         OrderOperationLimits limits = archive.EffectiveLimits;
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
         bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed";
+        if (first)
+        {
+            var fixtureApproval = FixtureApproval();
+            if (fixtureApproval.Binding != claim.Binding || fixtureApproval.ObservedAt != archive.ObservedAt)
+                throw new InvalidOperationException("Fixture assignment approval mismatch.");
+            var assignments = new[] { FixtureAssignment(claim, archive, "S01"), FixtureAssignment(claim, archive, "S02") };
+            var catalog = assignments.Select(a => new OrderAgentProfile(a.Agent, true, ["csharp"])).ToArray();
+            foreach (var assignment in assignments)
+                DevelopmentOrderHandover.ValidateAssignment(fixtureApproval, Guid.ParseExact(claim.JobId, "N"), assignment, catalog);
+        }
+
+        OrderOperationReservation ProposeModel(DevelopmentOrderOperationLedger state, string step, int seconds, long now) =>
+            state.Propose(claim.JobId, step, "model", seconds, now,
+                OrderOperationAgentBinding.FromAssignment(FixtureAssignment(claim, archive, step)));
+
         string database = first ? owner.CreateOrderJournal() : owner.RequireOrderJournal();
 
         string connection = new SqliteConnectionStringBuilder
@@ -315,7 +354,7 @@ internal static class PersistenceBridgeProbe
         try
         {
             var system = host.Services.GetRequiredService<ActorSystem>();
-            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, limits, policy, owner)), "bridge");
+            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, archive, limits, policy, owner)), "bridge");
             async Task<BridgeState> ReadAsync()
             {
                 Task<BridgeState> read = actor.Ask<BridgeState>(new ReadState(), Deadline);
@@ -340,6 +379,14 @@ internal static class PersistenceBridgeProbe
             string artifact = database + ".s01";
             if (!first)
             {
+                // The exact assignment is part of the historical reservation,
+                // including for unresolved and failed attempts.
+                if (current.Ledger.Pending is { } recoveredOperation)
+                    VerifyFixtureAssignment(claim, archive, recoveredOperation);
+                if (current.S01 is { } recoveredS01)
+                    VerifyFixtureAssignment(claim, archive, recoveredS01.Reservation);
+                if (current.FailedS01 is { } recoveredFailure)
+                    VerifyFixtureAssignment(claim, archive, recoveredFailure.Reservation);
                 long now = DateTime.UtcNow.Ticks;
                 if (current.Ledger.StartedUtcTicks <= 0 || current.Ledger.StartedUtcTicks >= processStart
                     || current.Ledger.Remaining(limits, now) >= TimeSpan.FromSeconds(limits.Seconds)
@@ -355,7 +402,7 @@ internal static class PersistenceBridgeProbe
                 current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeStart(
                     new(1, claim.ArchiveHash, processStart)), 1);
                 Console.WriteLine("BRIDGE_PHASE: order accepted.");
-                var reserved = current.Ledger.Propose(claim.JobId, "S01", "model", 30, DateTime.UtcNow.Ticks);
+                var reserved = ProposeModel(current.Ledger, "S01", 30, DateTime.UtcNow.Ticks);
                 current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(reserved), 2);
                 if (current.Ledger.Pending != reserved || current.Ledger.Models != 1
                     || current.Ledger.ReservedSeconds != 30)
@@ -382,7 +429,7 @@ internal static class PersistenceBridgeProbe
                         byte[] rejected = owner.RequireOrderCandidate(candidate);
                         if (!rejected.SequenceEqual(PartialBytes) || rejected.SequenceEqual(AcceptedBytes))
                             throw new InvalidOperationException("Expected fixture rejection missing.");
-                        var failure = new OrderOperationEvidence(1, claim.ArchiveHash, reserved,
+                        var failure = new OrderOperationEvidence(2, claim.ArchiveHash, reserved,
                             OrderOperationEvidence.FixtureObserver, "failed", claim.Binding.CalculatorBaselineHash,
                             claim.Binding.CalculatorBaselineHash, null, DateTime.UtcNow.Ticks);
                         var completion = owner.StoreOrderOperationEvidence(failure);
@@ -401,7 +448,7 @@ internal static class PersistenceBridgeProbe
                     string hash = owner.StoreOrderArtifact("S01", AcceptedBytes);
                     var completion = ObserveFixtureOutcome(owner, claim, reserved, hash);
                     current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(completion), 3);
-                    var denied = current.Ledger.Propose(claim.JobId, "S02", "model", 100, DateTime.UtcNow.Ticks);
+                    var denied = ProposeModel(current.Ledger, "S02", 100, DateTime.UtcNow.Ticks);
                     current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeBudgetStop(new(1, denied, "time")), 3);
                     if (current.Ledger.BudgetStop?.Request != denied || current.Ledger.Sequence != 1
                         || File.Exists(database + ".s02"))
@@ -463,7 +510,7 @@ internal static class PersistenceBridgeProbe
                     new(2, pending.OperationId, PartialHash, "succeeded", DateTime.UtcNow.Ticks)));
                 // Do not retry or release the reservation: outcome is unknown.
                 Reject(() => current.Ledger.Reserve(claim.JobId, limits,
-                    current.Ledger.Propose(claim.JobId, "S01", "model", 30, DateTime.UtcNow.Ticks)));
+                    ProposeModel(current.Ledger, "S01", 30, DateTime.UtcNow.Ticks)));
                 Console.WriteLine("BRIDGE_BLOCKED");
                 return 0;
             }
@@ -486,13 +533,18 @@ internal static class PersistenceBridgeProbe
                 VerifyFixtureFailure(owner, claim, failed, candidate);
 
                 long originalRetryStart = current.Ledger.StartedUtcTicks;
-                var retry = current.Ledger.Propose(claim.JobId, "S01", "model", 30, DateTime.UtcNow.Ticks);
+                var retry = ProposeModel(current.Ledger, "S01", 30, DateTime.UtcNow.Ticks);
                 current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(retry), 2);
                 if (retry.OperationId != claim.JobId + ":2" || current.Ledger.Models != 2
                     || current.Ledger.ReservedSeconds != 60 || current.Ledger.StartedUtcTicks != originalRetryStart
                     || current.Ledger.LatestCandidate != candidate)
                     throw new InvalidOperationException("Retry reset original reservation or candidate.");
                 Reject(() => owner.RequireOrderOperationEvidence(retry, failed.Completion));
+                var retryAssignment = retry.Assignment ?? throw new InvalidOperationException("Retry assignment missing.");
+                Reject(() => owner.RequireOrderOperationEvidence(failed.Reservation with
+                {
+                    Assignment = retryAssignment with { Revision = retryAssignment.Revision + 1 }
+                }, failed.Completion));
                 _ = current.Ledger.DispatchAllowance(limits, retry.OperationId, DateTime.UtcNow.Ticks);
                 string hash = owner.StoreOrderArtifact("S01", AcceptedBytes);
                 var succeeded = ObserveFixtureOutcome(owner, claim, retry, hash);
@@ -504,7 +556,7 @@ internal static class PersistenceBridgeProbe
                 // The old failure remains a distinct receipt even after success.
                 _ = owner.RequireOrderOperationEvidence(failed.Reservation, failed.Completion);
                 Reject(() => current.Ledger.Reserve(claim.JobId, limits,
-                    current.Ledger.Propose(claim.JobId, "S01", "model", 1, DateTime.UtcNow.Ticks)));
+                    ProposeModel(current.Ledger, "S01", 1, DateTime.UtcNow.Ticks)));
                 guard.RequireObserved();
                 Console.WriteLine("BRIDGE_PHASE: verified failure; fresh retry consumed second S01 model reservation.");
                 Console.WriteLine("BRIDGE_RETRIED");
@@ -540,7 +592,7 @@ internal static class PersistenceBridgeProbe
                 || current.Ledger.BudgetRevision != 0 || current.Ledger.CurrentLimits != limits)
                 throw new InvalidOperationException("Persistent budget exhaustion missing.");
             Reject(() => current.Ledger.Reserve(claim.JobId, limits,
-                current.Ledger.Propose(claim.JobId, "S02", "model", 1, DateTime.UtcNow.Ticks)));
+                ProposeModel(current.Ledger, "S02", 1, DateTime.UtcNow.Ticks)));
             // Synthetic trusted decision only; no real approval transport.
             string decision = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic extension fixture"));
             var extension = new OrderBudgetExtensionApproved(1, claim.JobId, claim.ArchiveHash, 0,
@@ -555,7 +607,7 @@ internal static class PersistenceBridgeProbe
             Console.WriteLine("BRIDGE_PHASE: recovered budget stop; synthetic approved extension persisted.");
 
             // Reusing S01 is not a second write to its exclusive effect file.
-            var next = current.Ledger.Propose(claim.JobId, "S02", "model", 100, DateTime.UtcNow.Ticks);
+            var next = ProposeModel(current.Ledger, "S02", 100, DateTime.UtcNow.Ticks);
             current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(next), 4);
             if (current.Ledger.Pending != next || current.Ledger.Models != 2
                 || current.Ledger.ReservedSeconds != 130)
@@ -735,16 +787,18 @@ internal static class PersistenceBridgeProbe
         private BridgeState state = new(0, null, new());
         private bool recovered;
         private readonly DevelopmentOrderClaim claim;
+        private readonly DevelopmentOrderArchive archive;
         private readonly OrderOperationLimits limits;
         private readonly DevelopmentOrderBudgetPolicy policy;
 
         public override string PersistenceId { get; }
 
-        public BridgeActor(DevelopmentOrderClaim claim, OrderOperationLimits limits, DevelopmentOrderBudgetPolicy policy,
-            DevelopmentJobStateStore.Lease owner)
+        public BridgeActor(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive,
+            OrderOperationLimits limits, DevelopmentOrderBudgetPolicy policy, DevelopmentJobStateStore.Lease owner)
         {
             PersistenceId = claim.PersistenceId;
             this.claim = claim;
+            this.archive = archive;
             this.limits = limits;
             this.policy = policy;
             // Recovery only folds acknowledged journal events; no effects.
@@ -797,6 +851,7 @@ internal static class PersistenceBridgeProbe
                 if (evt.StartsWith("budget-stop-v1:", StringComparison.Ordinal))
                 {
                     var stop = DevelopmentOrderOperationLedger.DecodeBudgetStop(evt);
+                    VerifyFixtureAssignment(claim, archive, stop.Request);
                     if (stop.Request.Step != (previous.Stage == 1 ? "S01" : "S02") || stop.Request.Kind != "model")
                         throw new InvalidOperationException("Unexpected synthetic stop.");
                     return previous with { Ledger = previous.Ledger.StopForBudget(claim.JobId, effective, stop) };
@@ -808,6 +863,7 @@ internal static class PersistenceBridgeProbe
                             DevelopmentOrderOperationLedger.DecodeBudgetExtension(evt))
                     };
                 var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
+                VerifyFixtureAssignment(claim, archive, reservation);
                 if (reservation.Step != (previous.Stage == 1 ? "S01" : "S02") || reservation.Kind != "model")
                     throw new InvalidOperationException("Unexpected synthetic step operation.");
                 return previous with
