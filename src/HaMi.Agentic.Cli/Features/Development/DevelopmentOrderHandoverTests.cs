@@ -52,12 +52,17 @@ internal static class DevelopmentOrderHandoverTests
         Reject(() => Approve(issue with { Comments = [comment, comment with { Id = 2 }] }), "ORDER_APPROVAL_AMBIGUOUS");
         var revoke = comment with
         {
-            Id = 2, Body = $"HaMi-Order-Revoke: v1 1 {order.Sha256}",
-            CreatedAt = time.AddSeconds(1), UpdatedAt = time.AddSeconds(1)
+            Id = 2,
+            Body = $"HaMi-Order-Revoke: v1 1 {order.Sha256}",
+            CreatedAt = time.AddSeconds(1),
+            UpdatedAt = time.AddSeconds(1)
         };
         Reject(() => Approve(issue with { Comments = [revoke, comment] }), "ORDER_APPROVAL_STALE_OR_REVOKED");
-        Reject(() => Approve(issue with { Body = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(body)
-            .Replace(plan, " " + plan, StringComparison.Ordinal)) }), "ORDER_APPROVAL_STALE_OR_REVOKED");
+        Reject(() => Approve(issue with
+        {
+            Body = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(body)
+                .Replace(plan, " " + plan, StringComparison.Ordinal))
+        }), "ORDER_APPROVAL_STALE_OR_REVOKED");
         var reapproval = comment with { Id = 3, CreatedAt = time.AddSeconds(2), UpdatedAt = time.AddSeconds(2) };
         if (Approve(issue with { Comments = [reapproval, revoke, comment] }).Binding.ApprovalCommentId != 3)
             throw new InvalidOperationException("Latest explicit approval not bound.");
