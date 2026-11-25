@@ -59,7 +59,7 @@ internal sealed record DevelopmentOrderOperationLedger(
     string? LastEvidenceHash = null, OrderOperationLimits? CurrentLimits = null,
     string? ArchiveHash = null, string? PolicyHash = null, int FinalReserveSeconds = 0,
     int BudgetRevision = 0, OrderBudgetExhausted? BudgetStop = null, string ExtensionHashes = "",
-    OrderCandidateCheckpoint? LatestCandidate = null)
+    OrderCandidateCheckpoint? LatestCandidate = null, OrderGuestOutcome? LatestGuestOutcome = null)
 {
     internal int Models => S01Models + S02Models;
     internal int Guests => S01Guests + S02Guests + FinalGuests;
@@ -135,7 +135,7 @@ internal sealed record DevelopmentOrderOperationLedger(
         if (reservation.Kind == "model")
             (reservation.Assignment ?? throw new InvalidOperationException("ORDER_OPERATION_ASSIGNMENT")).Validate();
         else
-            OrderCheck.Require(reservation.Assignment is null, "ORDER_GUEST_ASSIGNMENT");
+            _ = DevelopmentOrderGuestReconciliation.RunId(reservation);
         OrderCheck.Require(FinalGuests == 0 || reservation.Step == "FINAL", "ORDER_FINAL_ALREADY_RESERVED");
         int closing = reservation.Step == "FINAL" ? 0 : FinalReserveSeconds;
         OrderCheck.Require(reservation.Step != "FINAL" || reservation.ReservedSeconds >= FinalReserveSeconds,
@@ -242,6 +242,25 @@ internal sealed record DevelopmentOrderOperationLedger(
     // before persisting this event. A known failure is also a spent operation.
     internal DevelopmentOrderOperationLedger Complete(OrderOperationCompletion completion)
     {
+        OrderCheck.Require(Pending is { Kind: "model" }, "ORDER_MODEL_COMPLETION_REQUIRED");
+        return Settle(completion);
+    }
+
+    // Only the typed guest outcome may settle a guest reservation. The
+    // trusted host independently verifies report bytes and sandbox absence
+    // before journaling; pure replay does not repeat inspect or guest work.
+    internal DevelopmentOrderOperationLedger CompleteGuest(OrderGuestOutcome outcome)
+    {
+        var reservation = Pending ?? throw new InvalidOperationException("ORDER_GUEST_PENDING");
+        string archiveHash = ArchiveHash ?? throw new InvalidOperationException("ORDER_GUEST_ARCHIVE");
+        outcome.Validate(archiveHash, reservation);
+        string evidenceHash = DevelopmentJobState.Hash(OrderStorageJson.Encode(outcome, EventMaxBytes));
+        return Settle(new(2, reservation.OperationId, evidenceHash, "succeeded", outcome.ObservedUtcTicks))
+            with { LatestGuestOutcome = outcome };
+    }
+
+    private DevelopmentOrderOperationLedger Settle(OrderOperationCompletion completion)
+    {
         OrderCheck.Require(completion.Version == 2 && Pending is not null
             && completion.OperationId == Pending.OperationId && OrderCheck.Hash(completion.EvidenceHash)
             && completion.Outcome is "succeeded" or "failed", "ORDER_OPERATION_COMPLETION");
@@ -300,6 +319,12 @@ internal sealed record DevelopmentOrderOperationLedger(
 
     internal static OrderCandidateCheckpoint DecodeCandidate(string evt) =>
         OrderStorageJson.Decode<OrderCandidateCheckpoint>(EventBytes(evt, "candidate-v1:"), EventMaxBytes);
+
+    internal static string EncodeGuestOutcome(OrderGuestOutcome outcome) =>
+        "guest-outcome-v1:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(outcome, EventMaxBytes));
+
+    internal static OrderGuestOutcome DecodeGuestOutcome(string evt) =>
+        OrderStorageJson.Decode<OrderGuestOutcome>(EventBytes(evt, "guest-outcome-v1:"), EventMaxBytes);
 
     private static byte[] EventBytes(string evt, string prefix)
     {

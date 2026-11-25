@@ -72,7 +72,10 @@ internal static class DevelopmentOrderOperationLedgerTests
         DevelopmentOrderOperationLedger Spend(DevelopmentOrderOperationLedger state, string step, string kind)
         {
             var request = Propose(state, step, kind, step == "FINAL" ? policy.FinalVerificationSeconds : 1, now);
-            return state.Reserve(job, limits, request).Complete(new(2, request.OperationId, hash, "succeeded", now));
+            var charged = state.Reserve(job, limits, request);
+            return kind == "guest"
+                ? charged.CompleteGuest(new(1, hash, request, DevelopmentOrderGuestReconciliation.RunId(request), hash, now))
+                : charged.Complete(new(2, request.OperationId, hash, "succeeded", now));
         }
 
         var modelLimit = settled;
@@ -265,6 +268,61 @@ internal static class DevelopmentOrderOperationLedgerTests
         Reject(() => observation.ValidateCompletion(claim, retry, observation.Completion()));
         Reject(() => DevelopmentOrderOperationLedger.DecodeReservation(evt.Replace("reserve-v3:", "reserve-v2:", StringComparison.Ordinal)));
         Console.WriteLine("PASS: journaled model assignment binds agent version, revision, configuration and attempt; substituted receipts rejected.");
+
+        var guestRequest = Propose(initial, "S01", "guest", 30, now);
+        var guestPending = initial.Reserve(job, limits, guestRequest);
+        string runId = DevelopmentOrderGuestReconciliation.RunId(guestRequest);
+        if (runId.Length != 32
+            || runId != DevelopmentOrderGuestReconciliation.RunId(DevelopmentOrderOperationLedger.DecodeReservation(
+                DevelopmentOrderOperationLedger.EncodeReservation(guestRequest)))
+            || runId == DevelopmentOrderGuestReconciliation.RunId(Propose(guestPending, "S01", "guest", 30, now)))
+            throw new InvalidOperationException("Guest identity was not stable and operation-specific.");
+        Reject(() => guestPending.Complete(new(2, guestRequest.OperationId, hash, "succeeded", now)));
+        Reject(() => guestPending.Reserve(job, limits, Propose(guestPending, "S01", "guest", 30, now)));
+        Reject(() => DevelopmentOrderGuestReconciliation.RunId(reserve));
+        string absent = "error: sandbox 'hami-code-" + runId[..12] + "' not found";
+        var report = new DevelopmentSandboxRunner.SandboxRunReport(1, runId, "Demo.csproj", "run",
+            0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null);
+        byte[] Report(DevelopmentSandboxRunner.SandboxRunReport value) =>
+            System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(value,
+                new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web) { WriteIndented = true });
+        OrderGuestOutcome? Observe(DevelopmentSandboxRunner.SandboxRunReport value) =>
+            DevelopmentOrderGuestReconciliation.Observe(hash, guestRequest, Report(value), 1, "", absent, afterTen);
+        if (DevelopmentOrderGuestReconciliation.Observe(hash, guestRequest, null, 1, "", absent, afterTen) is not null
+            || DevelopmentOrderGuestReconciliation.Observe(hash, guestRequest, Report(report), 0, absent, "", afterTen) is not null
+            || DevelopmentOrderGuestReconciliation.Observe(hash, guestRequest, Report(report), 1, "", "backend unavailable", afterTen) is not null
+            || DevelopmentOrderGuestReconciliation.Observe(hash, guestRequest, [.. Report(report), 0x20], 1, "", absent, afterTen) is not null)
+            throw new InvalidOperationException("Missing/ambiguous guest evidence was accepted.");
+        foreach (var invalidReport in new[]
+        {
+            report with { RunId = new string('f', 32) },
+            report with { Project = "Other.csproj" },
+            report with { Mode = "build" },
+            report with { TimedOut = true },
+            report with { SandboxRemovalSucceeded = false },
+            report with { ExecutionExitCode = 1 },
+            report with { BuildExitCode = 1, ExecutionExitCode = -1 },
+            report with { RestoreExitCode = 1, BuildExitCode = -1, ExecutionExitCode = -1 },
+            report with { Error = "uncertain host failure" }
+        })
+            if (Observe(invalidReport) is not null)
+                throw new InvalidOperationException("Unconfirmed guest outcome accepted.");
+
+        var guestOutcome = Observe(report) ?? throw new InvalidOperationException("Known guest outcome missing.");
+        var recoveredOutcome = DevelopmentOrderOperationLedger.DecodeGuestOutcome(
+            DevelopmentOrderOperationLedger.EncodeGuestOutcome(guestOutcome));
+        DevelopmentOrderGuestReconciliation.RequireObserved(recoveredOutcome, Observe(report));
+        Reject(() => DevelopmentOrderGuestReconciliation.RequireObserved(recoveredOutcome, null));
+        Reject(() => DevelopmentOrderGuestReconciliation.RequireObserved(recoveredOutcome, Observe(report with { TotalMilliseconds = 7 })));
+        Reject(() => guestPending.CompleteGuest(guestOutcome with { RunId = new string('f', 32) }));
+        Reject(() => guestPending.CompleteGuest(guestOutcome with { ArchiveHash = new string('C', 64) }));
+        Reject(() => reserved.CompleteGuest(guestOutcome));
+        var guestSettled = guestPending.CompleteGuest(recoveredOutcome);
+        if (guestSettled.Pending is not null || guestSettled.Guests != 1 || guestSettled.ReservedSeconds != 30
+            || guestSettled.LatestGuestOutcome != guestOutcome || guestSettled.LastOutcome != "succeeded")
+            throw new InvalidOperationException("Reconciled guest refunded budget or lost identity.");
+        Reject(() => guestSettled.CompleteGuest(recoveredOutcome));
+        Console.WriteLine("PASS: pre-bound guest run identity, exact report and confirmed absence required; unknown guest remains blocked.");
     }
 
     private static void Reject(Action action)
