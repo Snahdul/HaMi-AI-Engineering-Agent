@@ -7,6 +7,12 @@ on:
 permissions:
   contents: read
 
+# Only the newest pull-request revision needs the full CI. Manual runs
+# have their own group and never cancel a PR or another manual run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,8 +29,8 @@ jobs:
         with:
           global-json-file: global.json
 
-      - name: Restore
-        run: dotnet restore src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj
+      - name: Restore CLI and JobState probe dependency graph
+        run: dotnet restore tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj
 
       - name: Build
         run: dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-restore
@@ -35,7 +41,7 @@ jobs:
         shell: pwsh
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $env:BASE_SHA -Mode Check -Restore -SmokeIfEmpty
+        run: ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $env:BASE_SHA -Mode Check -SmokeIfEmpty
 
       - name: Generate formatting correction patch on failure (read-only CI)
         if: failure() && steps.format-check.outcome == 'failure'
@@ -58,7 +64,7 @@ jobs:
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
 
       - name: Verify exclusive developer job ownership across processes (offline)
-        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release
+        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --no-restore
 
       - name: Verify production-verify CLI dispatch reaches reviewed contract gate (offline)
         shell: bash
@@ -231,8 +237,8 @@ jobs:
           dotnet build (Join-Path $target 'GuestProbe.csproj') -c Release -p:NuGetAudit=false --nologo
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Restore
-        run: dotnet restore src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj
+      - name: Restore CLI and JobState probe dependency graph
+        run: dotnet restore tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj
 
       - name: Release build with warnings as errors
         run: dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-restore
@@ -243,7 +249,7 @@ jobs:
         shell: pwsh
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $env:BASE_SHA -Mode Check -Restore -SmokeIfEmpty
+        run: ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $env:BASE_SHA -Mode Check -SmokeIfEmpty
 
       - name: Generate formatting correction patch on failure (read-only CI)
         if: failure() && steps.format-check.outcome == 'failure'
@@ -263,7 +269,7 @@ jobs:
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
 
       - name: Verify exclusive developer job ownership across processes (offline)
-        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release
+        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --no-restore
 
       - name: Validate general C# sandbox runner input isolation on Windows (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-run-self-test
