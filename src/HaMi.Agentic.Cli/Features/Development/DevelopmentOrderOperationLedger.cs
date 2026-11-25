@@ -8,23 +8,7 @@ namespace HaMi.Agentic.Cli.Features.Development;
 // current authority, timeouts and independently verified outcome evidence.
 internal sealed record OrderOperationLimits(
     int Models, int Guests, int Seconds, int S01Models, int S01Guests,
-    int S02Models, int S02Guests, int FinalGuests)
-{
-    internal static OrderOperationLimits From(DevelopmentOrder order)
-    {
-        var root = order.Document;
-        var limits = root.GetProperty("limits");
-        var steps = root.GetProperty("steps");
-        return new(limits.GetProperty("modelCalls").GetInt32(),
-            limits.GetProperty("sandboxRuns").GetInt32(),
-            limits.GetProperty("elapsedSeconds").GetInt32(),
-            steps[0].GetProperty("maxModelCalls").GetInt32(),
-            steps[0].GetProperty("maxSandboxRuns").GetInt32(),
-            steps[1].GetProperty("maxModelCalls").GetInt32(),
-            steps[1].GetProperty("maxSandboxRuns").GetInt32(),
-            root.GetProperty("finalVerification").GetProperty("maxSandboxRuns").GetInt32());
-    }
-}
+    int S02Models, int S02Guests, int FinalGuests);
 
 internal sealed record OrderExecutionStart(int Version, string ArchiveHash, long UtcTicks);
 

@@ -5,6 +5,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj" />
     <EmbeddedResource Include="../../samples/DevelopmentOrder/pair-order.json" LogicalName="HaMi.Probe.Order" />
+    <EmbeddedResource Include="../../policies/development/pair-budget.fixture.policy.json" LogicalName="HaMi.Probe.BudgetPolicy" />
     <PackageReference Include="Akka.Persistence" />
     <PackageReference Include="Akka.Persistence.Hosting" />
     <PackageReference Include="Akka.Persistence.Sql.Hosting" />

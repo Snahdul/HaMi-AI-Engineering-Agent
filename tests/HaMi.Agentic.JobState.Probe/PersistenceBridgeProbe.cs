@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Reflection;
 using System.Text;
+using System.Text.Json.Nodes;
 using Akka.Actor;
 using Akka.Hosting;
 using Akka.Pattern;
@@ -162,21 +163,35 @@ internal static class PersistenceBridgeProbe
         using Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("HaMi.Probe.Order")
             ?? throw new InvalidOperationException("Order fixture missing.");
         using var reader = new StreamReader(stream);
-        string plan = reader.ReadToEnd().Replace("\r\n", "\n", StringComparison.Ordinal);
+        // Exercise the no-explicit-budget path across actual process kill.
+        JsonObject node = JsonNode.Parse(reader.ReadToEnd())!.AsObject();
+        node.Remove("limits");
+        foreach (JsonNode? step in node["steps"]!.AsArray())
+        {
+            step!.AsObject().Remove("maxModelCalls");
+            step.AsObject().Remove("maxSandboxRuns");
+        }
+        node["finalVerification"]!.AsObject().Remove("maxSandboxRuns");
+        string plan = node.ToJsonString() + "\n";
+        using Stream policyStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("HaMi.Probe.BudgetPolicy")
+            ?? throw new InvalidOperationException("Budget policy fixture missing.");
+        using var buffer = new MemoryStream();
+        policyStream.CopyTo(buffer);
+        var policy = DevelopmentOrderBudgetPolicy.Parse(buffer.ToArray());
         byte[] body = Encoding.UTF8.GetBytes("\x60\x60\x60hami-order-json\n" + plan + "\x60\x60\x60\n");
         DevelopmentOrder order = DevelopmentOrder.ParseIssueBody(body);
         var document = order.Document;
         string repository = document.GetProperty("repository").GetString()!;
         string commit = document.GetProperty("baseCommit").GetString()!;
         string hash = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic review"));
-        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", commit, hash, hash, hash, hash, hash);
+        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", commit, hash, hash, policy.Sha256, hash, hash);
         DateTimeOffset time = new(2026, 11, 25, 10, 0, 0, TimeSpan.Zero);
         var comment = new OrderCommentObservation(1, 42, "fixture-owner",
             $"HaMi-Order-Approval: v1 1 {order.Sha256} {commit}", time, time);
         var observation = new OrderIssueObservation(repository, Issue, Issue,
             document.GetProperty("title").GetString()!, 42, "fixture-owner",
             true, true, body, time.AddMinutes(1), true, [comment]);
-        return DevelopmentOrderApproval.Observe(observation, profile);
+        return DevelopmentOrderApproval.Observe(observation, profile, policy);
     }
 
     internal static async Task<int> RunChildAsync(string mode, string root, DevelopmentJobStateStore.Lease owner)
@@ -185,9 +200,8 @@ internal static class PersistenceBridgeProbe
         DevelopmentOrderClaim claim = owner.CurrentOrder
             ?? throw new InvalidOperationException("Order claim missing.");
         DevelopmentOrderArchive archive = owner.RequireArchivedOrder();
-        var order = DevelopmentOrder.ParseIssueBody(Encoding.UTF8.GetBytes(
-            "\x60\x60\x60hami-order-json\n" + archive.Plan + "\x60\x60\x60\n"));
-        OrderOperationLimits limits = OrderOperationLimits.From(order);
+        // Recovery uses only the validated immutable archive, not today's policy.
+        OrderOperationLimits limits = archive.EffectiveLimits;
         bool first = mode is "bridge-hold" or "bridge-unknown";
         string database = first ? owner.CreateOrderJournal() : owner.RequireOrderJournal();
 

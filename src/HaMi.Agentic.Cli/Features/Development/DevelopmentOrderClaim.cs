@@ -55,12 +55,13 @@ internal sealed record DevelopmentOrderClaim(
 // permission to execute. Live approval must be obtained separately.
 internal sealed record DevelopmentOrderArchive(
     int SchemaVersion, OrderBinding Binding, string Title, DateTimeOffset ObservedAt,
-    OrderCommentObservation Comment, string Plan)
+    OrderCommentObservation Comment, string Plan, string BudgetPolicy, OrderOperationLimits EffectiveLimits)
 {
     internal const int MaxBytes = 256 * 1024;
 
     internal static DevelopmentOrderArchive From(DevelopmentOrderApproval approval) =>
-        new(1, approval.Binding, approval.Title, approval.ObservedAt, approval.Comment, approval.Order.Plan);
+        new(2, approval.Binding, approval.Title, approval.ObservedAt, approval.Comment, approval.Order.Plan,
+            approval.BudgetPolicy.Source, approval.EffectiveLimits);
 
     internal byte[] Serialize() => OrderStorageJson.Encode(this, MaxBytes);
 
@@ -68,7 +69,7 @@ internal sealed record DevelopmentOrderArchive(
     {
         OrderCheck.Require(DevelopmentJobState.Hash(bytes) == claim.ArchiveHash, "ORDER_ARCHIVE_HASH");
         var archive = OrderStorageJson.Decode<DevelopmentOrderArchive>(bytes, MaxBytes);
-        OrderCheck.Require(archive.SchemaVersion == 1 && archive.Binding == claim.Binding
+        OrderCheck.Require(archive.SchemaVersion == 2 && archive.Binding == claim.Binding
             && archive.ObservedAt != default,
             "ORDER_ARCHIVE_BINDING");
         OrderBinding binding = claim.Binding;
@@ -91,6 +92,9 @@ internal sealed record DevelopmentOrderArchive(
             && comment.AuthorLogin == binding.OwnerLogin && comment.Body == expected
             && comment.CreatedAt != default && comment.CreatedAt == comment.UpdatedAt
             && comment.CreatedAt <= archive.ObservedAt, "ORDER_ARCHIVE_OBSERVATION");
+        var policy = DevelopmentOrderBudgetPolicy.Parse(new UTF8Encoding(false, true).GetBytes(archive.BudgetPolicy));
+        OrderCheck.Require(policy.Sha256 == binding.PolicyHash
+            && policy.Resolve(order) == archive.EffectiveLimits, "ORDER_ARCHIVE_EFFECTIVE_BUDGET");
         return archive;
     }
 }

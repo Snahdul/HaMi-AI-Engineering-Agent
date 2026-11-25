@@ -1,10 +1,11 @@
 using System.Text;
+using System.Text.Json.Nodes;
 
 namespace HaMi.Agentic.Cli.Features.Development;
 
 internal static class DevelopmentOrderHandoverTests
 {
-    internal static void SelfTest(string plan)
+    internal static void SelfTest(string plan, DevelopmentOrderBudgetPolicy policy)
     {
         byte[] body = Encoding.UTF8.GetBytes("### Approved plan\n\n" + "\x60\x60\x60hami-order-json\n" + plan + "\x60\x60\x60\n");
         DevelopmentOrder order = DevelopmentOrder.ParseIssueBody(body);
@@ -17,14 +18,14 @@ internal static class DevelopmentOrderHandoverTests
         // Expected baseline digests are independent of the supplied artifact store.
         string baselineOne = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic baseline one"));
         string baselineTwo = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic baseline two"));
-        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", baseCommit, hash, hash, hash,
+        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", baseCommit, hash, hash, policy.Sha256,
             baselineOne, baselineTwo);
         var comment = new OrderCommentObservation(1, 42, "fixture-owner",
             $"HaMi-Order-Approval: v1 1 {order.Sha256} {baseCommit}", time, time);
         var issue = new OrderIssueObservation(repository, 901, number, title, 42, "fixture-owner",
             true, true, body, time.AddMinutes(1), true, [comment]);
 
-        DevelopmentOrderApproval Approve(OrderIssueObservation observation) => DevelopmentOrderApproval.Observe(observation, profile);
+        DevelopmentOrderApproval Approve(OrderIssueObservation observation) => DevelopmentOrderApproval.Observe(observation, profile, policy);
         DevelopmentOrderApproval approved = Approve(issue);
         DevelopmentOrderClaimTests.SelfTest(approved);
         DevelopmentOrderOperationLedgerTests.SelfTest(approved);
@@ -43,12 +44,49 @@ internal static class DevelopmentOrderHandoverTests
             throw new InvalidOperationException("Expected rejection: " + reason);
         }
 
+        // A human approves the unchanged plan without budget fields. The
+        // host resolves defaults; no second approval marker is required.
+        JsonObject without = JsonNode.Parse(plan)!.AsObject();
+        without.Remove("limits");
+        foreach (JsonNode? step in without["steps"]!.AsArray())
+        {
+            step!.AsObject().Remove("maxModelCalls");
+            step.AsObject().Remove("maxSandboxRuns");
+        }
+        without["finalVerification"]!.AsObject().Remove("maxSandboxRuns");
+        byte[] defaultBody = Encoding.UTF8.GetBytes("\x60\x60\x60hami-order-json\n" + without.ToJsonString() + "\n\x60\x60\x60\n");
+        DevelopmentOrder defaultOrder = DevelopmentOrder.ParseIssueBody(defaultBody);
+        var defaultComment = comment with { Body = $"HaMi-Order-Approval: v1 1 {defaultOrder.Sha256} {baseCommit}" };
+        DevelopmentOrderApproval defaultApproval = Approve(issue with { Body = defaultBody, Comments = [defaultComment] });
+        if (defaultApproval.EffectiveLimits != policy.Defaults || defaultApproval.Order.Plan != defaultOrder.Plan)
+            throw new InvalidOperationException("Implicit budget changed approved plan.");
+        DevelopmentOrderClaimTests.SelfTest(defaultApproval);
+
+        // Use a deliberately tighter test policy to distinguish defaults
+        // from explicit requests. The current real fixture is not a
+        // production budget recommendation.
+        JsonObject tighter = JsonNode.Parse(policy.Source)!.AsObject();
+        tighter["defaults"]!["elapsedSeconds"] = 60;
+        tighter["maximums"]!["elapsedSeconds"] = 120;
+        var changed = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(tighter.ToJsonString()));
+        Reject(() => DevelopmentOrderApproval.Observe(issue, profile, changed), "ORDER_BUDGET_POLICY_BINDING");
+        Reject(() => changed.Resolve(order), "ORDER_BUDGET_MAXIMUM");
+        var changedApproval = DevelopmentOrderApproval.Observe(
+            issue with { Body = defaultBody, Comments = [defaultComment] },
+            profile with { PolicyHash = changed.Sha256 }, changed);
+        if (changedApproval.EffectiveLimits.Seconds != 60 || defaultApproval.EffectiveLimits.Seconds != policy.Defaults.Seconds)
+            throw new InvalidOperationException("Policy change retroactively changed accepted budget.");
+        Reject(() => DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes("{}")), "ORDER_BUDGET_POLICY_FIELDS");
+        tighter["defaults"]!["elapsedSeconds"] = 121;
+        Reject(() => DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(tighter.ToJsonString())), "ORDER_BUDGET_MAXIMUM");
+        Console.WriteLine("PASS: omitted budget resolved from reviewed policy; exact policy binding and immutable effective limits.");
+
         Reject(() => Approve(issue with { IsOpen = false }), "ORDER_ISSUE_AUTHORITY");
         Reject(() => Approve(issue with { IsActive = false }), "ORDER_ISSUE_AUTHORITY");
         Reject(() => Approve(issue with { AuthorId = 43 }), "ORDER_ISSUE_AUTHORITY");
         Reject(() => Approve(issue with { Title = "Changed" }), "ORDER_OBSERVATION_BINDING");
         Reject(() => Approve(issue with { Number = number + 1 }), "ORDER_OBSERVATION_BINDING");
-        Reject(() => DevelopmentOrderApproval.Observe(issue, profile with { BaseCommit = new string('a', 40) }),
+        Reject(() => DevelopmentOrderApproval.Observe(issue, profile with { BaseCommit = new string('a', 40) }, policy),
             "ORDER_OBSERVATION_BINDING");
         Reject(() => Approve(issue with { CompleteHistory = false }), "ORDER_APPROVAL_HISTORY");
         Reject(() => Approve(issue with { Comments = [] }), "ORDER_APPROVAL_AMBIGUOUS");

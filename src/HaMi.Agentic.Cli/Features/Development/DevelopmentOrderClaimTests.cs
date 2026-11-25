@@ -51,9 +51,19 @@ internal static class DevelopmentOrderClaimTests
                 DevelopmentOrderArchive archive = resumed.RequireArchivedOrder();
                 if (resumed.CurrentOrder != claim || archive.Plan != approval.Order.Plan
                     || archive.Comment != approval.Comment || archive.Title != approval.Title
-                    || archive.ObservedAt != approval.ObservedAt || archive.Binding != approval.Binding)
+                    || archive.ObservedAt != approval.ObservedAt || archive.Binding != approval.Binding
+                    || archive.BudgetPolicy != approval.BudgetPolicy.Source
+                    || archive.EffectiveLimits != approval.EffectiveLimits)
                     throw new InvalidOperationException("Order archive reentry mismatch.");
             }
+
+            var originalArchive = DevelopmentOrderArchive.From(approval);
+            byte[] wrongBudget = (originalArchive with
+            {
+                EffectiveLimits = originalArchive.EffectiveLimits with { Seconds = originalArchive.EffectiveLimits.Seconds - 1 }
+            }).Serialize();
+            Reject(() => DevelopmentOrderArchive.Parse(wrongBudget,
+                claim with { ArchiveHash = DevelopmentJobState.Hash(wrongBudget) }));
 
             string prefix = Path.Combine(root, FormattableString.Invariant($"issue-{issue}"));
             string archivePath = prefix + ".order-approval";

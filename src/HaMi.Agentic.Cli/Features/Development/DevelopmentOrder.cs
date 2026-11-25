@@ -122,10 +122,17 @@ internal sealed class DevelopmentOrder
         RequireDistinct(steps.Append(final).SelectMany(s => s.GetProperty("criteria").EnumerateArray()
             .Select(x => Text(x, "id"))), "ORDER_CRITERION_IDS");
 
-        JsonElement limits = root.GetProperty("limits");
-        Require(steps.Sum(s => Number(s, "maxModelCalls")) <= Number(limits, "modelCalls")
-            && steps.Sum(s => Number(s, "maxSandboxRuns")) + Number(final, "maxSandboxRuns")
-                <= Number(limits, "sandboxRuns"), "ORDER_BUDGET");
+        // Preserve the existing explicit-budget checks. Missing fields are
+        // resolved against the separately trusted policy at approval.
+        if (root.TryGetProperty("limits", out JsonElement limits))
+        {
+            if (steps.All(s => s.TryGetProperty("maxModelCalls", out _)))
+                Require(steps.Sum(s => Number(s, "maxModelCalls")) <= Number(limits, "modelCalls"), "ORDER_BUDGET");
+            if (steps.All(s => s.TryGetProperty("maxSandboxRuns", out _))
+                && final.TryGetProperty("maxSandboxRuns", out _))
+                Require(steps.Sum(s => Number(s, "maxSandboxRuns")) + Number(final, "maxSandboxRuns")
+                    <= Number(limits, "sandboxRuns"), "ORDER_BUDGET");
+        }
     }
 
     private static void RequireStep(JsonElement step, string id, string[] dependencies,

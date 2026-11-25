@@ -4,7 +4,7 @@ internal static class DevelopmentOrderOperationLedgerTests
 {
     internal static void SelfTest(DevelopmentOrderApproval approval)
     {
-        var limits = OrderOperationLimits.From(approval.Order);
+        var limits = approval.EffectiveLimits;
         string job = new('a', 32);
         string hash = new('A', 64);
         long now = new DateTime(2026, 11, 25, 10, 0, 0, DateTimeKind.Utc).Ticks;
