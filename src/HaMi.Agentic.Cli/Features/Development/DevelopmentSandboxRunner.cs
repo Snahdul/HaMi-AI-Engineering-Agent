@@ -52,10 +52,25 @@ internal static class DevelopmentSandboxRunner
         long RestoreMilliseconds, long BuildMilliseconds, long ExecutionMilliseconds,
         long CleanupMilliseconds, long TotalMilliseconds, bool SandboxRemovalSucceeded, string? Error);
 
-    public static async Task<int> RunAsync(
+    public static Task<int> RunAsync(
         string repo, string source, string project, string mode, string resultsDirectory,
-        Action<string, string, long, int>? phaseObserver = null)
+        Action<string, string, long, int>? phaseObserver = null) =>
+        RunCoreAsync(repo, source, project, mode, resultsDirectory, phaseObserver, null, SbxAsync);
+
+    // Only a trusted order host may call this after a fresh journal ack,
+    // current authorization and budget admission. Never call during replay.
+    // The caller supplies an existing private, exclusively controlled
+    // results root and a reviewed immutable source snapshot.
+    internal static Task<int> RunReservedAsync(string repo, string source, string resultsDirectory,
+        OrderOperationReservation reservation, Action<string, string, long, int>? phaseObserver = null) =>
+        RunCoreAsync(repo, source, "Demo.csproj", "run", resultsDirectory, phaseObserver, reservation, SbxAsync);
+
+    private static async Task<int> RunCoreAsync(
+        string repo, string source, string project, string mode, string resultsDirectory,
+        Action<string, string, long, int>? phaseObserver, OrderOperationReservation? reservation,
+        Func<TimeSpan, string[], Task<SandboxProcess>> transport)
     {
+        Task<SandboxProcess> InvokeAsync(TimeSpan limit, params string[] arguments) => transport(limit, arguments);
         ValidateMode(mode);
         ValidateProjectPath(project);
         if (!Path.IsPathFullyQualified(source) || !Path.IsPathFullyQualified(resultsDirectory))
@@ -72,16 +87,20 @@ internal static class DevelopmentSandboxRunner
             throw new InvalidOperationException("Snapshot source directory does not exist.");
 
         string[] sourceFiles = InspectSnapshot(source, project);
-        string id = Guid.NewGuid().ToString("N");
-        string sandbox = "hami-code-" + id[..12];
+        string id = reservation is null ? Guid.NewGuid().ToString("N")
+            : DevelopmentOrderGuestReconciliation.RunId(reservation);
+        string sandbox = RecoverySandboxName(id);
         string stage = Path.Combine(resultsDirectory, "staging", "hami-code-" + id);
         string reportDir = Path.Combine(resultsDirectory, "reports", "hami-code-" + id);
         string guest = "/home/agent/workspace/hami-code-" + id;
         string guestProject = project.Replace('\\', '/');
+        if (reservation is not null)
+            ReserveDispatchSlot(resultsDirectory, id, stage, reportDir);
         Directory.CreateDirectory(stage);
         Directory.CreateDirectory(reportDir);
 
         bool createAttempted = false;
+        bool createConfirmed = false;
         bool sandboxRemovalSucceeded = false;
         bool timedOut = false;
         int restore = -1, build = -1, execution = -1;
@@ -115,8 +134,16 @@ internal static class DevelopmentSandboxRunner
 
             Stopwatch watch = Stopwatch.StartNew();
             ProgressMessage($"Erstelle MicroVM {sandbox} aus {Template} (4 vCPU, 4 GiB) ...");
+            if (reservation is not null)
+            {
+                // Exact read-only absence check immediately before create.
+                // Existing name or ambiguous inspect is not ours to remove.
+                SandboxProcess existing = await InvokeAsync(TimeSpan.FromSeconds(30), "inspect", sandbox);
+                if (!IsConfirmedAbsent(id, existing.ExitCode, existing.Output, existing.Error))
+                    throw new InvalidOperationException("Reserved sandbox name absence not confirmed.");
+            }
             createAttempted = true;
-            EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(90),
+            EnsureSuccess(await InvokeAsync(TimeSpan.FromSeconds(90),
                 "create", "--name", sandbox, "--template", Template,
                 "--pull", "never", "--cpus", "4", "--memory", "4g",
                 "--skills", "off", "--static-mcp", "none",
@@ -126,29 +153,30 @@ internal static class DevelopmentSandboxRunner
                 "--env", "AZURE_CLIENT_SECRET=",
                 "--env", "AWS_SECRET_ACCESS_KEY=", "--env", "SSH_AUTH_SOCK=",
                 "shell"), "Create sandbox");
+            createConfirmed = true;
             createMs = watch.ElapsedMilliseconds;
             ProgressMessage($"MicroVM bereit ({createMs / 1000.0:F2} s).", "MICROVM_READY");
 
             ProgressMessage("Prüfe Isolation: Mounts, Secrets, MCP, Ports, Netzwerk ...");
-            SandboxProcess inspect = await SbxAsync(TimeSpan.FromSeconds(30),
+            SandboxProcess inspect = await InvokeAsync(TimeSpan.FromSeconds(30),
                 "inspect", sandbox);
             ValidateInspect(inspect, sandbox);
             // No guest network approvals, no source/package retrieval from network.
             foreach (string endpoint in new[] { "api.github.com:443", "1.1.1.1:443", "10.0.0.1:443" })
             {
-                SandboxProcess policy = await SbxAsync(TimeSpan.FromSeconds(20),
+                SandboxProcess policy = await InvokeAsync(TimeSpan.FromSeconds(20),
                     "policy", "check", "network", "--sandbox", sandbox, endpoint);
                 ValidateDeny(policy, endpoint);
             }
 
             ProgressMessage("Prüfe Gast-Umgebung auf nichtleere Credential-Variablen ...");
-            SandboxProcess credentialCheck = await SbxAsync(TimeSpan.FromSeconds(20),
+            SandboxProcess credentialCheck = await InvokeAsync(TimeSpan.FromSeconds(20),
                 "exec", sandbox, "/bin/sh", "-c", GuestEnvCheckScript);
             ValidateGuestCredentialPreflight(credentialCheck);
             ProgressMessage("Gast-Umgebung bestätigt: keine nichtleeren Credential-Variablen.");
             ProgressMessage("Isolation bestätigt: kein Host-Mount, keine Secrets, Netzwerk gesperrt.", "ISOLATION_VERIFIED");
             ProgressMessage("Prüfe .NET SDK 11.0.100 im Gast ...");
-            SandboxProcess sdk = await SbxAsync(TimeSpan.FromSeconds(40),
+            SandboxProcess sdk = await InvokeAsync(TimeSpan.FromSeconds(40),
                 "exec", sandbox, "/home/agent/bin/dotnet", "--version");
             if (sdk.ExitCode != 0
                 || !sdk.Output.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
@@ -158,9 +186,9 @@ internal static class DevelopmentSandboxRunner
 
             ProgressMessage($"Übertrage {sourceFiles.Length} Snapshot-Dateien in die MicroVM ...");
             watch.Restart();
-            EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(75),
+            EnsureSuccess(await InvokeAsync(TimeSpan.FromSeconds(75),
                 "cp", stage, sandbox + ":/home/agent/workspace/"), "Transfer snapshot");
-            EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(35),
+            EnsureSuccess(await InvokeAsync(TimeSpan.FromSeconds(35),
                 "exec", "--user", "root", sandbox, "chown", "-R", "agent:agent", guest),
                 "Set guest snapshot owner");
             copyMs = watch.ElapsedMilliseconds;
@@ -168,13 +196,13 @@ internal static class DevelopmentSandboxRunner
 
             // No shell interpolation: the project name is a validated relative
             // path and each component of the dotnet command is a fixed argv item.
-            EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(20),
+            EnsureSuccess(await InvokeAsync(TimeSpan.FromSeconds(20),
                 "exec", sandbox, "mkdir", "-p", "/home/agent/empty-nuget-source"),
                 "Prepare offline NuGet source");
 
             ProgressMessage("Offline-Restore gestartet ...");
             watch.Restart();
-            SandboxProcess restored = await SbxAsync(TimeSpan.FromSeconds(75),
+            SandboxProcess restored = await InvokeAsync(TimeSpan.FromSeconds(75),
                 "exec", "--workdir", guest, sandbox, "/home/agent/bin/dotnet",
                 "restore", guestProject, "--source", "/home/agent/empty-nuget-source",
                 "-p:NuGetAudit=false", "--nologo");
@@ -187,7 +215,7 @@ internal static class DevelopmentSandboxRunner
             {
                 ProgressMessage("Release-Build gestartet ...");
                 watch.Restart();
-                SandboxProcess built = await SbxAsync(TimeSpan.FromSeconds(120),
+                SandboxProcess built = await InvokeAsync(TimeSpan.FromSeconds(120),
                     "exec", "--workdir", guest, sandbox, "/home/agent/bin/dotnet",
                     "build", guestProject, "-c", "Release", "--no-restore", "--nologo");
                 buildMs = watch.ElapsedMilliseconds;
@@ -208,7 +236,7 @@ internal static class DevelopmentSandboxRunner
                 SandboxProcess checkedCode;
                 try
                 {
-                    checkedCode = await SbxAsync(TimeSpan.FromSeconds(60),
+                    checkedCode = await InvokeAsync(TimeSpan.FromSeconds(60),
                         ["exec", "--workdir", guest, sandbox, "/home/agent/bin/dotnet", .. arguments]);
                 }
                 finally
@@ -236,11 +264,14 @@ internal static class DevelopmentSandboxRunner
         {
             ProgressMessage($"Bereinige MicroVM {sandbox} und lokale Staging-Dateien ...");
             Stopwatch cleanup = Stopwatch.StartNew();
-            if (createAttempted)
+            // V1 preserves its existing cleanup behavior. For an order,
+            // an ambiguous create may refer to a competing name: leave it
+            // pending for reconciliation instead of deleting by name.
+            if (reservation is null ? createAttempted : createConfirmed)
             {
                 try
                 {
-                    EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(90),
+                    EnsureSuccess(await InvokeAsync(TimeSpan.FromSeconds(90),
                         "rm", "--force", sandbox), "Remove ephemeral sandbox");
                     sandboxRemovalSucceeded = true;
                 }
@@ -278,6 +309,44 @@ internal static class DevelopmentSandboxRunner
         }
         return error is null && sandboxRemovalSucceeded && restore == 0 && build == 0
             && (mode == "build" || execution == 0) ? 0 : 1;
+    }
+
+    private static bool EntryExists(string path)
+    {
+        try
+        {
+            _ = File.GetAttributes(path);
+            return true;
+        }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
+    }
+
+    private static void ReserveDispatchSlot(string resultsDirectory, string id, string stage, string reportDir)
+    {
+        if (!Directory.Exists(resultsDirectory))
+            throw new InvalidOperationException("Reserved sandbox requires an existing private results root.");
+        CheckNoReparseAncestors(resultsDirectory);
+        foreach (string path in new[] { stage, reportDir })
+        {
+            string parent = Path.GetDirectoryName(path)!;
+            if (EntryExists(parent))
+            {
+                if (!Directory.Exists(parent))
+                    throw new InvalidOperationException("Reserved sandbox output parent is not a directory.");
+                CheckNoReparseAncestors(parent);
+            }
+            if (EntryExists(path))
+                throw new InvalidOperationException("Reserved sandbox output already exists.");
+        }
+
+        // Persistent one-shot guard for this trusted results root and short
+        // name. Not a workflow journal or proof of global name ownership.
+        // Never remove/reuse the slot after a fault or successful run.
+        string slot = Path.Combine(resultsDirectory, "." + RecoverySandboxName(id) + ".dispatch");
+        using var stream = new FileStream(slot, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        stream.Write(Encoding.UTF8.GetBytes(id));
+        stream.Flush(flushToDisk: true);
     }
 
     private static void Progress(Stopwatch elapsed, string message)
@@ -655,6 +724,112 @@ internal static class DevelopmentSandboxRunner
             "api.github.com:443"));
         ExpectRejected(() => ValidateDeny(new SandboxProcess(1, "Allowed: api.github.com:443", ""),
             "api.github.com:443"));
+        ReservedRunnerSelfTestAsync().GetAwaiter().GetResult();
+    }
+
+    private static async Task ReservedRunnerSelfTestAsync()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "hami-reserved-runner-" + Guid.NewGuid().ToString("N"));
+        string repo = Path.Combine(root, "repo");
+        string source = Path.Combine(root, "source");
+        Directory.CreateDirectory(repo);
+        Directory.CreateDirectory(source);
+        try
+        {
+            File.WriteAllText(Path.Combine(source, "Demo.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"/>");
+            File.WriteAllText(Path.Combine(source, "Program.cs"), "Console.WriteLine(42);");
+            long now = DateTime.UtcNow.Ticks;
+            var reservation = new OrderOperationReservation(3, new string('a', 32) + ":1",
+                "S01", "guest", 30, now, null);
+            string id = DevelopmentOrderGuestReconciliation.RunId(reservation);
+            string name = RecoverySandboxName(id);
+            string absent = "error: sandbox '" + name + "' not found";
+            string healthy = string.Join('\n', new[]
+            {
+                "Name: " + name, "Agent: shell", "Workspace: -", "Clone source: -",
+                "Configured host mounts: none", "Secrets: none", "MCP mode: static",
+                "MCP servers: none", "Ports: none published", "Network policy: global (local policy)",
+                "Auth mode: not configured", "State: running"
+            });
+
+            foreach (string scenario in new[] { "existing", "backend", "ambiguous-create", "success" })
+            {
+                string results = Path.Combine(root, scenario);
+                Directory.CreateDirectory(results);
+                var calls = new List<string[]>();
+                Task<SandboxProcess> FakeTransport(TimeSpan _, string[] args)
+                {
+                    calls.Add(args);
+                    SandboxProcess response = new(0, "", "");
+                    switch (args[0])
+                    {
+                        case "inspect":
+                            response = calls.Count == 1
+                                ? scenario == "existing" ? new(0, healthy, "")
+                                    : scenario == "backend" ? new(1, "", "backend unavailable")
+                                    : new(1, "", absent)
+                                : new(0, healthy, "");
+                            break;
+                        case "create":
+                            if (scenario == "ambiguous-create")
+                                response = new(1, "", "unconfirmed create");
+                            break;
+                        case "policy":
+                            response = new(1, "Denied: " + args[^1] + " default deny", "");
+                            break;
+                        case "exec":
+                            if (args.Contains(GuestEnvCheckScript, StringComparer.Ordinal))
+                                response = new(0, "CREDENTIAL_ENV=clean", "");
+                            else if (args.Contains("--version", StringComparer.Ordinal))
+                                response = new(0, "11.0.100", "");
+                            break;
+                    }
+                    return Task.FromResult(response);
+                }
+
+                int exit = await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
+                    (_, _, _, _) => { }, reservation, FakeTransport);
+                bool success = scenario == "success";
+                int creates = calls.Count(a => a[0] == "create");
+                int removes = calls.Count(a => a[0] == "rm");
+                if ((exit == 0) != success || creates != (scenario is "success" or "ambiguous-create" ? 1 : 0)
+                    || removes != (success ? 1 : 0)
+                    || calls[0][0] != "inspect" || calls[0][1] != name
+                    || calls.Any(a => a[0] == "create" && a[2] != name)
+                    || calls.Any(a => a[0] == "rm" && a[^1] != name))
+                    throw new InvalidOperationException("Reserved runner dispatch/cleanup differed.");
+
+                string reportPath = Path.Combine(results, "reports", "hami-code-" + id, "report.json");
+                byte[] bytes = File.ReadAllBytes(reportPath);
+                var report = JsonSerializer.Deserialize<SandboxRunReport>(bytes, new JsonSerializerOptions(JsonSerializerDefaults.Web))
+                    ?? throw new InvalidOperationException("Reserved runner report missing.");
+                if (report.RunId != id || report.SandboxRemovalSucceeded != success)
+                    throw new InvalidOperationException("Reserved report identity or cleanup differs.");
+                var observed = DevelopmentOrderGuestReconciliation.Observe(new string('A', 64),
+                    reservation, bytes, 1, "", absent, DateTime.UtcNow.Ticks);
+                if ((observed is not null) != success)
+                    throw new InvalidOperationException("Reserved report reconciliation differs.");
+
+                // Remove test report/staging to exercise the durable one-shot
+                // slot itself; never a repair action in the real path.
+                Directory.Delete(Path.GetDirectoryName(reportPath)!, recursive: true);
+                int before = calls.Count;
+                bool rejected = false;
+                try
+                {
+                    _ = await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
+                        (_, _, _, _) => { }, reservation, FakeTransport);
+                }
+                catch (IOException) { rejected = true; }
+                if (!rejected || calls.Count != before)
+                    throw new InvalidOperationException("Reserved run was dispatched twice.");
+            }
+            Console.WriteLine("PASS: reserved sandbox runner uses pre-bound identity, rejects collisions and ambiguous create, retains one-shot slot.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
     }
 
     private static void ExpectRejected(Action action)

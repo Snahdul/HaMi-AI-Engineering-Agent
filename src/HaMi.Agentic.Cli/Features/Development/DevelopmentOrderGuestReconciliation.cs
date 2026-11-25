@@ -32,8 +32,8 @@ internal static class DevelopmentOrderGuestReconciliation
     // Existing runner uses a 32-character lowercase run ID and the first
     // 12 characters as sandbox name. Derive it BEFORE dispatch from the
     // immutable reserved operation, never from an untrusted report/path.
-    // A future runner must consume this ID and reject any existing name
-    // before create. No change to the live runner in this increment.
+    // The reserved runner entry consumes this ID, checks name absence
+    // and never retries a previously consumed local dispatch slot.
     internal static string RunId(OrderOperationReservation reservation)
     {
         OrderCheck.Require(reservation.Version == 3 && reservation.Kind == "guest"
