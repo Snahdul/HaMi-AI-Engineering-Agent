@@ -139,6 +139,7 @@ internal static class PersistenceBridgeProbe
 
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
+        Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -181,6 +182,10 @@ internal static class PersistenceBridgeProbe
     {
         DevelopmentOrderClaim claim = owner.CurrentOrder
             ?? throw new InvalidOperationException("Order claim missing.");
+        DevelopmentOrderArchive archive = owner.RequireArchivedOrder();
+        var order = DevelopmentOrder.ParseIssueBody(Encoding.UTF8.GetBytes(
+            "\x60\x60\x60hami-order-json\n" + archive.Plan + "\x60\x60\x60\n"));
+        OrderOperationLimits limits = OrderOperationLimits.From(order);
         bool first = mode is "bridge-hold" or "bridge-unknown";
         string database = first ? owner.CreateOrderJournal() : owner.RequireOrderJournal();
 
@@ -226,20 +231,21 @@ internal static class PersistenceBridgeProbe
         try
         {
             var system = host.Services.GetRequiredService<ActorSystem>();
-            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim.PersistenceId, claim.ArchiveHash)), "bridge");
+            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, limits)), "bridge");
             async Task<BridgeState> ReadAsync()
             {
                 Task<BridgeState> read = actor.Ask<BridgeState>(new ReadState(), Deadline);
                 await guard.AwaitAsync(read);
                 return await read;
             }
-            async Task AdvanceAsync(string evt, int stage)
+            async Task<BridgeState> AdvanceAsync(string evt, int stage)
             {
                 Task<BridgeState> pending = actor.Ask<BridgeState>(new Advance(evt), Deadline);
                 await guard.AwaitAsync(pending);
                 BridgeState state = await pending;
                 if (state.Stage != stage)
                     throw new InvalidOperationException("Persisted transition was not acknowledged.");
+                return state;
             }
 
             Console.WriteLine("BRIDGE_PHASE: host started; awaiting replay.");
@@ -252,9 +258,13 @@ internal static class PersistenceBridgeProbe
             {
                 if (current.Stage != 0 || File.Exists(artifact))
                     throw new InvalidOperationException("New journal is not empty.");
-                await AdvanceAsync("order-accepted:" + claim.ArchiveHash, 1);
+                current = await AdvanceAsync("order-accepted:" + claim.ArchiveHash, 1);
                 Console.WriteLine("BRIDGE_PHASE: order accepted.");
-                await AdvanceAsync("s01-operation-reserved", 2);
+                var reserved = current.Ledger.Propose(claim.JobId, "S01", "model", 30);
+                current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(reserved), 2);
+                if (current.Ledger.Pending != reserved || current.Ledger.Models != 1
+                    || current.Ledger.ReservedSeconds != 30)
+                    throw new InvalidOperationException("Reservation acknowledgement differs.");
                 Console.WriteLine("BRIDGE_PHASE: operation reserved.");
                 if (mode == "bridge-unknown")
                 {
@@ -263,7 +273,8 @@ internal static class PersistenceBridgeProbe
                 else
                 {
                     string hash = owner.StoreOrderArtifact("S01", AcceptedBytes);
-                    await AdvanceAsync("s01-accepted:" + hash, 3);
+                    await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(
+                        new(1, reserved.OperationId, hash)), 3);
                     Console.WriteLine("BRIDGE_PHASE: S01 persisted; opening rollback transaction.");
                     // Hold an actual native rollback transaction across process kill.
                     // This table is a test fixture; Akka event rows are untouched.
@@ -292,22 +303,38 @@ internal static class PersistenceBridgeProbe
 
             if (mode == "bridge-blocked")
             {
-                if (current.Stage != 2 || current.ArtifactHash is not null || File.Exists(artifact))
+                if (current.Stage != 2 || current.ArtifactHash is not null || File.Exists(artifact)
+                    || current.Ledger.Pending != new DevelopmentOrderOperationLedger().Propose(claim.JobId, "S01", "model", 30)
+                    || current.Ledger.Models != 1 || current.Ledger.Guests != 0
+                    || current.Ledger.ReservedSeconds != 30)
                     throw new InvalidOperationException("Unknown operation did not recover as reserved.");
                 // Do not retry or release the reservation: outcome is unknown.
+                Reject(() => current.Ledger.Reserve(claim.JobId, limits,
+                    current.Ledger.Propose(claim.JobId, "S01", "model", 30)));
                 Console.WriteLine("BRIDGE_BLOCKED");
                 return 0;
             }
 
-            if (mode != "bridge-resume" || current.Stage != 3 || current.ArtifactHash != AcceptedHash)
+            if (mode != "bridge-resume" || current.Stage != 3 || current.ArtifactHash != AcceptedHash
+                || current.Ledger.Pending is not null || current.Ledger.Sequence != 1
+                || current.Ledger.Models != 1 || current.Ledger.Guests != 0
+                || current.Ledger.ReservedSeconds != 30)
                 throw new InvalidOperationException("Accepted step not recovered.");
             byte[] input = owner.RequireOrderArtifact("S01", AcceptedHash);
 
             // Reusing S01 is not a second write to its exclusive effect file.
-            await AdvanceAsync("s02-operation-reserved", 4);
+            var next = current.Ledger.Propose(claim.JobId, "S02", "model", 30);
+            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(next), 4);
+            if (current.Ledger.Pending != next || current.Ledger.Models != 2
+                || current.Ledger.ReservedSeconds != 60)
+                throw new InvalidOperationException("S02 reservation acknowledgement differs.");
             string outputHash = owner.StoreOrderArtifact("S02", input);
             _ = owner.RequireOrderArtifact("S02", outputHash);
-            await AdvanceAsync("s02-accepted", 5);
+            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(
+                new(1, next.OperationId, outputHash)), 5);
+            if (current.Ledger.Pending is not null || current.Ledger.Models != 2
+                || current.Ledger.ReservedSeconds != 60)
+                throw new InvalidOperationException("S02 completion refunded budget.");
             guard.RequireObserved();
             Console.WriteLine("BRIDGE_COMPLETED");
             return 0;
@@ -465,20 +492,22 @@ internal static class PersistenceBridgeProbe
 
     private sealed record ReadState;
     private sealed record Advance(string Event);
-    private sealed record BridgeState(int Stage, string? ArtifactHash);
+    private sealed record BridgeState(int Stage, string? ArtifactHash, DevelopmentOrderOperationLedger Ledger);
 
     private sealed class BridgeActor : ReceivePersistentActor
     {
-        private BridgeState state = new(0, null);
+        private BridgeState state = new(0, null, new());
         private bool recovered;
-        private readonly string archiveHash;
+        private readonly DevelopmentOrderClaim claim;
+        private readonly OrderOperationLimits limits;
 
         public override string PersistenceId { get; }
 
-        public BridgeActor(string id, string archiveHash)
+        public BridgeActor(DevelopmentOrderClaim claim, OrderOperationLimits limits)
         {
-            PersistenceId = id;
-            this.archiveHash = archiveHash;
+            PersistenceId = claim.PersistenceId;
+            this.claim = claim;
+            this.limits = limits;
             // Recovery only folds acknowledged journal events; no effects.
             Recover<string>(evt => state = Next(state, evt));
             Recover<RecoveryCompleted>(_ => recovered = true);
@@ -498,15 +527,34 @@ internal static class PersistenceBridgeProbe
             });
         }
 
-        private BridgeState Next(BridgeState previous, string evt) =>
-            (previous.Stage, evt) switch
+        private BridgeState Next(BridgeState previous, string evt)
+        {
+            if (previous.Stage == 0 && evt == "order-accepted:" + claim.ArchiveHash)
+                return previous with { Stage = 1 };
+            if (previous.Stage is 1 or 3)
             {
-                (0, _) when evt == "order-accepted:" + archiveHash => new(1, null),
-                (1, "s01-operation-reserved") => new(2, null),
-                (2, _) when evt == "s01-accepted:" + AcceptedHash => new(3, AcceptedHash),
-                (3, "s02-operation-reserved") => previous with { Stage = 4 },
-                (4, "s02-accepted") => previous with { Stage = 5 },
-                _ => throw new InvalidOperationException("Bridge transition rejected.")
-            };
+                var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
+                if (reservation.Step != (previous.Stage == 1 ? "S01" : "S02") || reservation.Kind != "model")
+                    throw new InvalidOperationException("Unexpected synthetic step operation.");
+                return previous with
+                {
+                    Stage = previous.Stage + 1,
+                    Ledger = previous.Ledger.Reserve(claim.JobId, limits, reservation)
+                };
+            }
+            if (previous.Stage is 2 or 4)
+            {
+                var completion = DevelopmentOrderOperationLedger.DecodeCompletion(evt);
+                if (completion.EvidenceHash != AcceptedHash)
+                    throw new InvalidOperationException("Synthetic evidence mismatch.");
+                return previous with
+                {
+                    Stage = previous.Stage + 1,
+                    ArtifactHash = completion.EvidenceHash,
+                    Ledger = previous.Ledger.Complete(completion)
+                };
+            }
+            throw new InvalidOperationException("Bridge transition rejected.");
+        }
     }
 }
