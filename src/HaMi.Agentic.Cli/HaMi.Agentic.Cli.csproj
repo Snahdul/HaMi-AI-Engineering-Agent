@@ -13,9 +13,6 @@
     <InternalsVisibleTo Include="HaMi.Agentic.JobState.Probe" />
   </ItemGroup>
   <ItemGroup>
-    <!-- Consume the runtime validator, not its optional repository-wide optimization analyzers. -->
-    <PackageReference Include="Corvus.Text.Json" Version="5.8.12" ExcludeAssets="analyzers" />
-    <PackageReference Include="Corvus.Text.Json.Validator" Version="5.8.12" ExcludeAssets="analyzers" />
     <PackageReference Include="YamlDotNet" Version="18.1.0" />
     <PackageReference Include="System.CommandLine" Version="3.0.0" />
     <PackageReference Include="Akka.Hosting" Version="1.5.74" />
@@ -30,11 +27,4 @@
     <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
     <PackageReference Include="Serilog.Formatting.Compact" Version="3.0.0" />
   </ItemGroup>
-  <!-- The packaged Corvus optimization analyzer is not a Developer quality policy.
-       Keep all SDK and other project analyzers enabled. -->
-  <Target Name="ExcludeCorvusOptimizationAnalyzer" AfterTargets="ResolvePackageAssets" BeforeTargets="CoreCompile">
-    <ItemGroup>
-      <Analyzer Remove="@(Analyzer)" Condition="'%(Analyzer.Filename)' == 'Corvus.Text.Json.Analyzers'" />
-    </ItemGroup>
-  </Target>
 </Project>

@@ -1,4 +1,3 @@
-using Corvus.Text.Json.Validator;
 using System.Text;
 using System.Text.Json;
 
@@ -13,7 +12,7 @@ internal sealed class DevelopmentOrder
     private const string Fence = "```hami-order-json";
     private const string SchemaResource = "HaMi.DevelopmentOrder.Schema";
     private static readonly UTF8Encoding Utf8 = new(false, true);
-    private static readonly Lazy<JsonSchema> Schema = new(LoadSchema);
+    private static readonly Lazy<DevelopmentOrderSchema> Schema = new(LoadSchema);
 
     private DevelopmentOrder(string plan, JsonElement document)
     {
@@ -51,12 +50,12 @@ internal sealed class DevelopmentOrder
 
         using JsonDocument json = JsonDocument.Parse(plan, new JsonDocumentOptions { MaxDepth = 16 });
         ValidateJson(json.RootElement);
-        Require(Schema.Value.Validate(plan), "ORDER_SCHEMA");
+        Require(Schema.Value.Validate(json.RootElement), "ORDER_SCHEMA");
         ValidateProfile(json.RootElement);
         return new DevelopmentOrder(plan, json.RootElement.Clone());
     }
 
-    private static JsonSchema LoadSchema()
+    private static DevelopmentOrderSchema LoadSchema()
     {
         // The schema is compiled into the reviewed host assembly, never
         // selected by an issue or fetched from a caller-controlled URL.
@@ -64,29 +63,7 @@ internal sealed class DevelopmentOrder
             ?? throw new InvalidOperationException("ORDER_SCHEMA_MISSING");
         using var reader = new StreamReader(stream, Utf8);
         string schema = reader.ReadToEnd();
-        using JsonDocument document = JsonDocument.Parse(schema);
-        RejectSchemaReferences(document.RootElement);
-        return JsonSchema.FromText(schema);
-    }
-
-    private static void RejectSchemaReferences(JsonElement element)
-    {
-        if (element.ValueKind == JsonValueKind.Object)
-        {
-            foreach (JsonProperty property in element.EnumerateObject())
-            {
-                Require(property.Name is not ("$ref" or "$dynamicRef" or "$recursiveRef" or "$id" or "$vocabulary"),
-                    "ORDER_SCHEMA_EXTERNAL_REFERENCE");
-                if (property.Name == "$schema")
-                    Require(property.Value.GetString() == "https://json-schema.org/draft/2020-12/schema", "ORDER_SCHEMA_DIALECT");
-                RejectSchemaReferences(property.Value);
-            }
-        }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (JsonElement item in element.EnumerateArray())
-                RejectSchemaReferences(item);
-        }
+        return DevelopmentOrderSchema.Parse(schema);
     }
 
     private static void ValidateJson(JsonElement element)
