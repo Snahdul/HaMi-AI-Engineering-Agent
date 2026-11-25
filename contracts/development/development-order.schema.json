@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HaMi Development order v1 (M5b design)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "revision",
+    "repository",
+    "issueNumber",
+    "title",
+    "baseCommit",
+    "goal",
+    "context",
+    "decisions",
+    "contractId",
+    "limits",
+    "steps",
+    "finalVerification"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "repository": {
+      "const": "Snahdul/HaMi-AI-Engineering-Agent"
+    },
+    "issueNumber": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 180
+    },
+    "baseCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1500
+    },
+    "context": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reference",
+          "description"
+        ],
+        "properties": {
+          "reference": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          }
+        }
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "decision",
+          "rationale",
+          "alternatives"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,63}$"
+          },
+          "decision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "rationale": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "alternatives": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            }
+          }
+        }
+      }
+    },
+    "contractId": {
+      "const": "sandbox-pair"
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "modelCalls",
+        "sandboxRuns",
+        "elapsedSeconds"
+      ],
+      "properties": {
+        "modelCalls": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "sandboxRuns": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "elapsedSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1800
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "objective",
+          "dependsOn",
+          "competencies",
+          "inputs",
+          "outputs",
+          "allowedWritePaths",
+          "verifier",
+          "criteria",
+          "maxModelCalls",
+          "maxSandboxRuns"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^S[0-9]{2}$"
+          },
+          "objective": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "dependsOn": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 7,
+            "items": {
+              "type": "string",
+              "pattern": "^S[0-9]{2}$"
+            },
+            "uniqueItems": true
+          },
+          "competencies": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,63}$"
+            },
+            "uniqueItems": true
+          },
+          "inputs": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "source",
+                "id",
+                "stepId"
+              ],
+              "properties": {
+                "source": {
+                  "enum": [
+                    "baseline",
+                    "step"
+                  ]
+                },
+                "id": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,63}$"
+                },
+                "stepId": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^S[0-9]{2}$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            },
+            "uniqueItems": true
+          },
+          "outputs": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,63}$"
+            },
+            "uniqueItems": true
+          },
+          "allowedWritePaths": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240,
+              "pattern": "^[A-Za-z0-9._/-]+\\.cs$"
+            },
+            "uniqueItems": true
+          },
+          "verifier": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,63}$"
+          },
+          "criteria": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "text"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "pattern": "^C[0-9]{2}$"
+                },
+                "text": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500
+                }
+              }
+            }
+          },
+          "maxModelCalls": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2
+          },
+          "maxSandboxRuns": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2
+          }
+        }
+      }
+    },
+    "finalVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verifier",
+        "criteria",
+        "maxSandboxRuns"
+      ],
+      "properties": {
+        "verifier": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,63}$"
+        },
+        "criteria": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "text"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^C[0-9]{2}$"
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500
+              }
+            }
+          }
+        },
+        "maxSandboxRuns": {
+          "const": 1
+        }
+      }
+    }
+  }
+}
