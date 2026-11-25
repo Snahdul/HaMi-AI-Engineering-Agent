@@ -22,11 +22,29 @@ if ($LASTEXITCODE -ne 0) { throw 'Fixture worktree creation failed.' }
 try {
     Push-Location -LiteralPath $worktree
     try {
-        $project = 'src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj'
+        $probeRelative = 'tests/HaMi.Agentic.JobState.Probe/Program.cs'
+        $probe = Join-Path $worktree $probeRelative
         $relative = 'src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs'
         $target = Join-Path $worktree $relative
         $control = Join-Path $worktree 'src/HaMi.Agentic.Cli/Features/Coding/CodingTaskDefinition.cs'
         $controlHash = (Get-FileHash -LiteralPath $control).Hash
+
+        # A test-project-only change must hit the same non-mutating gate.
+        $probeOriginal = [IO.File]::ReadAllText($probe)
+        $probeBad = $probeOriginal.Replace('    private const int Issue = 62;', ' private const int Issue = 62;')
+        if ($probeBad -ceq $probeOriginal) { throw 'Probe regression anchor missing.' }
+        [IO.File]::WriteAllText($probe, $probeBad, [Text.UTF8Encoding]::new($false))
+        $probeBadHash = (Get-FileHash -LiteralPath $probe).Hash
+        $denied = $false
+        try { $null = & ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $base -Mode Check -Restore 2>&1 }
+        catch {
+            if ($_.Exception.Message -notlike 'Microsoft formatter failed for tests/HaMi.Agentic.JobState.Probe/*') { throw }
+            $denied = $true
+        }
+        if (-not $denied -or (Get-FileHash -LiteralPath $probe).Hash -cne $probeBadHash) {
+            throw 'Check did not reject bad test-project formatting without mutation.'
+        }
+        Write-Host 'PASS: test-project-only formatting is covered.'
 
         # Preserve the original failed candidate from CI 45460196255.
         # Manufacturer indentation behavior was investigated and approved
@@ -36,14 +54,12 @@ try {
         if ($bad -ceq $original) { throw 'Original regression anchor missing.' }
         [IO.File]::WriteAllText($target, $bad, [Text.UTF8Encoding]::new($false))
         $badHash = (Get-FileHash -LiteralPath $target).Hash
-        & dotnet restore $project
-        if ($LASTEXITCODE -ne 0) { throw 'Fixture restore failed.' }
 
         # Expected negative check. Capture tool output in this test only so
         # GitHub does not annotate the deliberate WHITESPACE diagnostics as
         # failed production checks. Real failures still propagate.
         $denied = $false
-        try { $null = & ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $base -Mode Check 2>&1 }
+        try { $null = & ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $base -Mode Check -Restore 2>&1 }
         catch {
             if ($_.Exception.Message -notlike 'Microsoft formatter failed for*') { throw }
             $denied = $true
@@ -56,21 +72,26 @@ try {
         # Commit the bad candidate only in this disposable detached worktree.
         # Exercise Apply through the real CI patch helper: it calls the
         # Microsoft formatter and its non-mutating verification exactly once.
-        & git add -- $relative
+        & git add -- $relative $probeRelative
         if ($LASTEXITCODE -ne 0) { throw 'Fixture index setup failed.' }
         & git -c 'user.name=HaMi Formatter Test' -c 'user.email=formatter-test@example.invalid' -c commit.gpgsign=false commit --no-verify -m 'Temporary formatter regression fixture'
         if ($LASTEXITCODE -ne 0) { throw 'Fixture commit failed.' }
         $fixtureHead = (& git rev-parse HEAD).Trim()
         if ($LASTEXITCODE -ne 0 -or $fixtureHead -ceq $base) { throw 'Fixture commit identity missing.' }
         $beforePatch = (Get-FileHash -LiteralPath $target).Hash
+        $worktreesBefore = (@(& git worktree list --porcelain) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw 'Fixture worktree inventory failed.' }
         $patchOutput = @(& ./scripts/quality/Show-HaMiFormatPatch.ps1 -Base $base)
         $start = [Array]::IndexOf($patchOutput, "FORMAT PATCH FOR HEAD $fixtureHead")
         $end = [Array]::IndexOf($patchOutput, 'END FORMAT PATCH')
         if ($start -lt 0 -or $end -le ($start + 1)) {
             throw 'Expected head-correlated formatter correction patch missing.'
         }
+        $worktreesAfter = (@(& git worktree list --porcelain) -join "`n")
+        if ($LASTEXITCODE -ne 0 -or $worktreesAfter -cne $worktreesBefore) { throw 'Patch worktree cleanup failed.' }
         $status = @(& git status --porcelain=v1 --untracked-files=all)
         if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0 -or
+            (Get-FileHash -LiteralPath $probe).Hash -cne $probeBadHash -or
             (Get-FileHash -LiteralPath $target).Hash -cne $beforePatch -or
             (Get-FileHash -LiteralPath $control).Hash -cne $controlHash -or
             (& git rev-parse HEAD).Trim() -cne $fixtureHead) {
@@ -90,7 +111,9 @@ try {
             if (Test-Path -LiteralPath $patchFile) { Remove-Item -LiteralPath $patchFile }
         }
         $status = @(& git status --porcelain=v1 --untracked-files=all)
-        if ($LASTEXITCODE -ne 0 -or $status.Count -ne 1 -or $status[0] -cne " M $relative" -or
+        if ($LASTEXITCODE -ne 0 -or $status.Count -ne 2 -or
+            $status -cnotcontains " M $relative" -or $status -cnotcontains " M $probeRelative" -or
+            (Get-FileHash -LiteralPath $probe).Hash -ceq $probeBadHash -or
             (Get-FileHash -LiteralPath $target).Hash -ceq $beforePatch -or
             (Get-FileHash -LiteralPath $control).Hash -cne $controlHash -or
             (& git rev-parse HEAD).Trim() -cne $fixtureHead) {

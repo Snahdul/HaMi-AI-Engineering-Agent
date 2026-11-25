@@ -16,6 +16,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Install .NET SDK from global.json
         uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
@@ -28,26 +29,13 @@ jobs:
       - name: Build
         run: dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-restore
 
-      - name: Verify changed production C# formatting and analyzers
+      - name: Verify changed C# formatting and analyzers (production and tests)
         id: format-check
         if: github.event_name == 'pull_request'
-        shell: bash
+        shell: pwsh
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          mapfile -d '' -t sources < <(
-            git diff --name-only -z --diff-filter=ACMR "$BASE_SHA" HEAD -- ':(glob)src/HaMi.Agentic.Cli/**/*.cs'
-          )
-          if (( ${#sources[@]} == 0 )); then
-            # Exercise the gate on a stable production file even when the PR
-            # only changes configuration/documentation.
-            sources=(src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs)
-          fi
-          printf 'Checking %s\n' "${sources[@]}"
-          dotnet format whitespace src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --no-restore --verify-no-changes --include "${sources[@]}"
-          dotnet format analyzers src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --no-restore --verify-no-changes --severity warn --include "${sources[@]}"
+        run: ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $env:BASE_SHA -Mode Check -Restore -SmokeIfEmpty
 
       - name: Generate formatting correction patch on failure (read-only CI)
         if: failure() && steps.format-check.outcome == 'failure'
@@ -209,6 +197,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Install .NET SDK from global.json
         uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
@@ -247,6 +236,21 @@ jobs:
 
       - name: Release build with warnings as errors
         run: dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-restore
+
+      - name: Verify changed C# formatting and analyzers (production and tests)
+        id: format-check
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $env:BASE_SHA -Mode Check -Restore -SmokeIfEmpty
+
+      - name: Generate formatting correction patch on failure (read-only CI)
+        if: failure() && steps.format-check.outcome == 'failure'
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: ./scripts/quality/Show-HaMiFormatPatch.ps1 -Base $env:BASE_SHA
 
       - name: Test HaMi formatter integration and source scope
         shell: pwsh
