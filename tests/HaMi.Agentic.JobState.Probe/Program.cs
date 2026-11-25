@@ -36,7 +36,7 @@ internal static class Program
             return 0;
         }
 
-        if (args.Length == 2 && args[0] is "hold" or "probe")
+        if (args.Length == 2 && args[0] is "hold" or "probe" or "bridge-hold" or "bridge-unknown" or "bridge-resume" or "bridge-blocked")
         {
             string root = args[1];
             string name = Path.GetFileName(root);
@@ -45,6 +45,18 @@ internal static class Program
                 || Path.Combine(Path.GetTempPath(), name) != root)
                 throw new InvalidOperationException("Probe root rejected.");
             var store = new DevelopmentJobStateStore(root);
+            if (args[0].StartsWith("bridge-", StringComparison.Ordinal))
+            {
+                using var owner = store.Acquire(Issue);
+                if (args[0] is "bridge-hold" or "bridge-unknown")
+                    owner.Claim(Initial(root));
+                else if (owner.RequireCurrent() != Initial(root))
+                    throw new InvalidOperationException("Original fixture claim changed.");
+                // The V1 Accepted claim is only an ownership sentinel in this
+                // disposable fixture. All workflow transitions live in the journal.
+                return await PersistenceBridgeProbe.RunChildAsync(args[0], root, owner.RequireCurrent().Identity.JobId);
+            }
+
             if (args[0] == "probe")
             {
                 DevelopmentJobStateStore.Lease owner;
@@ -108,6 +120,7 @@ internal static class Program
             }
             await ExpectProbeAsync(fixture, "ACQUIRED:recovery-blocked");
             Console.WriteLine("PASS: cross-process exclusive ownership and abrupt termination retain claim.");
+            await PersistenceBridgeProbe.RunAsync(Prefix, Start, ExpectProbeAsync);
             return 0;
         }
         finally

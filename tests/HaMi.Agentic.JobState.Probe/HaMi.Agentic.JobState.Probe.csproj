@@ -8,5 +8,9 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj" />
+    <PackageReference Include="Akka.Persistence" Version="1.5.74" />
+    <PackageReference Include="Akka.Persistence.Hosting" Version="1.5.74" />
+    <PackageReference Include="Akka.Persistence.Sql.Hosting" Version="1.5.73" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0" />
   </ItemGroup>
 </Project>
