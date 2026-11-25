@@ -1,3 +1,4 @@
+using System.Data;
 using System.Data.Common;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
@@ -10,6 +11,7 @@ using Akka.Persistence;
 using Akka.Persistence.Sql.Hosting;
 using HaMi.Agentic.Cli.Features.Development;
 using LinqToDB;
+using LinqToDB.Common;
 using LinqToDB.Interceptors;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
@@ -209,21 +211,28 @@ internal static class PersistenceBridgeProbe
         var guard = new ProviderConnectionGuard();
         var options = new DataOptions()
             .UseConnectionString(ProviderName.SQLiteMS, connection)
-            .UseAfterConnectionOpened(guard.Configure)
+            .UseInterceptor(new ProviderOpenInterceptor(guard))
             .UseInterceptor(guard);
         using IHost host = new HostBuilder()
             .ConfigureServices((_, services) => services.AddAkka("hami-persistence-probe", (builder, provider) =>
                 builder.WithSqlPersistence(options)))
             .Build();
-        await host.StartAsync().WaitAsync(Deadline);
+        await guard.AwaitAsync(host.StartAsync());
         try
         {
             var system = host.Services.GetRequiredService<ActorSystem>();
             IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim.PersistenceId, claim.ArchiveHash)), "bridge");
-            async Task<BridgeState> ReadAsync() => await actor.Ask<BridgeState>(new ReadState(), Deadline);
+            async Task<BridgeState> ReadAsync()
+            {
+                Task<BridgeState> read = actor.Ask<BridgeState>(new ReadState(), Deadline);
+                await guard.AwaitAsync(read);
+                return await read;
+            }
             async Task AdvanceAsync(string evt, int stage)
             {
-                BridgeState state = await actor.Ask<BridgeState>(new Advance(evt), Deadline);
+                Task<BridgeState> pending = actor.Ask<BridgeState>(new Advance(evt), Deadline);
+                await guard.AwaitAsync(pending);
+                BridgeState state = await pending;
                 if (state.Stage != stage)
                     throw new InvalidOperationException("Persisted transition was not acknowledged.");
             }
@@ -348,38 +357,104 @@ internal static class PersistenceBridgeProbe
             throw new InvalidOperationException("Journal identity differs from claim.");
     }
 
-    // Registered in DataOptions so the standard provider's replacement
-    // connection clone retains the interceptor. A command on an unconfigured
-    // connection is a failure, not an implicit fallback to SQLite defaults.
+    // LinqToDB 6 creates commands before opening their connection.
+    // Configure at connection-open, then guard the actual execution boundary.
+    // Both interceptors are registered in DataOptions for provider clones.
+    private sealed class ProviderOpenInterceptor(ProviderConnectionGuard guard) : ConnectionInterceptor
+    {
+        public override void ConnectionOpened(ConnectionEventData eventData, DbConnection connection) =>
+            guard.Configure(connection);
+
+        public override Task ConnectionOpenedAsync(ConnectionEventData eventData, DbConnection connection,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            guard.Configure(connection);
+            return Task.CompletedTask;
+        }
+    }
+
     private sealed class ProviderConnectionGuard : CommandInterceptor
     {
         private readonly ConditionalWeakTable<DbConnection, object> configured = new();
+        private readonly TaskCompletionSource<Exception> failure = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int commands;
 
         internal void Configure(DbConnection connection)
         {
-            CheckDurability(connection);
-            _ = configured.GetValue(connection, _ => new object());
-            Console.WriteLine("BRIDGE_GUARD: configured connection " + connection.GetType().FullName);
+            try
+            {
+                CheckDurability(connection);
+                _ = configured.GetValue(connection, _ => new object());
+            }
+            catch (Exception ex)
+            {
+                Fail(ex);
+                throw;
+            }
         }
 
-        public override DbCommand CommandInitialized(CommandEventData eventData, DbCommand command)
+        private void Fail(Exception error)
+        {
+            if (failure.TrySetResult(error))
+                Console.Error.WriteLine("BRIDGE_GUARD: " + error.Message);
+        }
+
+        private void RequireConfigured(DbCommand command)
         {
             if (command.Connection is not DbConnection connection
-                || !configured.TryGetValue(connection, out _))
+                || connection.State != ConnectionState.Open || !configured.TryGetValue(connection, out _))
             {
-                Console.Error.WriteLine("BRIDGE_GUARD: command connection not configured: "
-                    + (command.Connection?.GetType().FullName ?? "null"));
-                throw new InvalidOperationException("Provider used a connection without the durability callback.");
+                var error = new InvalidOperationException("Provider attempted SQL execution without an open, configured connection.");
+                Fail(error);
+                throw error;
             }
             Interlocked.Increment(ref commands);
-            return command;
+        }
+
+        public override Option<int> ExecuteNonQuery(CommandEventData eventData, DbCommand command, Option<int> result)
+        {
+            RequireConfigured(command);
+            return result;
+        }
+
+        public override Task<Option<int>> ExecuteNonQueryAsync(CommandEventData eventData, DbCommand command,
+            Option<int> result, CancellationToken cancellationToken) =>
+            Task.FromResult(ExecuteNonQuery(eventData, command, result));
+
+        public override Option<object?> ExecuteScalar(CommandEventData eventData, DbCommand command, Option<object?> result)
+        {
+            RequireConfigured(command);
+            return result;
+        }
+
+        public override Task<Option<object?>> ExecuteScalarAsync(CommandEventData eventData, DbCommand command,
+            Option<object?> result, CancellationToken cancellationToken) =>
+            Task.FromResult(ExecuteScalar(eventData, command, result));
+
+        public override Option<DbDataReader> ExecuteReader(CommandEventData eventData, DbCommand command,
+            CommandBehavior commandBehavior, Option<DbDataReader> result)
+        {
+            RequireConfigured(command);
+            return result;
+        }
+
+        public override Task<Option<DbDataReader>> ExecuteReaderAsync(CommandEventData eventData, DbCommand command,
+            CommandBehavior commandBehavior, Option<DbDataReader> result, CancellationToken cancellationToken) =>
+            Task.FromResult(ExecuteReader(eventData, command, commandBehavior, result));
+
+        internal async Task AwaitAsync(Task operation)
+        {
+            await Task.WhenAny(operation, failure.Task).WaitAsync(Deadline);
+            if (failure.Task.IsCompletedSuccessfully)
+                throw new InvalidOperationException("Provider durability guard rejected an operation.", await failure.Task);
+            await operation;
         }
 
         internal void RequireObserved()
         {
-            if (Volatile.Read(ref commands) == 0)
-                throw new InvalidOperationException("No guarded actual provider commands observed.");
+            if (failure.Task.IsCompletedSuccessfully || Volatile.Read(ref commands) == 0)
+                throw new InvalidOperationException("No valid guarded actual provider execution observed.");
         }
     }
 
