@@ -2,7 +2,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{40}$')][string]$Base,
-    [ValidateSet('Check', 'Apply')][string]$Mode = 'Check'
+    [ValidateSet('Check', 'Apply')][string]$Mode = 'Check',
+    [switch]$Restore,
+    [switch]$SmokeIfEmpty
 )
 $ErrorActionPreference = 'Stop'
 # Handle native exit codes explicitly, including expected check failures in CI.
@@ -32,7 +34,7 @@ try {
             }
             $result = $output.GetAwaiter().GetResult()
             $null = $errors.GetAwaiter().GetResult()
-            if ($process.ExitCode -ne 0) { throw 'Git metadata query failed.' }
+            if ($process.ExitCode -ne 0) { throw "Git metadata query failed: $($Arguments[0]) (exit $($process.ExitCode))." }
             return $result
         }
         finally { $process.Dispose() }
@@ -74,7 +76,11 @@ try {
     $head = (Invoke-GitText @('rev-parse', 'HEAD')).Trim()
     $branch = (Invoke-GitText @('rev-parse', '--abbrev-ref', 'HEAD')).Trim()
     $null = Invoke-GitText @('cat-file', '-e', "${Base}^{commit}")
+    if ((Invoke-GitText @('rev-parse', '--is-shallow-repository')).Trim() -eq 'true') {
+        throw 'Formatter requires full Git history to verify the approved base (fetch-depth: 0 or git fetch --unshallow).'
+    }
     $null = Invoke-GitText @('merge-base', '--is-ancestor', $Base, $head)
+    if ($SmokeIfEmpty -and $Mode -ne 'Check') { throw 'SmokeIfEmpty requires Check mode.' }
 
     if ($Mode -eq 'Apply') {
         if ($branch -in @('main', 'master')) { throw 'Apply forbidden on protected development checkout.' }
@@ -104,8 +110,13 @@ try {
         }
     }
     if ($scope.Count -eq 0) {
-        Write-Host 'No changed C# files in supported implementation projects.'
-        return
+        if (-not $SmokeIfEmpty) {
+            Write-Host 'No changed C# files in supported implementation projects.'
+            return
+        }
+        $smoke = 'src/HaMi.Agentic.Cli/Features/Coding/RetryBudget.cs'
+        if (-not [IO.File]::Exists((Resolve-SafePath $smoke))) { throw 'Formatter smoke source missing.' }
+        $null = $scope.Add($smoke)
     }
 
     # Fingerprint every tracked/nonignored untracked path, including the
@@ -136,6 +147,11 @@ try {
             if ($files.Count -eq 0) { continue }
             $null = Resolve-SafePath $project
             if (-not [IO.File]::Exists((Join-Path $repo $project))) { throw "Project missing: $project" }
+            if ($Restore) {
+                & dotnet restore $project
+                if ($LASTEXITCODE -ne 0) { throw "Formatter workspace restore failed for $project." }
+            }
+            foreach ($file in $files) { Write-Host "Checking $file" }
             $arguments = @('format', 'whitespace', $project, '--no-restore')
             if ($Mode -eq 'Check') { $arguments += '--verify-no-changes' }
             $arguments += '--include'
@@ -145,6 +161,9 @@ try {
             if ($Mode -eq 'Apply') {
                 & dotnet @arguments --verify-no-changes
                 if ($LASTEXITCODE -ne 0) { throw "Formatter verification failed for $project." }
+            } else {
+                & dotnet format analyzers $project --no-restore --verify-no-changes --severity warn --include @files
+                if ($LASTEXITCODE -ne 0) { throw "Microsoft analyzer check failed for $project (exit $LASTEXITCODE)." }
             }
         }
     }
