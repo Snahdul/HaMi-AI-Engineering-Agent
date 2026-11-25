@@ -207,7 +207,9 @@ internal static class PersistenceBridgeProbe
             }
             using var version = binding.CreateCommand();
             version.CommandText = "SELECT sqlite_version()";
-            Console.WriteLine("SQLite native version: " + version.ExecuteScalar());
+            if (version.ExecuteScalar() is not string nativeVersion || nativeVersion != "3.54.1")
+                throw new InvalidOperationException("Unexpected native SQLite version; reviewed 3.54.1 required.");
+            Console.WriteLine("SQLite native version: " + nativeVersion);
         }
 
         Console.WriteLine("BRIDGE_PHASE: identity validated; initializing provider.");

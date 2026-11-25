@@ -13,5 +13,7 @@
     <PackageReference Include="Akka.Persistence.Hosting" Version="1.5.74" />
     <PackageReference Include="Akka.Persistence.Sql.Hosting" Version="1.5.73" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0" />
+    <!-- Pin the native transitive package to the reviewed security patch. -->
+    <PackageReference Include="SQLite" Version="[3.54.1]" />
   </ItemGroup>
 </Project>
