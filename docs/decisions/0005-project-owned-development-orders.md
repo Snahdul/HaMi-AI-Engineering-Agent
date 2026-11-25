@@ -34,3 +34,5 @@ Keep the existing Developer slice and Akka technical coordinator. MEAI remains t
 - Scheduler-Agent-Supervisor: https://learn.microsoft.com/en-us/azure/architecture/patterns/scheduler-agent-supervisor
 - W3C PROV-DM: https://www.w3.org/TR/prov-dm/
 - JSON Schema: https://json-schema.org/draft/2020-12
+
+S04.2 uses typed synthetic observations rather than an authenticated live Issue reader or durable evidence store. Approval, assignment, artifact byte correlation, independent verifier observations and knowledge review are separate inputs; no new production authority is granted. See the contract design for precise limitations.

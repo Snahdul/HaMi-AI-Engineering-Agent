@@ -1,0 +1,139 @@
+using System.Text;
+
+namespace HaMi.Agentic.Cli.Features.Development;
+
+internal static class DevelopmentOrderHandoverTests
+{
+    internal static void SelfTest(string plan)
+    {
+        byte[] body = Encoding.UTF8.GetBytes("### Approved plan\n\n" + "\x60\x60\x60hami-order-json\n" + plan + "\x60\x60\x60\n");
+        DevelopmentOrder order = DevelopmentOrder.ParseIssueBody(body);
+        DateTimeOffset time = new(2026, 11, 25, 10, 0, 0, TimeSpan.Zero);
+        string hash = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic reviewed profile"));
+        string baseCommit = order.Document.GetProperty("baseCommit").GetString()!;
+        string repository = order.Document.GetProperty("repository").GetString()!;
+        string title = order.Document.GetProperty("title").GetString()!;
+        int number = order.Document.GetProperty("issueNumber").GetInt32();
+        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", baseCommit, hash, hash, hash);
+        var comment = new OrderCommentObservation(1, 42, "fixture-owner",
+            $"HaMi-Order-Approval: v1 1 {order.Sha256} {baseCommit}", time, time);
+        var issue = new OrderIssueObservation(repository, 901, number, title, 42, "fixture-owner",
+            true, true, body, time.AddMinutes(1), true, [comment]);
+
+        DevelopmentOrderApproval Approve(OrderIssueObservation observation) => DevelopmentOrderApproval.Observe(observation, profile);
+        DevelopmentOrderApproval approved = Approve(issue);
+
+        void Reject(Action action, string reason)
+        {
+            try
+            {
+                action();
+            }
+            catch (InvalidOperationException ex) when (ex.Message == reason)
+            {
+                return;
+            }
+
+            throw new InvalidOperationException("Expected rejection: " + reason);
+        }
+
+        Reject(() => Approve(issue with { IsOpen = false }), "ORDER_ISSUE_AUTHORITY");
+        Reject(() => Approve(issue with { IsActive = false }), "ORDER_ISSUE_AUTHORITY");
+        Reject(() => Approve(issue with { AuthorId = 43 }), "ORDER_ISSUE_AUTHORITY");
+        Reject(() => Approve(issue with { Title = "Changed" }), "ORDER_OBSERVATION_BINDING");
+        Reject(() => Approve(issue with { Number = number + 1 }), "ORDER_OBSERVATION_BINDING");
+        Reject(() => DevelopmentOrderApproval.Observe(issue, profile with { BaseCommit = new string('a', 40) }),
+            "ORDER_OBSERVATION_BINDING");
+        Reject(() => Approve(issue with { CompleteHistory = false }), "ORDER_APPROVAL_HISTORY");
+        Reject(() => Approve(issue with { Comments = [] }), "ORDER_APPROVAL_AMBIGUOUS");
+        Reject(() => Approve(issue with { Comments = [comment with { AuthorId = 43 }] }), "ORDER_APPROVAL_AMBIGUOUS");
+        Reject(() => Approve(issue with { Comments = [comment with { UpdatedAt = time.AddSeconds(1) }] }), "ORDER_APPROVAL_MARKER");
+        Reject(() => Approve(issue with { Comments = [comment with { Body = comment.Body + "\n" }] }), "ORDER_APPROVAL_MARKER");
+        Reject(() => Approve(issue with { Comments = [comment, comment with { Id = 2 }] }), "ORDER_APPROVAL_AMBIGUOUS");
+        var revoke = comment with
+        {
+            Id = 2, Body = $"HaMi-Order-Revoke: v1 1 {order.Sha256}",
+            CreatedAt = time.AddSeconds(1), UpdatedAt = time.AddSeconds(1)
+        };
+        Reject(() => Approve(issue with { Comments = [revoke, comment] }), "ORDER_APPROVAL_STALE_OR_REVOKED");
+        Reject(() => Approve(issue with { Body = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(body)
+            .Replace(plan, " " + plan, StringComparison.Ordinal)) }), "ORDER_APPROVAL_STALE_OR_REVOKED");
+        var reapproval = comment with { Id = 3, CreatedAt = time.AddSeconds(2), UpdatedAt = time.AddSeconds(2) };
+        if (Approve(issue with { Comments = [reapproval, revoke, comment] }).Binding.ApprovalCommentId != 3)
+            throw new InvalidOperationException("Latest explicit approval not bound.");
+
+        Guid job = new("10000000-0000-0000-0000-000000000001");
+        var agent = new OrderAgentIdentity("fixture-agent", "1", hash, "fixture-provider", "fixture-model", hash);
+        var catalog = new OrderAgentProfile(agent, true, ["csharp"]);
+        var a1 = new OrderAssignment(approved.Binding, job, "S01", 1, agent, "Reviewed capability match", time.AddMinutes(2));
+        var a2 = a1 with { StepId = "S02" };
+        OrderAssignment[] assignments = [a1, a2];
+        DevelopmentOrderHandover.ValidateAssignment(approved, job, a1, [catalog]);
+        Reject(() => DevelopmentOrderHandover.ValidateAssignment(approved, job, a1, [catalog with { Enabled = false }]),
+            "ORDER_AGENT_CAPABILITY");
+        Reject(() => DevelopmentOrderHandover.ValidateAssignment(approved, job, a1, [catalog with { Competencies = ["shell"] }]),
+            "ORDER_AGENT_CAPABILITY");
+        Reject(() => DevelopmentOrderHandover.ValidateAssignment(approved, job,
+            a1 with { Agent = agent with { Provider = "unapproved" } }, [catalog]), "ORDER_AGENT_CAPABILITY");
+        Reject(() => DevelopmentOrderHandover.ValidateAssignment(approved, job,
+            a1 with { Binding = approved.Binding with { Revision = 2 } }, [catalog]), "ORDER_ASSIGNMENT_BINDING");
+
+        var t1 = new OrderAttempt(approved.Binding, job, "S01", 1,
+            new Guid("20000000-0000-0000-0000-000000000001"), 1, agent);
+        var t2 = t1 with { StepId = "S02", AttemptId = new Guid("20000000-0000-0000-0000-000000000002") };
+
+        OrderArtifactObservation Artifact(string id, string content, OrderAttempt? attempt = null)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(content);
+            return new OrderArtifactObservation(new OrderArtifact(id, "text/x-csharp", bytes.Length,
+                DevelopmentJobState.Hash(bytes), attempt?.JobId, attempt?.StepId, attempt?.AttemptId), bytes);
+        }
+
+        OrderArtifactObservation b1 = Artifact("calculator-baseline", "synthetic baseline one");
+        OrderArtifactObservation b2 = Artifact("formatter-baseline", "synthetic baseline two");
+        OrderArtifactObservation o1 = Artifact("calculator-source", "synthetic accepted one", t1);
+        OrderArtifactObservation o2 = Artifact("formatter-source", "synthetic accepted two", t2);
+        OrderArtifactObservation[] store = [b1, b2, o1, o2];
+        var r1 = new OrderStepResult(t1, [b1.Artifact], [o1.Artifact], "candidate", "Proposed calculation");
+        var r2 = new OrderStepResult(t2, [b2.Artifact, o1.Artifact], [o2.Artifact], "candidate", "Proposed format");
+        OrderStepResult[] results = [r1, r2];
+
+        var v1 = new OrderVerifier("pair-calculator", "1", hash, "fixture-host");
+        var v2 = v1 with { Id = "pair-formatter" };
+        var vf = v1 with { Id = "pair-integration" };
+        OrderVerifier[] verifiers = [v1, v2, vf];
+        var e1 = new OrderStepEvidence(new Guid("30000000-0000-0000-0000-000000000001"), t1, v1,
+            r1.Inputs, r1.Outputs, [new OrderCriterion("C01", true)], true, true, time.AddMinutes(3));
+        var e2 = new OrderStepEvidence(new Guid("30000000-0000-0000-0000-000000000002"), t2, v2,
+            r2.Inputs, r2.Outputs, [new OrderCriterion("C02", true)], true, true, time.AddMinutes(4));
+        OrderStepEvidence[] evidence = [e1, e2];
+        var final = new OrderFinalEvidence(new Guid("30000000-0000-0000-0000-000000000003"), approved.Binding,
+            job, vf, [o1.Artifact, o2.Artifact], [new OrderCriterion("C03", true)], true, true, time.AddMinutes(5));
+        var finding = new OrderKnowledge("finding-1", t1, e1.EvidenceId, "A proposed finding", "Recorded rationale", "S02 context");
+        var review = new OrderKnowledgeReview(finding, v1, "verified");
+
+        void Verify(OrderAssignment[]? aa = null, OrderStepResult[]? rr = null, OrderStepEvidence[]? ee = null,
+            OrderFinalEvidence? ff = null, OrderArtifactObservation[]? ss = null,
+            OrderVerifier[]? vv = null, OrderKnowledgeReview[]? kk = null) =>
+            DevelopmentOrderHandover.ValidateReference(approved, job, aa ?? assignments, rr ?? results,
+                ee ?? evidence, ff ?? final, [catalog], vv ?? verifiers, ss ?? store, [finding], kk ?? [review]);
+
+        Verify();
+        Verify(kk: []); // Proposed findings need no assertion of truth.
+        Reject(() => Verify(aa: [a2, a1]), "ORDER_STEP_SEQUENCE");
+        Reject(() => Verify(rr: [r1, r2 with { Attempt = t2 with { AssignmentRevision = 2 } }]), "ORDER_ATTEMPT_BINDING");
+        Reject(() => Verify(rr: [r1, r2 with { Attempt = t2 with { AttemptId = t1.AttemptId } }]), "ORDER_ATTEMPT_BINDING");
+        Reject(() => Verify(rr: [r1, r2 with { Inputs = [b2.Artifact] }]), "ORDER_RESULT_ARTIFACTS");
+        Reject(() => Verify(ee: [e1 with { Accepted = false }, e2]), "ORDER_STEP_EVIDENCE");
+        Reject(() => Verify(ee: [e1, e2 with { Attempt = t1 }]), "ORDER_STEP_EVIDENCE");
+        Reject(() => Verify(ee: [e1, e2 with { Criteria = [new OrderCriterion("C02", false)] }]), "ORDER_CRITERION_EVIDENCE");
+        OrderVerifier self = v1 with { ActorId = agent.Id };
+        Reject(() => Verify(ee: [e1 with { Verifier = self }, e2], vv: [self, v2, vf]), "ORDER_VERIFIER_INDEPENDENCE");
+        Reject(() => Verify(ss: [b1, b2, o1 with { Bytes = [1, 2, 3] }, o2]), "ORDER_ARTIFACT_BYTES");
+        Reject(() => Verify(ss: [b1, b2, o1]), "ORDER_HANDOVER_SHAPE");
+        Reject(() => Verify(ff: final with { Inputs = [o2.Artifact, o1.Artifact] }), "ORDER_FINAL_EVIDENCE");
+        Reject(() => Verify(ff: final with { CleanupSucceeded = false }), "ORDER_FINAL_EVIDENCE");
+        Reject(() => Verify(kk: [review with { Contribution = finding with { Claim = "Different claim" } }]), "ORDER_KNOWLEDGE_REVIEW");
+        Console.WriteLine("Development order approval, assignment, synthetic artifact/evidence and knowledge correlation self-test passed.");
+    }
+}

@@ -65,6 +65,7 @@ internal static class DevelopmentOrderTests
         RejectMutation(x => x["limits"]!["sandboxRuns"] = 4);
         RejectMutation(x => x["limits"]!["elapsedSeconds"] = 1801);
         Console.WriteLine("Development order schema, scope, dependencies, budgets and exact-byte identity self-test passed.");
+        DevelopmentOrderHandoverTests.SelfTest(plan);
     }
 
     private static void ExpectRejected(Action action)
