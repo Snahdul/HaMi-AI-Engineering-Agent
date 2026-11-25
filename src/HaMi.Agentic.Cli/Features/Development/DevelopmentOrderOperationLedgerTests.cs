@@ -167,6 +167,40 @@ internal static class DevelopmentOrderOperationLedgerTests
         if (checkpointed.Complete(completion with { Outcome = "failed" }).LatestCandidate != candidate)
             throw new InvalidOperationException("Known failure discarded candidate.");
         Console.WriteLine("PASS: source candidate checkpoint is immutable, unaccepted and does not settle pending operation.");
+
+        // Checkpoint provenance is independent of the claimed quality.
+        Reject(() => reserved.Checkpoint(claim, candidate with { ArchiveHash = new string('B', 64) }));
+        var foreignClaim = DevelopmentOrderClaim.Create(new string('b', 32), approval.Binding, hash);
+        Reject(() => reserved.Checkpoint(foreignClaim, candidate));
+        Reject(() => reserved.Checkpoint(claim, candidate with { BaselineHash = new string('B', 64) }));
+        Reject(() => reserved.Checkpoint(claim, candidate with { ByteCount = 0 }));
+        Reject(() => reserved.Checkpoint(claim, candidate with { ByteCount = OrderCandidateCheckpoint.MaxBytes + 1 }));
+
+        byte[] source = [0x61, 0x62, 0x63];
+        var actualCandidate = candidate with
+        {
+            ByteCount = source.Length,
+            ArtifactHash = DevelopmentJobState.Hash(source),
+            Quality = "Generated"
+        };
+        actualCandidate.ValidateBytes(source);
+        Reject(() => actualCandidate.ValidateBytes([0x61, 0x62, 0x64]));
+        Reject(() => actualCandidate.ValidateBytes([0x61, 0x62]));
+        var generated = reserved.Checkpoint(claim, actualCandidate);
+        if (generated.Pending != reserve || generated.LastOutcome is not null)
+            throw new InvalidOperationException("Generated candidate became a completed operation.");
+
+        // Known failure permits a new charged attempt, but its old checkpoint
+        // cannot be relabeled as evidence for that new operation.
+        var failedCandidate = generated.Complete(completion with { Outcome = "failed", ObservedUtcTicks = afterTen });
+        var retryCandidate = failedCandidate.Reserve(job, limits, retry);
+        Reject(() => retryCandidate.Checkpoint(claim, actualCandidate with { ObservedUtcTicks = afterTen }));
+        var secondCandidate = actualCandidate with { OperationId = retry.OperationId, ObservedUtcTicks = afterTen };
+        var secondCheckpoint = retryCandidate.Checkpoint(claim, secondCandidate);
+        if (secondCheckpoint.Pending != retry || secondCheckpoint.LatestCandidate != secondCandidate
+            || secondCheckpoint.Models != 2 || secondCheckpoint.ReservedSeconds != 60)
+            throw new InvalidOperationException("Retry checkpoint changed operation identity or charge.");
+        Console.WriteLine("PASS: checkpoint provenance, byte integrity and charged retry identity.");
     }
 
     private static void Reject(Action action)
