@@ -1,0 +1,122 @@
+{
+  "schemaVersion": 1,
+  "revision": 1,
+  "repository": "Snahdul/HaMi-AI-Engineering-Agent",
+  "issueNumber": 900001,
+  "title": "[Synthetic] Two-step calculator and formatter fixture",
+  "baseCommit": "9fa33db907c0a65e3766ed95f3e1e75dd40e25f3",
+  "goal": "Implement the existing staged fixture in two separately verifiable steps; keep the independent integration harness unchanged.",
+  "context": [
+    {
+      "reference": "contracts/development/agent-pair.json",
+      "description": "Reviewed two-file fixture contract; not a multi-step execution authorization."
+    },
+    {
+      "reference": "samples/SandboxCodingPair/Program.cs",
+      "description": "Existing integration harness from the reviewed base."
+    }
+  ],
+  "decisions": [
+    {
+      "id": "calculator-before-formatter",
+      "decision": "Accept the calculator first; pass its verified output to the formatter step.",
+      "rationale": "Demonstrates a reusable, immutable predecessor result and final cumulative acceptance.",
+      "alternatives": [
+        "Generate both files in one model call; already demonstrated, but not evidence of step recovery."
+      ]
+    },
+    {
+      "id": "independent-verification",
+      "decision": "Use trusted step-specific verifiers and the existing unchanged final harness.",
+      "rationale": "The baseline placeholders both throw; the combined harness alone cannot accept step one.",
+      "alternatives": [
+        "Let the model change the tests; rejected because acceptance must be independent."
+      ]
+    }
+  ],
+  "contractId": "sandbox-pair",
+  "limits": {
+    "modelCalls": 4,
+    "sandboxRuns": 5,
+    "elapsedSeconds": 1800
+  },
+  "steps": [
+    {
+      "id": "S01",
+      "objective": "Implement PairCalculator.Clamp(value,min,max) for min <= max.",
+      "dependsOn": [],
+      "competencies": [
+        "csharp"
+      ],
+      "inputs": [
+        {
+          "source": "baseline",
+          "id": "calculator-baseline",
+          "stepId": null
+        }
+      ],
+      "outputs": [
+        "calculator-source"
+      ],
+      "allowedWritePaths": [
+        "src/HaMi.Agentic.Cli/Features/Development/PairCalculator.cs"
+      ],
+      "verifier": "pair-calculator",
+      "criteria": [
+        {
+          "id": "C01",
+          "text": "Inclusive nearest-bound semantics verified by a trusted calculator-only harness; no other file changed."
+        }
+      ],
+      "maxModelCalls": 2,
+      "maxSandboxRuns": 2
+    },
+    {
+      "id": "S02",
+      "objective": "Implement PairFormatter.Format(clamped,min,max) in invariant culture with exactly clamped [min,max]. Preserve accepted calculator bytes.",
+      "dependsOn": [
+        "S01"
+      ],
+      "competencies": [
+        "csharp"
+      ],
+      "inputs": [
+        {
+          "source": "baseline",
+          "id": "formatter-baseline",
+          "stepId": null
+        },
+        {
+          "source": "step",
+          "id": "calculator-source",
+          "stepId": "S01"
+        }
+      ],
+      "outputs": [
+        "formatter-source"
+      ],
+      "allowedWritePaths": [
+        "src/HaMi.Agentic.Cli/Features/Development/PairFormatter.cs"
+      ],
+      "verifier": "pair-formatter",
+      "criteria": [
+        {
+          "id": "C02",
+          "text": "Independent formatter checks pass; predecessor calculator source remains byte-identical."
+        }
+      ],
+      "maxModelCalls": 2,
+      "maxSandboxRuns": 2
+    }
+  ],
+  "finalVerification": {
+    "verifier": "pair-integration",
+    "criteria": [
+      {
+        "id": "C03",
+        "text": "Unchanged combined harness builds offline without warnings and prints exactly HaMi pair acceptance passed; all guests removed, baseline unchanged."
+      }
+    ],
+    "maxSandboxRuns": 1
+  }
+}

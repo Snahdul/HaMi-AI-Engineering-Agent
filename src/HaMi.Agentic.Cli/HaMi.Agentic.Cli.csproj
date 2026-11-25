@@ -7,6 +7,9 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="../../contracts/development/development-order.schema.json" LogicalName="HaMi.DevelopmentOrder.Schema" />
+  </ItemGroup>
+  <ItemGroup>
     <InternalsVisibleTo Include="HaMi.Agentic.JobState.Probe" />
   </ItemGroup>
   <ItemGroup>
