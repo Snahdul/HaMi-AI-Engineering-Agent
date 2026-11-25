@@ -36,6 +36,14 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Test conservative draft test selection
+        run: python3 scripts/quality/select-draft-tests.py --self-test
+
+      - name: Select incremental Draft Linux tests
+        id: test-scope
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true && github.event.action == 'synchronize' && !contains(github.event.pull_request.labels.*.name, 'ci:full')
+        run: python3 scripts/quality/select-draft-tests.py
+
       - name: Install .NET SDK from global.json
         uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
@@ -97,18 +105,22 @@ jobs:
 
 
       - name: Validate general C# sandbox runner input isolation (offline)
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-run-self-test
 
       - name: Validate Docker Sandbox PoC preflight and report handling (offline)
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-poc-self-test
 
       - name: CLI help smoke test (no API key needed)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- replay --help
 
       - name: Validate historical templates without model call
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- replay --check .
 
       - name: Reject premature mandatory result fields (regression)
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         shell: bash
         run: |
           target="$RUNNER_TEMP/replay-bad"
@@ -123,6 +135,7 @@ jobs:
           echo "Expected rejection confirmed"
 
       - name: Verify unattended replay preflight without model access
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         shell: bash
         run: |
           set +e
@@ -144,12 +157,15 @@ jobs:
           echo "Unattended preflight guards verified without API key or network calls"
 
       - name: Validate MVP 0.2 two-stage manifest offline
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- workflow --repo . --manifest workflows/mvp02.json --validate
 
       - name: Verify two-stage orchestration without model or GitHub writes
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- workflow --self-test
 
       - name: Reject live workflow when API key is absent
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         shell: bash
         run: |
           set +e
@@ -162,9 +178,11 @@ jobs:
           fi
 
       - name: Verify persistent Windows-style settings resolver offline
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- config --self-test
 
       - name: Verify worktree path and masked named key via config check (no API)
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         shell: bash
         run: |
           output="$(env -u OPENAI_API_KEY 'HaMi-AI-Engineering-Agent-Key=ci-secret-must-not-appear' HAMI_AGENT_WORKTREE_ROOT="$RUNNER_TEMP/hami-worktrees" dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- config --check --repo .)"
@@ -177,27 +195,35 @@ jobs:
           echo "Runtime settings check passed without displaying the API key"
 
       - name: Build trusted fixed C# test fixture
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet build samples/ClampKata/ClampKata.csproj --configuration Release --nologo -p:NuGetAudit=false
 
       - name: Build and test real RetryBudget Coding feature fixture
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project samples/RetryBudget/RetryBudget.csproj --configuration Release --nologo
 
       - name: Validate two bounded coding tasks with real compiler, tests and correction (offline)
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test --repo .
 
       - name: Validate versioned execution policy without API/network access
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --policy-check --repo .
 
       - name: Validate task-specific retry policy (offline)
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --policy-check --task retry-budget --repo .
 
       - name: Test structured file logging, decisions and defaults without API access
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test-logging --repo .
 
       - name: Test Microsoft.Extensions.AI IChatClient coding adapter offline
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test-ai --repo .
 
       - name: Reject live coding without API key
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.test-scope.outputs.profile != 'order-recovery'
         shell: bash
         run: |
           set +e
