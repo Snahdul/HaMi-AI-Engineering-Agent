@@ -8,6 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj" />
+    <EmbeddedResource Include="../../samples/DevelopmentOrder/pair-order.json" LogicalName="HaMi.Probe.Order" />
     <PackageReference Include="Akka.Persistence" Version="1.5.74" />
     <PackageReference Include="Akka.Persistence.Hosting" Version="1.5.74" />
     <PackageReference Include="Akka.Persistence.Sql.Hosting" Version="1.5.73" />

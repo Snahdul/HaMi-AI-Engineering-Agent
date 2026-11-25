@@ -36,7 +36,7 @@ internal static class Program
             return 0;
         }
 
-        if (args.Length == 2 && args[0] is "hold" or "probe" or "bridge-hold" or "bridge-unknown" or "bridge-resume" or "bridge-blocked")
+        if (args.Length == 2 && args[0] is "hold" or "probe" or "bridge-hold" or "bridge-unknown" or "bridge-resume" or "bridge-blocked" or "bridge-probe")
         {
             string root = args[1];
             string name = Path.GetFileName(root);
@@ -47,14 +47,26 @@ internal static class Program
             var store = new DevelopmentJobStateStore(root);
             if (args[0].StartsWith("bridge-", StringComparison.Ordinal))
             {
-                using var owner = store.Acquire(Issue);
-                if (args[0] is "bridge-hold" or "bridge-unknown")
-                    owner.Claim(Initial(root));
-                else if (owner.RequireCurrent() != Initial(root))
-                    throw new InvalidOperationException("Original fixture claim changed.");
-                // The V1 Accepted claim is only an ownership sentinel in this
-                // disposable fixture. All workflow transitions live in the journal.
-                return await PersistenceBridgeProbe.RunChildAsync(args[0], root, owner.RequireCurrent().Identity.JobId);
+                var orderStore = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: false);
+                DevelopmentJobStateStore.Lease owner;
+                try { owner = orderStore.AcquireOrder(PersistenceBridgeProbe.Issue); }
+                catch (IOException) when (args[0] == "bridge-probe")
+                {
+                    Console.WriteLine("BUSY");
+                    return 0;
+                }
+                using (owner)
+                {
+                    if (args[0] == "bridge-probe")
+                    {
+                        Console.WriteLine(owner.CurrentOrder is null ? "ACQUIRED:none" : "ACQUIRED:order");
+                        return 0;
+                    }
+                    if (args[0] is "bridge-hold" or "bridge-unknown")
+                        owner.ClaimOrder(Guid.NewGuid().ToString("N"), PersistenceBridgeProbe.FixtureApproval());
+                    _ = owner.RequireArchivedOrder();
+                    return await PersistenceBridgeProbe.RunChildAsync(args[0], root, owner);
+                }
             }
 
             if (args[0] == "probe")
@@ -120,7 +132,8 @@ internal static class Program
             }
             await ExpectProbeAsync(fixture, "ACQUIRED:recovery-blocked");
             Console.WriteLine("PASS: cross-process exclusive ownership and abrupt termination retain claim.");
-            await PersistenceBridgeProbe.RunAsync(Prefix, Start, ExpectProbeAsync);
+            await PersistenceBridgeProbe.RunAsync(Prefix, Start,
+                (root, expected) => ExpectProbeAsync(root, expected, "bridge-probe"));
             return 0;
         }
         finally
@@ -165,9 +178,9 @@ internal static class Program
         return Process.Start(start) ?? throw new InvalidOperationException("Probe launch failed.");
     }
 
-    private static async Task ExpectProbeAsync(string root, string expected)
+    private static async Task ExpectProbeAsync(string root, string expected, string mode = "probe")
     {
-        using var child = Start("probe", root);
+        using var child = Start(mode, root);
         Task<string> stdout = child.StandardOutput.ReadToEndAsync();
         Task<string> stderr = child.StandardError.ReadToEndAsync();
         try

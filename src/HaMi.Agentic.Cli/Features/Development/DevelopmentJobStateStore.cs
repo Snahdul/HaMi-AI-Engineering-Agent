@@ -138,6 +138,8 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         private readonly string nextPath;
         private readonly string legacyPath;
         private readonly string approvalPath;
+        private readonly string journalPath;
+        private bool freshOrder;
         private readonly bool orderClaim;
         private byte[]? legacyClaim;
         private readonly int issue;
@@ -153,6 +155,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             nextPath = prefix + ".next";
             legacyPath = prefix + ".legacy-active";
             approvalPath = prefix + ".order-approval";
+            journalPath = prefix + ".order.db";
             string lockPath = prefix + ".lock";
             bool lockExists = RegularFileExists(lockPath);
             if (lockExists)
@@ -175,14 +178,14 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                     CurrentOrder = ReadOrder();
                     if (CurrentOrder is not null)
                         _ = RequireArchivedOrder();
-                    else if (RegularFileExists(approvalPath))
-                        throw new InvalidOperationException("Order archive exists without its claim.");
+                    else if (RegularFileExists(approvalPath) || JournalFilesExist())
+                        throw new InvalidOperationException("Order storage exists without its claim.");
                 }
                 else
                 {
                     Current = Read();
-                    if (RegularFileExists(approvalPath))
-                        throw new InvalidOperationException("Order archive requires order recovery.");
+                    if (RegularFileExists(approvalPath) || JournalFilesExist())
+                        throw new InvalidOperationException("Order storage requires order recovery.");
                 }
             }
             catch
@@ -219,7 +222,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             CheckOpen();
             if (!orderClaim || CurrentOrder is not null || ReadOrder() is not null
                 || RegularFileExists(legacyPath) || RegularFileExists(approvalPath)
-                || RegularFileExists(nextPath) || approval.Binding.IssueNumber != issue)
+                || RegularFileExists(nextPath) || JournalFilesExist() || approval.Binding.IssueNumber != issue)
                 throw new InvalidOperationException("Existing order claim cannot be replaced.");
 
             var archive = DevelopmentOrderArchive.From(approval);
@@ -235,6 +238,61 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 throw new InvalidOperationException("Order claim readback failed.");
             WriteNew(approvalPath, bytes);
             _ = RequireArchivedOrder();
+            freshOrder = true;
+        }
+
+        private bool JournalFilesExist() =>
+            new[] { journalPath, journalPath + "-journal", journalPath + "-wal", journalPath + "-shm" }
+                .Any(RegularFileExists);
+
+        // Fixed, host-owned path; only the same lease that made the claim
+        // can initialize an empty file. Never recreate a missing journal.
+        internal string CreateOrderJournal()
+        {
+            RequireOrderStorage();
+            if (!freshOrder || JournalFilesExist())
+                throw new InvalidOperationException("Order journal initialization rejected.");
+            freshOrder = false;
+            WriteNew(journalPath, []);
+            ValidateOrderJournalFiles();
+            return journalPath;
+        }
+
+        internal string RequireOrderJournal()
+        {
+            ValidateOrderJournalFiles();
+            using var stream = new FileStream(journalPath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            Span<byte> header = stackalloc byte[16];
+            if (stream.Length < 100)
+                throw new InvalidOperationException("Order journal is empty or incomplete.");
+            stream.ReadExactly(header);
+            if (!header.SequenceEqual("SQLite format 3\0"u8))
+                throw new InvalidOperationException("Order journal header rejected.");
+            return journalPath;
+        }
+
+        internal void ValidateOrderJournalFiles()
+        {
+            RequireOrderStorage();
+            if (!RegularFileExists(journalPath))
+                throw new InvalidOperationException("Order journal missing.");
+            validatePrivateEntry!(journalPath, false);
+            // This increment uses rollback DELETE journaling only. A hot
+            // rollback journal is preserved for SQLite to recover; WAL/SHM
+            // are outside the reviewed mode and must not be silently removed.
+            if (RegularFileExists(journalPath + "-wal") || RegularFileExists(journalPath + "-shm"))
+                throw new InvalidOperationException("Unexpected order journal mode.");
+            if (RegularFileExists(journalPath + "-journal"))
+                validatePrivateEntry!(journalPath + "-journal", false);
+        }
+
+        private void RequireOrderStorage()
+        {
+            _ = RequireArchivedOrder();
+            if (validatePrivateEntry is null)
+                throw new InvalidOperationException("Private order journal policy required.");
+            validatePrivateEntry(Path.GetDirectoryName(journalPath)!, true);
         }
 
         private void RequireV1()

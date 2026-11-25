@@ -66,6 +66,51 @@ internal static class DevelopmentJobStateRoot
         throw new InvalidOperationException("Recovery storage platform not supported.");
     }
 
+    // Only the disposable process probe can select a temporary fixture root.
+    // Reuse the actual owner/ACL/mode checks, not the production account path.
+    internal static DevelopmentJobStateStore OpenOrderProbeFixture(string root, bool create)
+    {
+        const string prefix = "hami-job-probe-";
+        string name = Path.GetFileName(root);
+        if (!name.StartsWith(prefix, StringComparison.Ordinal)
+            || !Guid.TryParseExact(name[prefix.Length..], "N", out _)
+            || Path.Combine(Path.GetTempPath(), name) != root)
+            throw new InvalidOperationException("Order probe root rejected.");
+        if (create && (Directory.Exists(root) || File.Exists(root) || new DirectoryInfo(root).LinkTarget is not null))
+            throw new InvalidOperationException("Order probe root already exists.");
+        if (OperatingSystem.IsWindows())
+        {
+            using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+            SecurityIdentifier user = identity.User
+                ?? throw new InvalidOperationException("Recovery account SID missing.");
+            if (create)
+                EnsureWindowsRoot(root, user);
+            ValidateWindowsEntry(root, true, user);
+            return new DevelopmentJobStateStore(root,
+                (path, directory) =>
+                {
+                    if (!OperatingSystem.IsWindows())
+                        throw new PlatformNotSupportedException();
+                    ValidateWindowsEntry(path, directory, user);
+                });
+        }
+        if (OperatingSystem.IsLinux())
+        {
+            uint uid = EffectiveLinuxUid();
+            if (create)
+                EnsureLinuxRoot(root, uid);
+            ValidateLinuxEntry(root, true, uid);
+            return new DevelopmentJobStateStore(root,
+                (path, directory) =>
+                {
+                    if (!OperatingSystem.IsLinux())
+                        throw new PlatformNotSupportedException();
+                    ValidateLinuxEntry(path, directory, uid);
+                });
+        }
+        throw new InvalidOperationException("Order probe platform not supported.");
+    }
+
     private static string Resolve(string repo, string? resultsRoot, string parent, string name)
     {
         if (string.IsNullOrWhiteSpace(parent) || !Path.IsPathFullyQualified(parent)
