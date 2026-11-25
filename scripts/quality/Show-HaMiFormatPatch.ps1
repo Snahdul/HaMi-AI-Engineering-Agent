@@ -13,16 +13,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Formatter worktree creation failed.' }
 try {
     Push-Location -LiteralPath $worktree
     try {
-        foreach ($project in @(
-            'src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj',
-            'tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj'
-        )) {
-            if (Test-Path -LiteralPath $project -PathType Leaf) {
-                & dotnet restore $project
-                if ($LASTEXITCODE -ne 0) { throw 'Formatter workspace restore failed.' }
-            }
-        }
-        & ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $Base -Mode Apply
+        & ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $Base -Mode Apply -Restore
         # No commit, index update, credentials or push. The existing failed
         # quality gate stays failed; this is only a reviewable correction.
         $patch = @(& git -c core.quotePath=false diff --no-color --no-ext-diff --no-textconv HEAD --)
