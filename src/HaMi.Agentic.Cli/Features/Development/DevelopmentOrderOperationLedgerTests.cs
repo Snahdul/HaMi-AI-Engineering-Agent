@@ -201,6 +201,27 @@ internal static class DevelopmentOrderOperationLedgerTests
             || secondCheckpoint.Models != 2 || secondCheckpoint.ReservedSeconds != 60)
             throw new InvalidOperationException("Retry checkpoint changed operation identity or charge.");
         Console.WriteLine("PASS: checkpoint provenance, byte integrity and charged retry identity.");
+
+        var observation = new OrderOperationEvidence(1, hash, reserve, OrderOperationEvidence.FixtureObserver,
+            "succeeded", claim.Binding.CalculatorBaselineHash, claim.Binding.CalculatorBaselineHash,
+            actualCandidate.ArtifactHash, afterTen);
+        var observedCompletion = observation.Completion();
+        observation.ValidateCompletion(claim, reserve, observedCompletion);
+        Reject(() => observation.ValidateCompletion(foreignClaim, reserve, observedCompletion));
+        Reject(() => observation.ValidateCompletion(claim, retry, observedCompletion));
+        Reject(() => observation.ValidateCompletion(claim, reserve with { ReservedSeconds = 31 }, observedCompletion));
+        Reject(() => observation.ValidateCompletion(claim, reserve, observedCompletion with { EvidenceHash = actualCandidate.ArtifactHash }));
+        Reject(() => observation.ValidateCompletion(claim, reserve, observedCompletion with { Outcome = "failed" }));
+        Reject(() => observation.ValidateCompletion(claim, reserve, observedCompletion with { ObservedUtcTicks = afterTen + 1 }));
+        Reject(() => (observation with { Observer = "model-assertion" }).ValidateBinding(claim));
+        Reject(() => (observation with { InputHash = new string('C', 64) }).ValidateBinding(claim));
+        Reject(() => (observation with { Outcome = "unknown" }).ValidateBinding(claim));
+        Reject(() => (observation with { Outcome = "failed" }).ValidateBinding(claim));
+        var knownFailure = observation with { Outcome = "failed", OutputHash = null };
+        knownFailure.ValidateCompletion(claim, reserve, knownFailure.Completion());
+        if (reserved.Complete(knownFailure.Completion()).ReservedSeconds != 30)
+            throw new InvalidOperationException("Known failure evidence refunded charge.");
+        Console.WriteLine("PASS: exact operation evidence binds reservation, outcome, observer and completion digest.");
     }
 
     private static void Reject(Action action)

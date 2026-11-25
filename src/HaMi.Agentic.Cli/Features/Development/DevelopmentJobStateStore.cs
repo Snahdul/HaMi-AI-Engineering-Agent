@@ -249,7 +249,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             new[] { journalPath, journalPath + "-journal", journalPath + "-wal", journalPath + "-shm",
                 ArtifactPath("S01"), ArtifactPath("S02") }.Any(RegularFileExists)
             || Enumerable.Range(1, OrderCandidateCheckpoint.MaxSequence)
-                .Any(sequence => RegularFileExists(CandidatePath(sequence)));
+                .Any(sequence => RegularFileExists(CandidatePath(sequence)) || RegularFileExists(OperationEvidencePath(sequence)));
 
         // Fixed, host-owned path; only the same lease that made the claim
         // can initialize an empty file. Never recreate a missing journal.
@@ -363,6 +363,52 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(path, OrderCandidateCheckpoint.MaxBytes);
             candidate.ValidateBytes(bytes);
             return bytes;
+        }
+
+        private string OperationEvidencePath(int sequence)
+        {
+            OrderCheck.Require(sequence is >= 1 and <= OrderCandidateCheckpoint.MaxSequence, "ORDER_EVIDENCE_SEQUENCE");
+            return journalPath + ".evidence-" + sequence.ToString(CultureInfo.InvariantCulture);
+        }
+
+        // Immutable exact host-observation bytes; never a second mutable
+        // workflow authority. Persist completion only after readback.
+        internal OrderOperationCompletion StoreOrderOperationEvidence(OrderOperationEvidence evidence)
+        {
+            RequireOrderStorage();
+            DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            string path = OperationEvidencePath(evidence.ValidateBinding(claim));
+            if (RegularFileExists(path))
+                throw new InvalidOperationException("Order operation evidence already exists.");
+            byte[] bytes = evidence.Serialize();
+            var completion = evidence.Completion();
+            WriteNew(path, bytes);
+            _ = RequireOrderOperationEvidence(evidence.Reservation, completion);
+            return completion;
+        }
+
+        internal OrderOperationEvidence RequireOrderOperationEvidence(OrderOperationReservation reservation,
+            OrderOperationCompletion completion)
+        {
+            RequireOrderStorage();
+            DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            string prefix = claim.JobId + ":";
+            OrderCheck.Require(reservation.OperationId is not null
+                && reservation.OperationId.StartsWith(prefix, StringComparison.Ordinal), "ORDER_EVIDENCE_SEQUENCE");
+            string id = reservation.OperationId ?? throw new InvalidOperationException("ORDER_EVIDENCE_SEQUENCE");
+            if (!int.TryParse(id.AsSpan(prefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out int sequence)
+                || sequence is < 1 or > OrderCandidateCheckpoint.MaxSequence
+                || id != prefix + sequence.ToString(CultureInfo.InvariantCulture))
+                throw new InvalidOperationException("ORDER_EVIDENCE_SEQUENCE");
+            string path = OperationEvidencePath(sequence);
+            if (!RegularFileExists(path))
+                throw new InvalidOperationException("Order operation evidence missing.");
+            validatePrivateEntry!(path, false);
+            byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(path, OrderOperationEvidence.MaxBytes);
+            OrderCheck.Require(DevelopmentJobState.Hash(bytes) == completion.EvidenceHash, "ORDER_EVIDENCE_HASH");
+            var evidence = OrderStorageJson.Decode<OrderOperationEvidence>(bytes, OrderOperationEvidence.MaxBytes);
+            evidence.ValidateCompletion(claim, reservation, completion);
+            return evidence;
         }
 
         private void RequireOrderStorage()

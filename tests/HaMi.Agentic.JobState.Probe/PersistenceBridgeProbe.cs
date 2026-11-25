@@ -28,6 +28,36 @@ internal static class PersistenceBridgeProbe
     private static readonly byte[] PartialBytes = Encoding.UTF8.GetBytes("internal static class PartialCalculator {");
     private static readonly string PartialHash = DevelopmentJobState.Hash(PartialBytes);
 
+    // Controlled host observation, separate from the synthetic generator.
+    // This is not an independent real model/guest verifier.
+    private static OrderOperationCompletion ObserveFixtureOutcome(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderClaim claim, OrderOperationReservation operation, string outputHash)
+    {
+        byte[] actual = owner.RequireOrderArtifact(operation.Step, outputHash);
+        if (!actual.SequenceEqual(AcceptedBytes))
+            throw new InvalidOperationException("Fixture output differs from trusted reference.");
+        string baseline = operation.Step == "S01" ? claim.Binding.CalculatorBaselineHash : claim.Binding.FormatterBaselineHash;
+        string inputHash = operation.Step == "S01" ? baseline : DevelopmentJobState.Hash(owner.RequireOrderArtifact("S01", AcceptedHash));
+        var evidence = new OrderOperationEvidence(1, claim.ArchiveHash, operation, OrderOperationEvidence.FixtureObserver,
+            "succeeded", baseline, inputHash, outputHash, DateTime.UtcNow.Ticks);
+        var completion = owner.StoreOrderOperationEvidence(evidence);
+        Reject(() => owner.StoreOrderOperationEvidence(evidence));
+        return completion;
+    }
+
+    private static void VerifyFixtureOutcome(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderClaim claim, RecordedOperation recorded)
+    {
+        var evidence = owner.RequireOrderOperationEvidence(recorded.Reservation, recorded.Completion);
+        string expectedInput = recorded.Reservation.Step == "S01"
+            ? claim.Binding.CalculatorBaselineHash
+            : DevelopmentJobState.Hash(owner.RequireOrderArtifact("S01", AcceptedHash));
+        if (evidence.Outcome != "succeeded" || evidence.InputHash != expectedInput
+            || evidence.OutputHash != AcceptedHash
+            || !owner.RequireOrderArtifact(recorded.Reservation.Step, AcceptedHash).SequenceEqual(AcceptedBytes))
+            throw new InvalidOperationException("Fixture observation differs from trusted inputs/output.");
+    }
+
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
         Func<string, string, Task> expectOwnership)
     {
@@ -155,6 +185,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: original execution window survives process kill and reentry.");
         Console.WriteLine("PASS: journaled budget stop survives process kill; synthetic extension preserves accepted artifacts and charges.");
         Console.WriteLine("PASS: unaccepted source checkpoint survives process kill; pending model remains blocked.");
+        Console.WriteLine("PASS: immutable operation outcome receipts survive process kill; missing, tampered and mismatched evidence rejected.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -264,7 +295,7 @@ internal static class PersistenceBridgeProbe
         try
         {
             var system = host.Services.GetRequiredService<ActorSystem>();
-            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, limits, policy)), "bridge");
+            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, limits, policy, owner)), "bridge");
             async Task<BridgeState> ReadAsync()
             {
                 Task<BridgeState> read = actor.Ask<BridgeState>(new ReadState(), Deadline);
@@ -328,8 +359,8 @@ internal static class PersistenceBridgeProbe
                 else
                 {
                     string hash = owner.StoreOrderArtifact("S01", AcceptedBytes);
-                    current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(
-                        new(2, reserved.OperationId, hash, "succeeded", DateTime.UtcNow.Ticks)), 3);
+                    var completion = ObserveFixtureOutcome(owner, claim, reserved, hash);
+                    current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(completion), 3);
                     var denied = current.Ledger.Propose(claim.JobId, "S02", "model", 100, DateTime.UtcNow.Ticks);
                     current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeBudgetStop(new(1, denied, "time")), 3);
                     if (current.Ledger.BudgetStop?.Request != denied || current.Ledger.Sequence != 1
@@ -387,6 +418,9 @@ internal static class PersistenceBridgeProbe
                 Reject(() => owner.StoreOrderCandidate(candidate, PartialBytes));
                 _ = owner.RequireOrderCandidate(candidate);
                 Console.WriteLine("BRIDGE_PHASE: unaccepted candidate retained; unknown model still pending.");
+                // A candidate hash alone is not an outcome receipt.
+                Reject(() => owner.RequireOrderOperationEvidence(pending,
+                    new(2, pending.OperationId, PartialHash, "succeeded", DateTime.UtcNow.Ticks)));
                 // Do not retry or release the reservation: outcome is unknown.
                 Reject(() => current.Ledger.Reserve(claim.JobId, limits,
                     current.Ledger.Propose(claim.JobId, "S01", "model", 30, DateTime.UtcNow.Ticks)));
@@ -399,6 +433,25 @@ internal static class PersistenceBridgeProbe
                 || current.Ledger.Models != 1 || current.Ledger.Guests != 0
                 || current.Ledger.ReservedSeconds != 30)
                 throw new InvalidOperationException("Accepted step not recovered.");
+            var recorded = current.S01 ?? throw new InvalidOperationException("Recorded S01 outcome missing.");
+            if (current.S02 is not null || current.Ledger.LastEvidenceHash != recorded.Completion.EvidenceHash)
+                throw new InvalidOperationException("Replayed outcome identity differs.");
+            VerifyFixtureOutcome(owner, claim, recorded);
+            string receipt = database + ".evidence-1";
+            byte[] originalReceipt = File.ReadAllBytes(receipt);
+            // Disposable fixture fault injection only; a real reentry must
+            // stop on either failure and never repair evidence automatically.
+            File.WriteAllBytes(receipt, [.. originalReceipt, 0x20]);
+            try { Reject(() => VerifyFixtureOutcome(owner, claim, recorded)); }
+            finally { File.WriteAllBytes(receipt, originalReceipt); }
+            File.Move(receipt, receipt + ".saved");
+            try { Reject(() => VerifyFixtureOutcome(owner, claim, recorded)); }
+            finally { File.Move(receipt + ".saved", receipt); }
+            Reject(() => owner.RequireOrderOperationEvidence(recorded.Reservation,
+                recorded.Completion with { EvidenceHash = AcceptedHash }));
+            Reject(() => owner.RequireOrderOperationEvidence(recorded.Reservation with { ReservedSeconds = 31 }, recorded.Completion));
+            VerifyFixtureOutcome(owner, claim, recorded);
+            Console.WriteLine("BRIDGE_PHASE: exact S01 outcome evidence and artifact verified before continuation.");
             byte[] input = owner.RequireOrderArtifact("S01", AcceptedHash);
             if (current.Ledger.BudgetStop is not { Reason: "time", Request: { Step: "S02", ReservedSeconds: 100 } }
                 || current.Ledger.BudgetRevision != 0 || current.Ledger.CurrentLimits != limits)
@@ -427,8 +480,9 @@ internal static class PersistenceBridgeProbe
             _ = current.Ledger.DispatchAllowance(limits, next.OperationId, DateTime.UtcNow.Ticks);
             string outputHash = owner.StoreOrderArtifact("S02", input);
             _ = owner.RequireOrderArtifact("S02", outputHash);
-            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(
-                new(2, next.OperationId, outputHash, "succeeded", DateTime.UtcNow.Ticks)), 5);
+            var finalCompletion = ObserveFixtureOutcome(owner, claim, next, outputHash);
+            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(finalCompletion), 5);
+            VerifyFixtureOutcome(owner, claim, current.S02 ?? throw new InvalidOperationException("Recorded S02 outcome missing."));
             if (current.Ledger.Pending is not null || current.Ledger.Models != 2
                 || current.Ledger.ReservedSeconds != 130)
                 throw new InvalidOperationException("S02 completion refunded budget.");
@@ -589,7 +643,9 @@ internal static class PersistenceBridgeProbe
 
     private sealed record ReadState;
     private sealed record Advance(string Event);
-    private sealed record BridgeState(int Stage, string? ArtifactHash, DevelopmentOrderOperationLedger Ledger);
+    private sealed record RecordedOperation(OrderOperationReservation Reservation, OrderOperationCompletion Completion);
+    private sealed record BridgeState(int Stage, string? ArtifactHash, DevelopmentOrderOperationLedger Ledger,
+        RecordedOperation? S01 = null, RecordedOperation? S02 = null);
 
     private sealed class BridgeActor : ReceivePersistentActor
     {
@@ -601,7 +657,8 @@ internal static class PersistenceBridgeProbe
 
         public override string PersistenceId { get; }
 
-        public BridgeActor(DevelopmentOrderClaim claim, OrderOperationLimits limits, DevelopmentOrderBudgetPolicy policy)
+        public BridgeActor(DevelopmentOrderClaim claim, OrderOperationLimits limits, DevelopmentOrderBudgetPolicy policy,
+            DevelopmentJobStateStore.Lease owner)
         {
             PersistenceId = claim.PersistenceId;
             this.claim = claim;
@@ -617,6 +674,14 @@ internal static class PersistenceBridgeProbe
                 if (!recovered)
                     throw new InvalidOperationException("Recovery incomplete.");
                 BridgeState next = Next(state, command.Event);
+                // Only the live command boundary reads protected evidence.
+                // Replay remains a pure fold and the host verifies recovered
+                // receipts again before permitting any further work.
+                if (command.Event.StartsWith("complete-v2:", StringComparison.Ordinal))
+                {
+                    var observed = state.Stage == 2 ? next.S01 : next.S02;
+                    VerifyFixtureOutcome(owner, claim, observed ?? throw new InvalidOperationException("Outcome missing."));
+                }
                 IActorRef reply = Sender;
                 Persist(command.Event, _ =>
                 {
@@ -667,13 +732,17 @@ internal static class PersistenceBridgeProbe
                         Ledger = previous.Ledger.Checkpoint(claim, DevelopmentOrderOperationLedger.DecodeCandidate(evt))
                     };
                 var completion = DevelopmentOrderOperationLedger.DecodeCompletion(evt);
-                if (completion.Outcome != "succeeded" || completion.EvidenceHash != AcceptedHash)
-                    throw new InvalidOperationException("Synthetic evidence mismatch.");
+                if (completion.Outcome != "succeeded")
+                    throw new InvalidOperationException("Synthetic outcome mismatch.");
+                var reservation = previous.Ledger.Pending ?? throw new InvalidOperationException("Operation missing.");
+                var recorded = new RecordedOperation(reservation, completion);
                 return previous with
                 {
                     Stage = previous.Stage + 1,
-                    ArtifactHash = completion.EvidenceHash,
-                    Ledger = previous.Ledger.Complete(completion)
+                    ArtifactHash = AcceptedHash,
+                    Ledger = previous.Ledger.Complete(completion),
+                    S01 = previous.Stage == 2 ? recorded : previous.S01,
+                    S02 = previous.Stage == 4 ? recorded : previous.S02
                 };
             }
             throw new InvalidOperationException("Bridge transition rejected.");
