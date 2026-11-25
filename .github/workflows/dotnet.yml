@@ -282,3 +282,8 @@ jobs:
 
       - name: Check production RetryBudget expression and correction on Windows
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- coding --self-test --repo .
+
+      - name: Shutdown .NET build servers
+        if: always()
+        timeout-minutes: 1
+        run: dotnet build-server shutdown
