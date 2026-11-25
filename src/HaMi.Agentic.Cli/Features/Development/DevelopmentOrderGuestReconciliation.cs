@@ -22,7 +22,7 @@ internal sealed record OrderGuestOutcome(
 
 internal static class DevelopmentOrderGuestReconciliation
 {
-    private const int MaxReportBytes = 32 * 1024;
+    internal const int MaxReportBytes = 32 * 1024;
     private static readonly JsonSerializerOptions ReportOptions = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = true,
@@ -62,10 +62,17 @@ internal static class DevelopmentOrderGuestReconciliation
         string runId = RunId(reservation);
         OrderCheck.Require(OrderCheck.Hash(archiveHash) && now >= reservation.ObservedUtcTicks
             && now <= DateTime.MaxValue.Ticks, "ORDER_GUEST_OBSERVATION");
-        if (reportBytes is null || reportBytes.Length is 0 or > MaxReportBytes
+        if (reportBytes is null || !IsSuccessfulReport(runId, reportBytes)
             || !DevelopmentSandboxRunner.IsConfirmedAbsent(runId, inspectExitCode, inspectOutput, inspectError))
             return null;
 
+        return new(1, archiveHash, reservation, runId, DevelopmentJobState.Hash(reportBytes), now);
+    }
+
+    internal static bool IsSuccessfulReport(string runId, byte[] reportBytes)
+    {
+        if (reportBytes.Length is 0 or > MaxReportBytes)
+            return false;
         DevelopmentSandboxRunner.SandboxRunReport? report;
         try
         {
@@ -73,7 +80,7 @@ internal static class DevelopmentOrderGuestReconciliation
         }
         catch (JsonException)
         {
-            return null;
+            return false;
         }
         // Exact canonical runner format rejects duplicate/unknown/missing
         // fields, alternate encodings, and trailing or truncated data.
@@ -84,9 +91,9 @@ internal static class DevelopmentOrderGuestReconciliation
             || report.CreateMilliseconds < 0 || report.CopyMilliseconds < 0 || report.RestoreMilliseconds < 0
             || report.BuildMilliseconds < 0 || report.ExecutionMilliseconds < 0 || report.CleanupMilliseconds < 0
             || report.TotalMilliseconds < 0)
-            return null;
+            return false;
 
-        return new(1, archiveHash, reservation, runId, DevelopmentJobState.Hash(reportBytes), now);
+        return true;
     }
 
     // Replay can fold an acknowledged outcome descriptor; the host must

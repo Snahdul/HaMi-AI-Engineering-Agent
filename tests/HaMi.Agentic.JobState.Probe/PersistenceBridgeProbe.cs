@@ -92,24 +92,55 @@ internal static class PersistenceBridgeProbe
             throw new InvalidOperationException("Fixture failure differs from trusted rejection.");
     }
 
+    private static byte[] FixtureGuestReport(OrderOperationReservation reservation)
+    {
+        var report = new DevelopmentSandboxRunner.SandboxRunReport(1,
+            DevelopmentOrderGuestReconciliation.RunId(reservation), "Demo.csproj", "run",
+            0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null);
+        return System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(report,
+            new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web) { WriteIndented = true });
+    }
+
+    // Controlled offline observation only. The real host must independently
+    // inspect sbx and validate snapshot/report provenance before this boundary.
+    private static OrderGuestOutcome? ObserveFixtureGuest(DevelopmentOrderClaim claim,
+        OrderOperationReservation reservation, byte[] bytes)
+    {
+        string id = DevelopmentOrderGuestReconciliation.RunId(reservation);
+        string absent = "error: sandbox 'hami-code-" + id[..12] + "' not found";
+        return DevelopmentOrderGuestReconciliation.Observe(claim.ArchiveHash, reservation,
+            bytes, 1, "", absent, DateTime.UtcNow.Ticks);
+    }
+
+    private static void VerifyFixtureGuest(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderClaim claim, OrderGuestOutcome outcome)
+    {
+        byte[] bytes = owner.RequireOrderGuestReport(outcome, outcome.Reservation);
+        if (!bytes.SequenceEqual(FixtureGuestReport(outcome.Reservation)))
+            throw new InvalidOperationException("Guest report differs from controlled fixture.");
+        DevelopmentOrderGuestReconciliation.RequireObserved(outcome,
+            ObserveFixtureGuest(claim, outcome.Reservation, bytes));
+    }
+
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
         Func<string, string, Task> expectOwnership)
     {
-        foreach (string scenario in new[] { "accepted", "unknown", "failed" })
+        foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest" })
         {
             bool unknown = scenario == "unknown";
             bool failed = scenario == "failed";
+            bool guest = scenario == "guest";
             string root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
             var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
             try
             {
-                using (Process child = start(unknown ? "bridge-unknown" : failed ? "bridge-failed" : "bridge-hold", root))
+                using (Process child = start(guest ? "bridge-guest" : unknown ? "bridge-unknown" : failed ? "bridge-failed" : "bridge-hold", root))
                 {
                     Task<string> stderr = child.StandardError.ReadToEndAsync();
                     var startup = Stopwatch.StartNew();
                     try
                     {
-                        await WaitForMarkerAsync(child, unknown ? "BRIDGE_RESERVED" : failed ? "BRIDGE_FAILED" : "BRIDGE_ACCEPTED").WaitAsync(Deadline);
+                        await WaitForMarkerAsync(child, guest ? "BRIDGE_GUEST" : unknown ? "BRIDGE_RESERVED" : failed ? "BRIDGE_FAILED" : "BRIDGE_ACCEPTED").WaitAsync(Deadline);
                         Console.WriteLine($"Bridge fixture startup/acceptance: {startup.ElapsedMilliseconds} ms.");
                         if (child.HasExited)
                             throw new InvalidOperationException("Bridge owner stopped before the crash test.");
@@ -149,9 +180,9 @@ internal static class PersistenceBridgeProbe
                     }
                     Reject(() => owner.CreateOrderJournal());
                     Reject(() => store.Acquire(Issue).Dispose());
-                    if (!unknown && !failed && !File.Exists(journal + "-journal"))
+                    if (!unknown && !failed && !guest && !File.Exists(journal + "-journal"))
                         throw new InvalidOperationException("Crash did not retain the live rollback sidecar.");
-                    if (!unknown && !failed)
+                    if (!unknown && !failed && !guest)
                     {
                         byte[] original = owner.RequireOrderArtifact("S01", AcceptedHash);
                         File.WriteAllBytes(artifact, [.. original, 0x20]);
@@ -180,7 +211,7 @@ internal static class PersistenceBridgeProbe
                 }
                 await expectOwnership(root, "ACQUIRED:order");
 
-                using Process resumed = start(unknown ? "bridge-blocked" : failed ? "bridge-retry" : "bridge-resume", root);
+                using Process resumed = start(guest ? "bridge-guest-resume" : unknown ? "bridge-blocked" : failed ? "bridge-retry" : "bridge-resume", root);
                 Task<string> output = resumed.StandardOutput.ReadToEndAsync();
                 Task<string> errors = resumed.StandardError.ReadToEndAsync();
                 try
@@ -191,12 +222,14 @@ internal static class PersistenceBridgeProbe
                         line.StartsWith("BRIDGE_PHASE:", StringComparison.Ordinal)))
                         Console.WriteLine("[bridge reentry] " + line.TrimEnd());
                     if (resumed.ExitCode != 0 || !result.Split('\n').Any(line =>
-                        line.Trim() == (unknown ? "BRIDGE_BLOCKED" : failed ? "BRIDGE_RETRIED" : "BRIDGE_COMPLETED")))
+                        line.Trim() == (guest ? "BRIDGE_GUEST_RECOVERED" : unknown ? "BRIDGE_BLOCKED" : failed ? "BRIDGE_RETRIED" : "BRIDGE_COMPLETED")))
                         throw new InvalidOperationException("Bridge reentry failed: " + result + await errors);
 
                     string s02 = Path.Combine(root, $"issue-{Issue}.order.db.s02");
                     string candidatePath = Path.Combine(root, $"issue-{Issue}.order.db.candidate-1");
-                    if (unknown ? File.Exists(artifact) || File.Exists(s02)
+                    if (guest ? File.Exists(artifact) || File.Exists(s02)
+                        || !File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.guest-report-1"))
+                        : unknown ? File.Exists(artifact) || File.Exists(s02)
                         || !File.ReadAllBytes(candidatePath).SequenceEqual(PartialBytes)
                         : failed ? !File.ReadAllBytes(artifact).SequenceEqual(AcceptedBytes) || File.Exists(s02)
                         || !File.ReadAllBytes(candidatePath).SequenceEqual(PartialBytes)
@@ -230,6 +263,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: immutable operation outcome receipts survive process kill; missing, tampered and mismatched evidence rejected.");
         Console.WriteLine("PASS: known failed fixture operation survives process kill; verified receipt and retained candidate permit one newly charged retry.");
         Console.WriteLine("PASS: exact historical model assignment survives process kill with reservation and receipts.");
+        Console.WriteLine("PASS: protected guest report survives process kill; exact bytes and fresh fixture observation required, no step accepted.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -294,7 +328,7 @@ internal static class PersistenceBridgeProbe
         // Recovery uses only the validated immutable archive, not today's policy.
         OrderOperationLimits limits = archive.EffectiveLimits;
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
-        bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed";
+        bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest";
         if (first)
         {
             var fixtureApproval = FixtureApproval();
@@ -381,7 +415,7 @@ internal static class PersistenceBridgeProbe
             {
                 // The exact assignment is part of the historical reservation,
                 // including for unresolved and failed attempts.
-                if (current.Ledger.Pending is { } recoveredOperation)
+                if (current.Ledger.Pending is { Kind: "model" } recoveredOperation)
                     VerifyFixtureAssignment(claim, archive, recoveredOperation);
                 if (current.S01 is { } recoveredS01)
                     VerifyFixtureAssignment(claim, archive, recoveredS01.Reservation);
@@ -402,6 +436,30 @@ internal static class PersistenceBridgeProbe
                 current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeStart(
                     new(1, claim.ArchiveHash, processStart)), 1);
                 Console.WriteLine("BRIDGE_PHASE: order accepted.");
+                if (mode == "bridge-guest")
+                {
+                    var guestReservation = current.Ledger.Propose(claim.JobId, "S01", "guest", 30, DateTime.UtcNow.Ticks, null);
+                    current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(guestReservation), 2);
+                    if (current.Ledger.Pending != guestReservation || current.Ledger.Guests != 1
+                        || current.Ledger.ReservedSeconds != 30)
+                        throw new InvalidOperationException("Guest reservation acknowledgement differs.");
+                    _ = current.Ledger.DispatchAllowance(limits, guestReservation.OperationId, DateTime.UtcNow.Ticks);
+                    byte[] guestBytes = FixtureGuestReport(guestReservation);
+                    var guestOutcome = ObserveFixtureGuest(claim, guestReservation, guestBytes)
+                        ?? throw new InvalidOperationException("Fixture guest observation missing.");
+                    owner.StoreOrderGuestReport(guestOutcome, guestReservation, guestBytes);
+                    Reject(() => owner.StoreOrderGuestReport(guestOutcome, guestReservation, guestBytes));
+                    current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeGuestOutcome(guestOutcome), 6);
+                    if (current.Ledger.Pending is not null || current.Ledger.LatestGuestOutcome != guestOutcome
+                        || current.Ledger.Guests != 1 || current.Ledger.ReservedSeconds != 30
+                        || current.S01 is not null || current.ArtifactHash is not null)
+                        throw new InvalidOperationException("Guest outcome became accepted step or refunded budget.");
+                    owner.ValidateOrderJournalFiles();
+                    Console.WriteLine("BRIDGE_GUEST");
+                    Console.Out.Flush();
+                    await Task.Delay(Timeout.InfiniteTimeSpan);
+                    return 1;
+                }
                 var reserved = ProposeModel(current.Ledger, "S01", 30, DateTime.UtcNow.Ticks);
                 current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(reserved), 2);
                 if (current.Ledger.Pending != reserved || current.Ledger.Models != 1
@@ -477,6 +535,36 @@ internal static class PersistenceBridgeProbe
                 Console.Out.Flush();
                 await Task.Delay(Timeout.InfiniteTimeSpan);
                 return 1;
+            }
+
+            if (mode == "bridge-guest-resume")
+            {
+                var recoveredGuest = current.Ledger.LatestGuestOutcome
+                    ?? throw new InvalidOperationException("Guest outcome missing after replay.");
+                if (current.Stage != 6 || current.Ledger.Pending is not null || current.Ledger.Guests != 1
+                    || current.Ledger.Models != 0 || current.Ledger.ReservedSeconds != 30
+                    || current.S01 is not null || current.S02 is not null || current.ArtifactHash is not null)
+                    throw new InvalidOperationException("Guest outcome changed acceptance or budget.");
+                VerifyFixtureGuest(owner, claim, recoveredGuest);
+                string guestPath = database + ".guest-report-1";
+                byte[] originalGuest = owner.RequireOrderGuestReport(recoveredGuest, recoveredGuest.Reservation);
+                File.WriteAllBytes(guestPath, [.. originalGuest, 0x20]);
+                try { Reject(() => VerifyFixtureGuest(owner, claim, recoveredGuest)); }
+                finally { File.WriteAllBytes(guestPath, originalGuest); }
+                File.Move(guestPath, guestPath + ".saved");
+                try { Reject(() => VerifyFixtureGuest(owner, claim, recoveredGuest)); }
+                finally { File.Move(guestPath + ".saved", guestPath); }
+                Reject(() => owner.RequireOrderGuestReport(recoveredGuest,
+                    recoveredGuest.Reservation with { ReservedSeconds = 31 }));
+                Reject(() => owner.RequireOrderGuestReport(recoveredGuest with { ArchiveHash = new string('C', 64) },
+                    recoveredGuest.Reservation));
+                Reject(() => owner.StoreOrderGuestReport(recoveredGuest, recoveredGuest.Reservation, originalGuest));
+                Reject(() => current.Ledger.CompleteGuest(recoveredGuest));
+                VerifyFixtureGuest(owner, claim, recoveredGuest);
+                guard.RequireObserved();
+                Console.WriteLine("BRIDGE_PHASE: protected guest report revalidated; no step accepted.");
+                Console.WriteLine("BRIDGE_GUEST_RECOVERED");
+                return 0;
             }
 
             if (mode == "bridge-blocked")
@@ -828,6 +916,9 @@ internal static class PersistenceBridgeProbe
                         VerifyFixtureOutcome(owner, claim, observed ?? throw new InvalidOperationException("Outcome missing."));
                     }
                 }
+                if (command.Event.StartsWith("guest-outcome-v1:", StringComparison.Ordinal))
+                    VerifyFixtureGuest(owner, claim, next.Ledger.LatestGuestOutcome
+                        ?? throw new InvalidOperationException("Guest outcome missing."));
                 IActorRef reply = Sender;
                 Persist(command.Event, _ =>
                 {
@@ -863,8 +954,10 @@ internal static class PersistenceBridgeProbe
                             DevelopmentOrderOperationLedger.DecodeBudgetExtension(evt))
                     };
                 var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
-                VerifyFixtureAssignment(claim, archive, reservation);
-                if (reservation.Step != (previous.Stage == 1 ? "S01" : "S02") || reservation.Kind != "model")
+                if (reservation.Kind == "model")
+                    VerifyFixtureAssignment(claim, archive, reservation);
+                if (reservation.Step != (previous.Stage == 1 ? "S01" : "S02")
+                    || (reservation.Kind != "model" && !(previous.Stage == 1 && reservation.Kind == "guest")))
                     throw new InvalidOperationException("Unexpected synthetic step operation.");
                 return previous with
                 {
@@ -874,6 +967,16 @@ internal static class PersistenceBridgeProbe
             }
             if (previous.Stage is 2 or 4)
             {
+                if (evt.StartsWith("guest-outcome-v1:", StringComparison.Ordinal))
+                {
+                    if (previous.Stage != 2 || previous.Ledger.Pending is not { Kind: "guest" })
+                        throw new InvalidOperationException("Unexpected fixture guest outcome.");
+                    return previous with
+                    {
+                        Stage = 6,
+                        Ledger = previous.Ledger.CompleteGuest(DevelopmentOrderOperationLedger.DecodeGuestOutcome(evt))
+                    };
+                }
                 if (evt.StartsWith("candidate-v1:", StringComparison.Ordinal))
                     return previous with
                     {

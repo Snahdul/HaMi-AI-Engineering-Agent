@@ -249,7 +249,8 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             new[] { journalPath, journalPath + "-journal", journalPath + "-wal", journalPath + "-shm",
                 ArtifactPath("S01"), ArtifactPath("S02") }.Any(RegularFileExists)
             || Enumerable.Range(1, OrderCandidateCheckpoint.MaxSequence)
-                .Any(sequence => RegularFileExists(CandidatePath(sequence)) || RegularFileExists(OperationEvidencePath(sequence)));
+                .Any(sequence => RegularFileExists(CandidatePath(sequence)) || RegularFileExists(OperationEvidencePath(sequence))
+                    || RegularFileExists(GuestReportPath(sequence)));
 
         // Fixed, host-owned path; only the same lease that made the claim
         // can initialize an empty file. Never recreate a missing journal.
@@ -409,6 +410,57 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             var evidence = OrderStorageJson.Decode<OrderOperationEvidence>(bytes, OrderOperationEvidence.MaxBytes);
             evidence.ValidateCompletion(claim, reservation, completion);
             return evidence;
+        }
+
+        private string GuestReportPath(int sequence)
+        {
+            OrderCheck.Require(sequence is >= 1 and <= OrderCandidateCheckpoint.MaxSequence, "ORDER_GUEST_REPORT_SEQUENCE");
+            return journalPath + ".guest-report-" + sequence.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private string BoundGuestReportPath(OrderGuestOutcome outcome, OrderOperationReservation reservation)
+        {
+            RequireOrderStorage();
+            DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            outcome.Validate(claim.ArchiveHash, reservation);
+            string prefix = claim.JobId + ":";
+            string id = reservation.OperationId;
+            if (!id.StartsWith(prefix, StringComparison.Ordinal)
+                || !int.TryParse(id.AsSpan(prefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out int sequence)
+                || sequence is < 1 or > OrderCandidateCheckpoint.MaxSequence
+                || id != prefix + sequence.ToString(CultureInfo.InvariantCulture))
+                throw new InvalidOperationException("ORDER_GUEST_REPORT_SEQUENCE");
+            return GuestReportPath(sequence);
+        }
+
+        private static void ValidateGuestReportBytes(OrderGuestOutcome outcome, byte[] bytes)
+        {
+            OrderCheck.Require(DevelopmentOrderGuestReconciliation.IsSuccessfulReport(outcome.RunId, bytes)
+                && DevelopmentJobState.Hash(bytes) == outcome.ReportHash, "ORDER_GUEST_REPORT_BYTES");
+        }
+
+        // Only successful, independently observed reports are retained by
+        // this slice. Exact original bytes; no normalization or overwrite.
+        // This storage API is not an independent absence observation.
+        internal void StoreOrderGuestReport(OrderGuestOutcome outcome, OrderOperationReservation reservation, byte[] bytes)
+        {
+            string path = BoundGuestReportPath(outcome, reservation);
+            ValidateGuestReportBytes(outcome, bytes);
+            if (RegularFileExists(path))
+                throw new InvalidOperationException("Order guest report already exists.");
+            WriteNew(path, bytes);
+            _ = RequireOrderGuestReport(outcome, reservation);
+        }
+
+        internal byte[] RequireOrderGuestReport(OrderGuestOutcome outcome, OrderOperationReservation reservation)
+        {
+            string path = BoundGuestReportPath(outcome, reservation);
+            if (!RegularFileExists(path))
+                throw new InvalidOperationException("Order guest report missing.");
+            validatePrivateEntry!(path, false);
+            byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(path, DevelopmentOrderGuestReconciliation.MaxReportBytes);
+            ValidateGuestReportBytes(outcome, bytes);
+            return bytes;
         }
 
         private void RequireOrderStorage()
