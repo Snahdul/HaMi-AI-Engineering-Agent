@@ -13,7 +13,9 @@
     <InternalsVisibleTo Include="HaMi.Agentic.JobState.Probe" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Corvus.Text.Json.Validator" Version="5.8.12" />
+    <!-- Consume the runtime validator, not its optional repository-wide optimization analyzers. -->
+    <PackageReference Include="Corvus.Text.Json" Version="5.8.12" ExcludeAssets="analyzers" />
+    <PackageReference Include="Corvus.Text.Json.Validator" Version="5.8.12" ExcludeAssets="analyzers" />
     <PackageReference Include="YamlDotNet" Version="18.1.0" />
     <PackageReference Include="System.CommandLine" Version="3.0.0" />
     <PackageReference Include="Akka.Hosting" Version="1.5.74" />
