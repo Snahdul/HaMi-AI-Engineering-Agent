@@ -247,7 +247,9 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
 
         private bool JournalFilesExist() =>
             new[] { journalPath, journalPath + "-journal", journalPath + "-wal", journalPath + "-shm",
-                ArtifactPath("S01"), ArtifactPath("S02") }.Any(RegularFileExists);
+                ArtifactPath("S01"), ArtifactPath("S02") }.Any(RegularFileExists)
+            || Enumerable.Range(1, OrderCandidateCheckpoint.MaxSequence)
+                .Any(sequence => RegularFileExists(CandidatePath(sequence)));
 
         // Fixed, host-owned path; only the same lease that made the claim
         // can initialize an empty file. Never recreate a missing journal.
@@ -326,6 +328,40 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             validatePrivateEntry!(path, false);
             byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(path, 64 * 1024);
             OrderCheck.Require(DevelopmentJobState.Hash(bytes) == hash, "ORDER_ARTIFACT_HASH");
+            return bytes;
+        }
+
+        private string CandidatePath(int sequence)
+        {
+            OrderCheck.Require(sequence is >= 1 and <= OrderCandidateCheckpoint.MaxSequence, "ORDER_CANDIDATE_SEQUENCE");
+            return journalPath + ".candidate-" + sequence.ToString(CultureInfo.InvariantCulture);
+        }
+
+        // Host supplies only an extracted, policy-approved source candidate.
+        // The journal descriptor is committed after exclusive durable write
+        // and exact readback. A file without its event is not a checkpoint.
+        internal void StoreOrderCandidate(OrderCandidateCheckpoint candidate, byte[] bytes)
+        {
+            RequireOrderStorage();
+            DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            string path = CandidatePath(candidate.ValidateBinding(claim));
+            candidate.ValidateBytes(bytes);
+            if (RegularFileExists(path))
+                throw new InvalidOperationException("Order candidate already exists.");
+            WriteNew(path, bytes);
+            _ = RequireOrderCandidate(candidate);
+        }
+
+        internal byte[] RequireOrderCandidate(OrderCandidateCheckpoint candidate)
+        {
+            RequireOrderStorage();
+            DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            string path = CandidatePath(candidate.ValidateBinding(claim));
+            if (!RegularFileExists(path))
+                throw new InvalidOperationException("Order candidate missing.");
+            validatePrivateEntry!(path, false);
+            byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(path, OrderCandidateCheckpoint.MaxBytes);
+            candidate.ValidateBytes(bytes);
             return bytes;
         }
 

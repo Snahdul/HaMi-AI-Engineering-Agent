@@ -31,7 +31,8 @@ internal sealed record DevelopmentOrderOperationLedger(
     long StartedUtcTicks = 0, long LastUtcTicks = 0, string? LastOutcome = null,
     string? LastEvidenceHash = null, OrderOperationLimits? CurrentLimits = null,
     string? ArchiveHash = null, string? PolicyHash = null, int FinalReserveSeconds = 0,
-    int BudgetRevision = 0, OrderBudgetExhausted? BudgetStop = null, string ExtensionHashes = "")
+    int BudgetRevision = 0, OrderBudgetExhausted? BudgetStop = null, string ExtensionHashes = "",
+    OrderCandidateCheckpoint? LatestCandidate = null)
 {
     internal int Models => S01Models + S02Models;
     internal int Guests => S01Guests + S02Guests + FinalGuests;
@@ -191,6 +192,19 @@ internal sealed record DevelopmentOrderOperationLedger(
         return denial is null ? extended : extended with { BudgetStop = new(1, request, denial) };
     }
 
+    // Descriptor only; the host verifies exact private bytes before append
+    // and before any reuse after replay. A candidate never settles Pending.
+    internal DevelopmentOrderOperationLedger Checkpoint(DevelopmentOrderClaim claim, OrderCandidateCheckpoint candidate)
+    {
+        int sequence = candidate.ValidateBinding(claim);
+        OrderCheck.Require(ArchiveHash == claim.ArchiveHash && Pending is { Kind: "model" }
+            && Pending.Step == candidate.Step && Pending.OperationId == candidate.OperationId
+            && sequence == Sequence && LatestCandidate?.OperationId != candidate.OperationId,
+            "ORDER_CANDIDATE_PENDING");
+        RequireObservation(candidate.ObservedUtcTicks);
+        return this with { LatestCandidate = candidate, LastUtcTicks = candidate.ObservedUtcTicks };
+    }
+
     // This is only the fold of an already established outcome. A hash alone
     // is not evidence: caller must verify the actual bytes and provenance
     // before persisting this event. A known failure is also a spent operation.
@@ -248,6 +262,12 @@ internal sealed record DevelopmentOrderOperationLedger(
 
     internal static OrderBudgetExtensionApproved DecodeBudgetExtension(string evt) =>
         OrderStorageJson.Decode<OrderBudgetExtensionApproved>(EventBytes(evt, "budget-extension-v1:"), EventMaxBytes);
+
+    internal static string EncodeCandidate(OrderCandidateCheckpoint candidate) =>
+        "candidate-v1:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(candidate, EventMaxBytes));
+
+    internal static OrderCandidateCheckpoint DecodeCandidate(string evt) =>
+        OrderStorageJson.Decode<OrderCandidateCheckpoint>(EventBytes(evt, "candidate-v1:"), EventMaxBytes);
 
     private static byte[] EventBytes(string evt, string prefix)
     {

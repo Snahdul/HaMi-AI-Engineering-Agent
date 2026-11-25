@@ -25,6 +25,8 @@ internal static class PersistenceBridgeProbe
     private static readonly TimeSpan Deadline = TimeSpan.FromSeconds(45);
     private static readonly byte[] AcceptedBytes = Encoding.UTF8.GetBytes("synthetic accepted S01");
     private static readonly string AcceptedHash = DevelopmentJobState.Hash(AcceptedBytes);
+    private static readonly byte[] PartialBytes = Encoding.UTF8.GetBytes("internal static class PartialCalculator {");
+    private static readonly string PartialHash = DevelopmentJobState.Hash(PartialBytes);
 
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
         Func<string, string, Task> expectOwnership)
@@ -71,6 +73,14 @@ internal static class PersistenceBridgeProbe
                 {
                     _ = owner.RequireArchivedOrder();
                     string journal = owner.RequireOrderJournal();
+                    if (unknown)
+                    {
+                        // The child has journaled the descriptor; the reentry
+                        // child must independently recover and validate it.
+                        string partial = journal + ".candidate-1";
+                        if (!File.ReadAllBytes(partial).SequenceEqual(PartialBytes))
+                            throw new InvalidOperationException("Partial candidate not retained.");
+                    }
                     Reject(() => owner.CreateOrderJournal());
                     Reject(() => store.Acquire(Issue).Dispose());
                     if (!unknown && !File.Exists(journal + "-journal"))
@@ -119,6 +129,7 @@ internal static class PersistenceBridgeProbe
                         throw new InvalidOperationException("Bridge reentry failed: " + result + await errors);
 
                     if (unknown ? File.Exists(artifact) || File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.s02"))
+                        || !File.ReadAllBytes(Path.Combine(root, $"issue-{Issue}.order.db.candidate-1")).SequenceEqual(PartialBytes)
                         : !File.ReadAllBytes(artifact).SequenceEqual(AcceptedBytes)
                         || !File.ReadAllBytes(Path.Combine(root, $"issue-{Issue}.order.db.s02")).SequenceEqual(AcceptedBytes))
                         throw new InvalidOperationException("Bridge external effect observation differs.");
@@ -143,6 +154,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
         Console.WriteLine("PASS: original execution window survives process kill and reentry.");
         Console.WriteLine("PASS: journaled budget stop survives process kill; synthetic extension preserves accepted artifacts and charges.");
+        Console.WriteLine("PASS: unaccepted source checkpoint survives process kill; pending model remains blocked.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -301,6 +313,16 @@ internal static class PersistenceBridgeProbe
                 Console.WriteLine("BRIDGE_PHASE: operation reserved.");
                 if (mode == "bridge-unknown")
                 {
+                    var candidate = new OrderCandidateCheckpoint(1, claim.ArchiveHash, reserved.OperationId,
+                        "S01", DevelopmentAgentContract.PairFirst, claim.Binding.CalculatorBaselineHash,
+                        claim.Binding.CalculatorBaselineHash, PartialBytes.Length, PartialHash, "Partial", DateTime.UtcNow.Ticks);
+                    owner.StoreOrderCandidate(candidate, PartialBytes);
+                    _ = owner.RequireOrderCandidate(candidate);
+                    current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCandidate(candidate), 2);
+                    if (current.Ledger.LatestCandidate != candidate || current.Ledger.Pending != reserved
+                        || current.Ledger.ReservedSeconds != 30 || File.Exists(artifact))
+                        throw new InvalidOperationException("Candidate advanced unknown operation.");
+                    Reject(() => owner.StoreOrderCandidate(candidate, PartialBytes));
                     Console.WriteLine("BRIDGE_RESERVED");
                 }
                 else
@@ -347,6 +369,24 @@ internal static class PersistenceBridgeProbe
                     || current.Ledger.Models != 1 || current.Ledger.Guests != 0
                     || current.Ledger.ReservedSeconds != 30)
                     throw new InvalidOperationException("Unknown operation did not recover as reserved.");
+                var candidate = current.Ledger.LatestCandidate
+                    ?? throw new InvalidOperationException("Candidate checkpoint missing after replay.");
+                if (candidate.Quality != "Partial" || candidate.OperationId != pending.OperationId
+                    || candidate.ArtifactHash != PartialHash || !owner.RequireOrderCandidate(candidate).SequenceEqual(PartialBytes))
+                    throw new InvalidOperationException("Candidate replay differs.");
+                string partial = database + ".candidate-1";
+                // Disposable fixture fault injection; runtime never repairs or
+                // overwrites a referenced candidate.
+                File.WriteAllBytes(partial, [.. PartialBytes, 0x20]);
+                try { Reject(() => owner.RequireOrderCandidate(candidate)); }
+                finally { File.WriteAllBytes(partial, PartialBytes); }
+                File.Move(partial, partial + ".saved");
+                try { Reject(() => owner.RequireOrderCandidate(candidate)); }
+                finally { File.Move(partial + ".saved", partial); }
+                Reject(() => owner.RequireOrderCandidate(candidate with { SourcePath = "../Other.cs" }));
+                Reject(() => owner.StoreOrderCandidate(candidate, PartialBytes));
+                _ = owner.RequireOrderCandidate(candidate);
+                Console.WriteLine("BRIDGE_PHASE: unaccepted candidate retained; unknown model still pending.");
                 // Do not retry or release the reservation: outcome is unknown.
                 Reject(() => current.Ledger.Reserve(claim.JobId, limits,
                     current.Ledger.Propose(claim.JobId, "S01", "model", 30, DateTime.UtcNow.Ticks)));
@@ -621,6 +661,11 @@ internal static class PersistenceBridgeProbe
             }
             if (previous.Stage is 2 or 4)
             {
+                if (evt.StartsWith("candidate-v1:", StringComparison.Ordinal))
+                    return previous with
+                    {
+                        Ledger = previous.Ledger.Checkpoint(claim, DevelopmentOrderOperationLedger.DecodeCandidate(evt))
+                    };
                 var completion = DevelopmentOrderOperationLedger.DecodeCompletion(evt);
                 if (completion.Outcome != "succeeded" || completion.EvidenceHash != AcceptedHash)
                     throw new InvalidOperationException("Synthetic evidence mismatch.");

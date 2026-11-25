@@ -142,6 +142,31 @@ internal static class DevelopmentOrderOperationLedgerTests
         if (tooLate.BudgetStop is null)
             throw new InvalidOperationException("Expired extension created new time window.");
         Console.WriteLine("PASS: hard budget stop, final time reserve and cumulative approved-extension reducer.");
+
+        var claim = DevelopmentOrderClaim.Create(job, approval.Binding, hash);
+        var candidate = new OrderCandidateCheckpoint(1, hash, reserve.OperationId, "S01",
+            DevelopmentAgentContract.PairFirst, claim.Binding.CalculatorBaselineHash,
+            claim.Binding.CalculatorBaselineHash, 1, hash, "Partial", now);
+        var candidateEvent = DevelopmentOrderOperationLedger.EncodeCandidate(candidate);
+        var checkpointed = reserved.Checkpoint(claim, DevelopmentOrderOperationLedger.DecodeCandidate(candidateEvent));
+        if (checkpointed.LatestCandidate != candidate || checkpointed.Pending != reserve
+            || checkpointed.Models != 1 || checkpointed.ReservedSeconds != 30
+            || checkpointed.LastOutcome is not null)
+            throw new InvalidOperationException("Candidate checkpoint settled or refunded operation.");
+        Reject(() => checkpointed.Checkpoint(claim, candidate));
+        Reject(() => initial.Checkpoint(claim, candidate));
+        Reject(() => reserved.Checkpoint(claim, candidate with { Quality = "Accepted" }));
+        Reject(() => reserved.Checkpoint(claim, candidate with { Quality = "Validated" }));
+        Reject(() => reserved.Checkpoint(claim, candidate with { SourcePath = "../Other.cs" }));
+        Reject(() => reserved.Checkpoint(claim, candidate with { InputHash = new string('B', 64) }));
+        Reject(() => reserved.Checkpoint(claim, candidate with { OperationId = job + ":2" }));
+        Reject(() => reserved.Checkpoint(claim, candidate with { OperationId = job + ":01" }));
+        Reject(() => reserved.Checkpoint(claim, candidate with { ObservedUtcTicks = now - 1 }));
+        Reject(() => checkpointed.Reserve(job, limits, checkpointed.Propose(job, "S01", "model", 1, now)));
+        Reject(() => DevelopmentOrderOperationLedger.DecodeCandidate(candidateEvent + " "));
+        if (checkpointed.Complete(completion with { Outcome = "failed" }).LatestCandidate != candidate)
+            throw new InvalidOperationException("Known failure discarded candidate.");
+        Console.WriteLine("PASS: source candidate checkpoint is immutable, unaccepted and does not settle pending operation.");
     }
 
     private static void Reject(Action action)
