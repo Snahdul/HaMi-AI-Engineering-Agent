@@ -110,6 +110,9 @@ internal static class PersistenceBridgeProbe
                 {
                     await resumed.WaitForExitAsync().WaitAsync(Deadline);
                     string result = await output;
+                    foreach (string line in result.Split('\n').Where(line =>
+                        line.StartsWith("BRIDGE_PHASE:", StringComparison.Ordinal)))
+                        Console.WriteLine("[bridge reentry] " + line.TrimEnd());
                     if (resumed.ExitCode != 0 || !result.Split('\n').Any(line =>
                         line.Trim() == (unknown ? "BRIDGE_BLOCKED" : "BRIDGE_COMPLETED")))
                         throw new InvalidOperationException("Bridge reentry failed: " + result + await errors);

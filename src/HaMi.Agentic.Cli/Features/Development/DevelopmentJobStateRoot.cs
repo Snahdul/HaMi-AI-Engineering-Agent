@@ -40,6 +40,12 @@ internal static class DevelopmentJobStateRoot
                     if (!OperatingSystem.IsWindows())
                         throw new PlatformNotSupportedException("Windows recovery storage requires Windows.");
                     ValidateWindowsEntry(path, directory, user);
+                },
+                path =>
+                {
+                    if (!OperatingSystem.IsWindows())
+                        throw new PlatformNotSupportedException();
+                    ValidateWindowsNativeRollback(path, user);
                 });
         }
 
@@ -92,6 +98,12 @@ internal static class DevelopmentJobStateRoot
                     if (!OperatingSystem.IsWindows())
                         throw new PlatformNotSupportedException();
                     ValidateWindowsEntry(path, directory, user);
+                },
+                path =>
+                {
+                    if (!OperatingSystem.IsWindows())
+                        throw new PlatformNotSupportedException();
+                    ValidateWindowsNativeRollback(path, user);
                 });
         }
         if (OperatingSystem.IsLinux())
@@ -220,22 +232,35 @@ internal static class DevelopmentJobStateRoot
     }
 
     [SupportedOSPlatform("windows")]
-    private static void ValidateWindowsEntry(string path, bool directory, SecurityIdentifier user)
+    private static void ValidateWindowsNativeRollback(string path, SecurityIdentifier user)
+    {
+        // Only the host-derived SQLite DELETE-mode rollback sidecar may
+        // have the native token's Administrators default owner.
+        if (!path.EndsWith(".order.db-journal", StringComparison.Ordinal))
+            throw new InvalidOperationException("Native rollback path rejected.");
+        ValidateWindowsEntry(path, false, user, nativeRollback: true);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void ValidateWindowsEntry(string path, bool directory, SecurityIdentifier user,
+        bool nativeRollback = false)
     {
         RejectLink(path, directory);
         FileSystemSecurity security = directory
             ? new DirectoryInfo(path).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access)
             : new FileInfo(path).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access);
-        ValidateWindowsSecurity(security, directory, user);
+        ValidateWindowsSecurity(security, directory, user, nativeRollback);
     }
 
     [SupportedOSPlatform("windows")]
-    internal static void ValidateWindowsSecurity(FileSystemSecurity security, bool directory, SecurityIdentifier user)
+    internal static void ValidateWindowsSecurity(FileSystemSecurity security, bool directory, SecurityIdentifier user,
+        bool nativeRollback = false)
     {
         string kind = directory ? "directory" : "file";
         if (security.GetOwner(typeof(SecurityIdentifier)) is not SecurityIdentifier owner)
             throw new InvalidOperationException("Recovery Windows " + kind + " owner missing.");
-        if (!owner.Equals(user))
+        if (!owner.Equals(user)
+            && !(nativeRollback && !directory && owner.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid)))
         {
             // Report only the fixed classification, never account names or SIDs.
             string classification = owner.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid)
@@ -395,6 +420,29 @@ internal static class DevelopmentJobStateRoot
             (path, directory) => ValidateWindowsEntry(path, directory, user));
         using (store.Acquire(62)) { }
         ValidateWindowsEntry(Path.Combine(root, "issue-62.lock"), false, user);
+        // Synthetic descriptors exercise the exact owner exception without
+        // requiring privilege changes or rewriting real recovery files.
+        var native = new FileSecurity();
+        var administrators = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        native.SetOwner(administrators);
+        native.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl, AccessControlType.Allow));
+        native.AddAccessRule(new FileSystemAccessRule(administrators, FileSystemRights.FullControl, AccessControlType.Allow));
+        ValidateWindowsSecurity(native, false, user, nativeRollback: true);
+        Reject(() => ValidateWindowsSecurity(native, false, user));
+        Reject(() => ValidateWindowsSecurity(native, true, user, nativeRollback: true));
+        native.SetOwner(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null));
+        Reject(() => ValidateWindowsSecurity(native, false, user, nativeRollback: true));
+        native.SetOwner(administrators);
+        native.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+            FileSystemRights.Read, AccessControlType.Allow));
+        Reject(() => ValidateWindowsSecurity(native, false, user, nativeRollback: true));
+        var missingAccount = new FileSecurity();
+        missingAccount.SetOwner(administrators);
+        missingAccount.AddAccessRule(new FileSystemAccessRule(administrators,
+            FileSystemRights.FullControl, AccessControlType.Allow));
+        Reject(() => ValidateWindowsSecurity(missingAccount, false, user, nativeRollback: true));
+        Console.WriteLine("PASS: native Windows rollback owner exception limited to trusted private sidecars.");
         var info = new DirectoryInfo(root);
         DirectorySecurity security = info.GetAccessControl();
         security.AddAccessRule(new FileSystemAccessRule(

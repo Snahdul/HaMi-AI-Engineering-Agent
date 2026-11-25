@@ -7,7 +7,8 @@ namespace HaMi.Agentic.Cli.Features.Development;
 // this constructor as a CLI path override. Production root/ACL policy is a
 // separate integration gate; this primitive is also used by offline fixtures.
 internal sealed class DevelopmentJobStateStore(string trustedRoot,
-    Action<string, bool>? validatePrivateEntry = null)
+    Action<string, bool>? validatePrivateEntry = null,
+    Action<string>? validateNativeRollback = null)
 {
     private readonly string root = ValidateRoot(trustedRoot);
 
@@ -24,7 +25,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         // One canonical repository is supported by this vertical slice.
         // The key deliberately excludes checkout, base, task and results path.
         string prefix = Path.Combine(root, "issue-" + issue.ToString(CultureInfo.InvariantCulture));
-        return new Lease(prefix, issue, validatePrivateEntry, orderClaim);
+        return new Lease(prefix, issue, validatePrivateEntry, orderClaim, validateNativeRollback);
     }
 
     // Locate the original issue through the private registry only. The
@@ -144,10 +145,13 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         private byte[]? legacyClaim;
         private readonly int issue;
         private readonly Action<string, bool>? validatePrivateEntry;
+        private readonly Action<string>? validateNativeRollback;
         private bool disposed;
 
-        internal Lease(string prefix, int issue, Action<string, bool>? validatePrivateEntry, bool orderClaim)
+        internal Lease(string prefix, int issue, Action<string, bool>? validatePrivateEntry, bool orderClaim,
+            Action<string>? validateNativeRollback)
         {
+            this.validateNativeRollback = validateNativeRollback;
             this.orderClaim = orderClaim;
             this.issue = issue;
             this.validatePrivateEntry = validatePrivateEntry;
@@ -283,8 +287,14 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             // are outside the reviewed mode and must not be silently removed.
             if (RegularFileExists(journalPath + "-wal") || RegularFileExists(journalPath + "-shm"))
                 throw new InvalidOperationException("Unexpected order journal mode.");
-            if (RegularFileExists(journalPath + "-journal"))
-                validatePrivateEntry!(journalPath + "-journal", false);
+            string rollback = journalPath + "-journal";
+            if (RegularFileExists(rollback))
+            {
+                if (validateNativeRollback is not null)
+                    validateNativeRollback(rollback);
+                else
+                    validatePrivateEntry!(rollback, false);
+            }
         }
 
         private string ArtifactPath(string step) => step switch
