@@ -18,12 +18,20 @@ internal sealed record OrderOperationReservation(
 internal sealed record OrderOperationCompletion(
     int Version, string OperationId, string EvidenceHash, string Outcome, long ObservedUtcTicks);
 
+internal sealed record OrderBudgetExhausted(int Version, OrderOperationReservation Request, string Reason);
+
+internal sealed record OrderBudgetExtensionApproved(
+    int Version, string JobId, string ArchiveHash, int PreviousRevision,
+    OrderOperationLimits Limits, string ApprovalHash, long ObservedUtcTicks);
+
 internal sealed record DevelopmentOrderOperationLedger(
     int Sequence = 0, int S01Models = 0, int S01Guests = 0,
     int S02Models = 0, int S02Guests = 0, int FinalGuests = 0,
     int ReservedSeconds = 0, OrderOperationReservation? Pending = null,
     long StartedUtcTicks = 0, long LastUtcTicks = 0, string? LastOutcome = null,
-    string? LastEvidenceHash = null)
+    string? LastEvidenceHash = null, OrderOperationLimits? CurrentLimits = null,
+    string? ArchiveHash = null, string? PolicyHash = null, int FinalReserveSeconds = 0,
+    int BudgetRevision = 0, OrderBudgetExhausted? BudgetStop = null, string ExtensionHashes = "")
 {
     internal int Models => S01Models + S02Models;
     internal int Guests => S01Guests + S02Guests + FinalGuests;
@@ -32,14 +40,23 @@ internal sealed record DevelopmentOrderOperationLedger(
     // A reservation is identified by the immutable job and next journaled
     // sequence, not by a transient actor address or regenerated GUID.
     internal DevelopmentOrderOperationLedger Start(OrderExecutionStart start, string archiveHash,
-        OrderOperationLimits limits)
+        OrderOperationLimits limits, DevelopmentOrderBudgetPolicy policy)
     {
+        policy.ValidateEffective(limits);
         OrderCheck.Require(StartedUtcTicks == 0 && Sequence == 0 && start.Version == 1
             && OrderCheck.Hash(archiveHash) && start.ArchiveHash == archiveHash
             && limits.Seconds > 0 && start.UtcTicks > 0
             && start.UtcTicks <= DateTime.MaxValue.Ticks - (long)limits.Seconds * TimeSpan.TicksPerSecond,
             "ORDER_EXECUTION_START");
-        return this with { StartedUtcTicks = start.UtcTicks, LastUtcTicks = start.UtcTicks };
+        return this with
+        {
+            StartedUtcTicks = start.UtcTicks,
+            LastUtcTicks = start.UtcTicks,
+            CurrentLimits = limits,
+            ArchiveHash = archiveHash,
+            PolicyHash = policy.Sha256,
+            FinalReserveSeconds = policy.FinalVerificationSeconds
+        };
     }
 
     internal OrderOperationReservation Propose(string jobId, string step, string kind, int seconds, long now) =>
@@ -55,6 +72,7 @@ internal sealed record DevelopmentOrderOperationLedger(
     internal TimeSpan Remaining(OrderOperationLimits limits, long now)
     {
         RequireObservation(now);
+        OrderCheck.Require(limits == CurrentLimits, "ORDER_BUDGET_REVISION");
         long end = checked(StartedUtcTicks + (long)limits.Seconds * TimeSpan.TicksPerSecond);
         return TimeSpan.FromTicks(Math.Max(0, end - now));
     }
@@ -69,41 +87,57 @@ internal sealed record DevelopmentOrderOperationLedger(
         TimeSpan remaining = Remaining(limits, now);
         long elapsed = now - reservation.ObservedUtcTicks;
         long operationTicks = (long)reservation.ReservedSeconds * TimeSpan.TicksPerSecond - elapsed;
-        long allowed = Math.Min(remaining.Ticks, operationTicks);
+        long closingTicks = reservation.Step == "FINAL" ? 0 : (long)FinalReserveSeconds * TimeSpan.TicksPerSecond;
+        long allowed = Math.Min(remaining.Ticks - closingTicks, operationTicks);
         OrderCheck.Require(allowed > 0, "ORDER_OPERATION_DISPATCH_EXPIRED");
         return TimeSpan.FromTicks(allowed);
+    }
+
+    // A malformed proposal is not budget exhaustion. Only a well-formed,
+    // eligible operation that cannot fit may produce the durable stop event.
+    internal string? BudgetDenial(string jobId, OrderOperationLimits limits, OrderOperationReservation reservation)
+    {
+        OrderCheck.Require(Pending is null, "ORDER_OPERATION_PENDING");
+        OrderCheck.Require(reservation.Version == 2
+            && reservation.OperationId == OperationId(jobId, checked(Sequence + 1))
+            && reservation.ReservedSeconds > 0, "ORDER_OPERATION_ID");
+        OrderCheck.Require((reservation.Step, reservation.Kind) is
+            ("S01" or "S02", "model" or "guest") or ("FINAL", "guest"), "ORDER_OPERATION_KIND");
+        OrderCheck.Require(FinalGuests == 0 || reservation.Step == "FINAL", "ORDER_FINAL_ALREADY_RESERVED");
+        int closing = reservation.Step == "FINAL" ? 0 : FinalReserveSeconds;
+        OrderCheck.Require(reservation.Step != "FINAL" || reservation.ReservedSeconds >= FinalReserveSeconds,
+            "ORDER_FINAL_TIME_TOO_SHORT");
+        TimeSpan remaining = Remaining(limits, reservation.ObservedUtcTicks);
+        long requested = (long)reservation.ReservedSeconds + closing;
+        if (requested > limits.Seconds - ReservedSeconds
+            || requested * TimeSpan.TicksPerSecond > remaining.Ticks)
+            return "time";
+        bool fits = (reservation.Step, reservation.Kind) switch
+        {
+            ("S01", "model") => S01Models < limits.S01Models && Models < limits.Models,
+            ("S02", "model") => S02Models < limits.S02Models && Models < limits.Models,
+            ("S01", "guest") => S01Guests < limits.S01Guests && Guests < limits.Guests - (limits.FinalGuests - FinalGuests),
+            ("S02", "guest") => S02Guests < limits.S02Guests && Guests < limits.Guests - (limits.FinalGuests - FinalGuests),
+            ("FINAL", "guest") => FinalGuests < limits.FinalGuests && Guests < limits.Guests,
+            _ => false
+        };
+        return fits ? null : "count";
     }
 
     internal DevelopmentOrderOperationLedger Reserve(string jobId, OrderOperationLimits limits,
         OrderOperationReservation reservation)
     {
-        OrderCheck.Require(Pending is null, "ORDER_OPERATION_PENDING");
-        OrderCheck.Require(reservation.Version == 2
-            && reservation.OperationId == OperationId(jobId, checked(Sequence + 1)),
-            "ORDER_OPERATION_ID");
-        OrderCheck.Require(reservation.ReservedSeconds > 0
-            && reservation.ReservedSeconds <= limits.Seconds - ReservedSeconds
-            && TimeSpan.FromSeconds(reservation.ReservedSeconds) <= Remaining(limits, reservation.ObservedUtcTicks),
-            "ORDER_OPERATION_TIME");
+        OrderCheck.Require(BudgetStop is null, "ORDER_BUDGET_EXHAUSTED");
+        OrderCheck.Require(BudgetDenial(jobId, limits, reservation) is null, "ORDER_OPERATION_BUDGET");
         var charged = (reservation.Step, reservation.Kind) switch
         {
-            ("S01", "model") when S01Models < limits.S01Models && Models < limits.Models =>
-                this with { S01Models = S01Models + 1 },
-            ("S01", "guest") when S01Guests < limits.S01Guests && Guests < limits.Guests =>
-                this with { S01Guests = S01Guests + 1 },
-            ("S02", "model") when S02Models < limits.S02Models && Models < limits.Models =>
-                this with { S02Models = S02Models + 1 },
-            ("S02", "guest") when S02Guests < limits.S02Guests && Guests < limits.Guests =>
-                this with { S02Guests = S02Guests + 1 },
-            ("FINAL", "guest") when FinalGuests < limits.FinalGuests && Guests < limits.Guests =>
-                this with { FinalGuests = FinalGuests + 1 },
-            _ => throw new InvalidOperationException("ORDER_OPERATION_BUDGET_OR_KIND")
+            ("S01", "model") => this with { S01Models = S01Models + 1 },
+            ("S01", "guest") => this with { S01Guests = S01Guests + 1 },
+            ("S02", "model") => this with { S02Models = S02Models + 1 },
+            ("S02", "guest") => this with { S02Guests = S02Guests + 1 },
+            ("FINAL", "guest") => this with { FinalGuests = FinalGuests + 1 },
+            _ => throw new InvalidOperationException("ORDER_OPERATION_KIND")
         };
-        // Retain the final verification allowance even if the supplied
-        // limits are inconsistent. No regular operation may consume it.
-        OrderCheck.Require(reservation.Step == "FINAL"
-            || charged.Guests <= limits.Guests - (limits.FinalGuests - FinalGuests),
-            "ORDER_OPERATION_FINAL_ALLOWANCE");
         return charged with
         {
             Sequence = checked(Sequence + 1),
@@ -111,6 +145,50 @@ internal sealed record DevelopmentOrderOperationLedger(
             Pending = reservation,
             LastUtcTicks = reservation.ObservedUtcTicks
         };
+    }
+
+    internal DevelopmentOrderOperationLedger StopForBudget(string jobId, OrderOperationLimits limits,
+        OrderBudgetExhausted stop)
+    {
+        OrderCheck.Require(BudgetStop is null && stop.Version == 1
+            && stop.Reason is "time" or "count"
+            && BudgetDenial(jobId, limits, stop.Request) == stop.Reason, "ORDER_BUDGET_STOP");
+        return this with { BudgetStop = stop, LastUtcTicks = stop.Request.ObservedUtcTicks };
+    }
+
+    // Only folds an already authenticated human decision. The host must
+    // independently check its exact evidence and current stricter ceilings.
+    // The archived policy is the historical ceiling for deterministic replay.
+    internal DevelopmentOrderOperationLedger Extend(string jobId, DevelopmentOrderBudgetPolicy policy,
+        OrderBudgetExtensionApproved extension)
+    {
+        var stop = BudgetStop ?? throw new InvalidOperationException("ORDER_BUDGET_NOT_STOPPED");
+        var old = CurrentLimits ?? throw new InvalidOperationException("ORDER_BUDGET_REVISION");
+        OrderCheck.Require(Pending is null && extension.Version == 1 && extension.JobId == jobId
+            && stop.Request.OperationId == OperationId(jobId, checked(Sequence + 1))
+            && extension.ArchiveHash == ArchiveHash && policy.Sha256 == PolicyHash
+            && extension.PreviousRevision == BudgetRevision && OrderCheck.Hash(extension.ApprovalHash)
+            && !ExtensionHashes.Contains(extension.ApprovalHash, StringComparison.Ordinal), "ORDER_BUDGET_EXTENSION_BINDING");
+        RequireObservation(extension.ObservedUtcTicks);
+        var next = extension.Limits;
+        policy.ValidateEffective(next);
+        OrderCheck.Require(next != old && next.Models >= old.Models && next.Guests >= old.Guests
+            && next.Seconds >= old.Seconds && next.S01Models >= old.S01Models && next.S01Guests >= old.S01Guests
+            && next.S02Models >= old.S02Models && next.S02Guests >= old.S02Guests
+            && next.FinalGuests >= old.FinalGuests
+            && StartedUtcTicks <= DateTime.MaxValue.Ticks - (long)next.Seconds * TimeSpan.TicksPerSecond,
+            "ORDER_BUDGET_EXTENSION_LIMITS");
+        var extended = this with
+        {
+            CurrentLimits = next,
+            BudgetRevision = checked(BudgetRevision + 1),
+            LastUtcTicks = extension.ObservedUtcTicks,
+            BudgetStop = null,
+            ExtensionHashes = ExtensionHashes + extension.ApprovalHash + ";"
+        };
+        var request = stop.Request with { ObservedUtcTicks = extension.ObservedUtcTicks };
+        string? denial = extended.BudgetDenial(jobId, next, request);
+        return denial is null ? extended : extended with { BudgetStop = new(1, request, denial) };
     }
 
     // This is only the fold of an already established outcome. A hash alone
@@ -158,6 +236,18 @@ internal sealed record DevelopmentOrderOperationLedger(
 
     internal static OrderOperationCompletion DecodeCompletion(string evt) =>
         OrderStorageJson.Decode<OrderOperationCompletion>(EventBytes(evt, "complete-v2:"), EventMaxBytes);
+
+    internal static string EncodeBudgetStop(OrderBudgetExhausted stop) =>
+        "budget-stop-v1:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(stop, EventMaxBytes));
+
+    internal static OrderBudgetExhausted DecodeBudgetStop(string evt) =>
+        OrderStorageJson.Decode<OrderBudgetExhausted>(EventBytes(evt, "budget-stop-v1:"), EventMaxBytes);
+
+    internal static string EncodeBudgetExtension(OrderBudgetExtensionApproved extension) =>
+        "budget-extension-v1:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(extension, EventMaxBytes));
+
+    internal static OrderBudgetExtensionApproved DecodeBudgetExtension(string evt) =>
+        OrderStorageJson.Decode<OrderBudgetExtensionApproved>(EventBytes(evt, "budget-extension-v1:"), EventMaxBytes);
 
     private static byte[] EventBytes(string evt, string prefix)
     {

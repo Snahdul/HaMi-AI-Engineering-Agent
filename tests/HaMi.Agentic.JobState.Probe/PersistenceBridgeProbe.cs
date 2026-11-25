@@ -142,6 +142,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
         Console.WriteLine("PASS: original execution window survives process kill and reentry.");
+        Console.WriteLine("PASS: journaled budget stop survives process kill; synthetic extension preserves accepted artifacts and charges.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -177,7 +178,10 @@ internal static class PersistenceBridgeProbe
             ?? throw new InvalidOperationException("Budget policy fixture missing.");
         using var buffer = new MemoryStream();
         policyStream.CopyTo(buffer);
-        var policy = DevelopmentOrderBudgetPolicy.Parse(buffer.ToArray());
+        var policyNode = JsonNode.Parse(Encoding.UTF8.GetString(buffer.ToArray()))!.AsObject();
+        // Only this disposable process fixture uses a tighter initial window.
+        policyNode["defaults"]!["elapsedSeconds"] = 120;
+        var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(policyNode.ToJsonString()));
         byte[] body = Encoding.UTF8.GetBytes("\x60\x60\x60hami-order-json\n" + plan + "\x60\x60\x60\n");
         DevelopmentOrder order = DevelopmentOrder.ParseIssueBody(body);
         var document = order.Document;
@@ -202,6 +206,7 @@ internal static class PersistenceBridgeProbe
         DevelopmentOrderArchive archive = owner.RequireArchivedOrder();
         // Recovery uses only the validated immutable archive, not today's policy.
         OrderOperationLimits limits = archive.EffectiveLimits;
+        var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
         bool first = mode is "bridge-hold" or "bridge-unknown";
         string database = first ? owner.CreateOrderJournal() : owner.RequireOrderJournal();
 
@@ -247,7 +252,7 @@ internal static class PersistenceBridgeProbe
         try
         {
             var system = host.Services.GetRequiredService<ActorSystem>();
-            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, limits)), "bridge");
+            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, limits, policy)), "bridge");
             async Task<BridgeState> ReadAsync()
             {
                 Task<BridgeState> read = actor.Ask<BridgeState>(new ReadState(), Deadline);
@@ -301,8 +306,13 @@ internal static class PersistenceBridgeProbe
                 else
                 {
                     string hash = owner.StoreOrderArtifact("S01", AcceptedBytes);
-                    await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(
+                    current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(
                         new(2, reserved.OperationId, hash, "succeeded", DateTime.UtcNow.Ticks)), 3);
+                    var denied = current.Ledger.Propose(claim.JobId, "S02", "model", 100, DateTime.UtcNow.Ticks);
+                    current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeBudgetStop(new(1, denied, "time")), 3);
+                    if (current.Ledger.BudgetStop?.Request != denied || current.Ledger.Sequence != 1
+                        || File.Exists(database + ".s02"))
+                        throw new InvalidOperationException("Budget stop changed consumed work.");
                     Console.WriteLine("BRIDGE_PHASE: S01 persisted; opening rollback transaction.");
                     // Hold an actual native rollback transaction across process kill.
                     // This table is a test fixture; Akka event rows are untouched.
@@ -350,12 +360,29 @@ internal static class PersistenceBridgeProbe
                 || current.Ledger.ReservedSeconds != 30)
                 throw new InvalidOperationException("Accepted step not recovered.");
             byte[] input = owner.RequireOrderArtifact("S01", AcceptedHash);
+            if (current.Ledger.BudgetStop is not { Reason: "time", Request: { Step: "S02", ReservedSeconds: 100 } }
+                || current.Ledger.BudgetRevision != 0 || current.Ledger.CurrentLimits != limits)
+                throw new InvalidOperationException("Persistent budget exhaustion missing.");
+            Reject(() => current.Ledger.Reserve(claim.JobId, limits,
+                current.Ledger.Propose(claim.JobId, "S02", "model", 1, DateTime.UtcNow.Ticks)));
+            // Synthetic trusted decision only; no real approval transport.
+            string decision = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic extension fixture"));
+            var extension = new OrderBudgetExtensionApproved(1, claim.JobId, claim.ArchiveHash, 0,
+                policy.Maximums, decision, DateTime.UtcNow.Ticks);
+            long originalStart = current.Ledger.StartedUtcTicks;
+            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeBudgetExtension(extension), 3);
+            if (current.Ledger.BudgetStop is not null || current.Ledger.BudgetRevision != 1
+                || current.Ledger.StartedUtcTicks != originalStart || current.Ledger.Models != 1
+                || current.Ledger.ReservedSeconds != 30)
+                throw new InvalidOperationException("Budget extension reset prior work.");
+            limits = current.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
+            Console.WriteLine("BRIDGE_PHASE: recovered budget stop; synthetic approved extension persisted.");
 
             // Reusing S01 is not a second write to its exclusive effect file.
-            var next = current.Ledger.Propose(claim.JobId, "S02", "model", 30, DateTime.UtcNow.Ticks);
+            var next = current.Ledger.Propose(claim.JobId, "S02", "model", 100, DateTime.UtcNow.Ticks);
             current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(next), 4);
             if (current.Ledger.Pending != next || current.Ledger.Models != 2
-                || current.Ledger.ReservedSeconds != 60)
+                || current.Ledger.ReservedSeconds != 130)
                 throw new InvalidOperationException("S02 reservation acknowledgement differs.");
             _ = current.Ledger.DispatchAllowance(limits, next.OperationId, DateTime.UtcNow.Ticks);
             string outputHash = owner.StoreOrderArtifact("S02", input);
@@ -363,7 +390,7 @@ internal static class PersistenceBridgeProbe
             current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(
                 new(2, next.OperationId, outputHash, "succeeded", DateTime.UtcNow.Ticks)), 5);
             if (current.Ledger.Pending is not null || current.Ledger.Models != 2
-                || current.Ledger.ReservedSeconds != 60)
+                || current.Ledger.ReservedSeconds != 130)
                 throw new InvalidOperationException("S02 completion refunded budget.");
             guard.RequireObserved();
             Console.WriteLine("BRIDGE_COMPLETED");
@@ -530,14 +557,16 @@ internal static class PersistenceBridgeProbe
         private bool recovered;
         private readonly DevelopmentOrderClaim claim;
         private readonly OrderOperationLimits limits;
+        private readonly DevelopmentOrderBudgetPolicy policy;
 
         public override string PersistenceId { get; }
 
-        public BridgeActor(DevelopmentOrderClaim claim, OrderOperationLimits limits)
+        public BridgeActor(DevelopmentOrderClaim claim, OrderOperationLimits limits, DevelopmentOrderBudgetPolicy policy)
         {
             PersistenceId = claim.PersistenceId;
             this.claim = claim;
             this.limits = limits;
+            this.policy = policy;
             // Recovery only folds acknowledged journal events; no effects.
             Recover<string>(evt => state = Next(state, evt));
             Recover<RecoveryCompleted>(_ => recovered = true);
@@ -563,17 +592,31 @@ internal static class PersistenceBridgeProbe
                 return previous with
                 {
                     Stage = 1,
-                    Ledger = previous.Ledger.Start(DevelopmentOrderOperationLedger.DecodeStart(evt), claim.ArchiveHash, limits)
+                    Ledger = previous.Ledger.Start(DevelopmentOrderOperationLedger.DecodeStart(evt), claim.ArchiveHash, limits, policy)
                 };
             if (previous.Stage is 1 or 3)
             {
+                var effective = previous.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
+                if (evt.StartsWith("budget-stop-v1:", StringComparison.Ordinal))
+                {
+                    var stop = DevelopmentOrderOperationLedger.DecodeBudgetStop(evt);
+                    if (stop.Request.Step != (previous.Stage == 1 ? "S01" : "S02") || stop.Request.Kind != "model")
+                        throw new InvalidOperationException("Unexpected synthetic stop.");
+                    return previous with { Ledger = previous.Ledger.StopForBudget(claim.JobId, effective, stop) };
+                }
+                if (evt.StartsWith("budget-extension-v1:", StringComparison.Ordinal))
+                    return previous with
+                    {
+                        Ledger = previous.Ledger.Extend(claim.JobId, policy,
+                            DevelopmentOrderOperationLedger.DecodeBudgetExtension(evt))
+                    };
                 var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
                 if (reservation.Step != (previous.Stage == 1 ? "S01" : "S02") || reservation.Kind != "model")
                     throw new InvalidOperationException("Unexpected synthetic step operation.");
                 return previous with
                 {
                     Stage = previous.Stage + 1,
-                    Ledger = previous.Ledger.Reserve(claim.JobId, limits, reservation)
+                    Ledger = previous.Ledger.Reserve(claim.JobId, effective, reservation)
                 };
             }
             if (previous.Stage is 2 or 4)

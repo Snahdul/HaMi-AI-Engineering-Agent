@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "finalVerificationSeconds": 30,
   "defaults": {
     "modelCalls": 4,
     "sandboxRuns": 5,

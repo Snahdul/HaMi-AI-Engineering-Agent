@@ -5,15 +5,16 @@ internal static class DevelopmentOrderOperationLedgerTests
     internal static void SelfTest(DevelopmentOrderApproval approval)
     {
         var limits = approval.EffectiveLimits;
+        var policy = approval.BudgetPolicy;
         string job = new('a', 32);
         string hash = new('A', 64);
         long now = new DateTime(2026, 11, 25, 10, 0, 0, DateTimeKind.Utc).Ticks;
         var start = new OrderExecutionStart(1, hash, now);
         var initial = new DevelopmentOrderOperationLedger().Start(
-            DevelopmentOrderOperationLedger.DecodeStart(DevelopmentOrderOperationLedger.EncodeStart(start)), hash, limits);
+            DevelopmentOrderOperationLedger.DecodeStart(DevelopmentOrderOperationLedger.EncodeStart(start)), hash, limits, policy);
         var reserve = initial.Propose(job, "S01", "model", 30, now);
         Reject(() => new DevelopmentOrderOperationLedger().Reserve(job, limits, reserve));
-        Reject(() => initial.Start(start, hash, limits));
+        Reject(() => initial.Start(start, hash, limits, policy));
         Reject(() => initial.Reserve(job, limits, reserve with { ObservedUtcTicks = now - 1 }));
         string evt = DevelopmentOrderOperationLedger.EncodeReservation(reserve);
         var reserved = initial.Reserve(job, limits, DevelopmentOrderOperationLedger.DecodeReservation(evt));
@@ -63,7 +64,7 @@ internal static class DevelopmentOrderOperationLedgerTests
 
         DevelopmentOrderOperationLedger Spend(DevelopmentOrderOperationLedger state, string step, string kind)
         {
-            var request = state.Propose(job, step, kind, 1, now);
+            var request = state.Propose(job, step, kind, step == "FINAL" ? policy.FinalVerificationSeconds : 1, now);
             return state.Reserve(job, limits, request).Complete(new(2, request.OperationId, hash, "succeeded", now));
         }
 
@@ -86,7 +87,7 @@ internal static class DevelopmentOrderOperationLedgerTests
         Reject(() => Spend(guestLimit, "FINAL", "guest"));
         if (guestLimit.Guests != limits.Guests)
             throw new InvalidOperationException("Final allowance changed.");
-        var time = initial.Reserve(job, limits, reserve with { ReservedSeconds = limits.Seconds })
+        var time = initial.Reserve(job, limits, reserve with { ReservedSeconds = limits.Seconds - policy.FinalVerificationSeconds })
             .Complete(completion);
         Reject(() => Spend(time, "S01", "model"));
         Reject(() => initial.Reserve(job, limits with { Models = 0 }, reserve));
@@ -99,6 +100,48 @@ internal static class DevelopmentOrderOperationLedgerTests
             throw new InvalidOperationException("Operation budget replay differs.");
         Console.WriteLine("PASS: versioned operation reservation, stable identity, monotone budgets and unknown-effect block.");
         Console.WriteLine("PASS: persistent execution window, known failure retry, expiry and clock rollback rejection.");
+
+        var small = limits with { Seconds = 120 };
+        var smallStart = new DevelopmentOrderOperationLedger().Start(start, hash, small, policy);
+        var first = smallStart.Reserve(job, small, reserve).Complete(completion);
+        var blockedRequest = first.Propose(job, "S02", "model", 100, now);
+        var stop = new OrderBudgetExhausted(1, blockedRequest, "time");
+        if (first.BudgetDenial(job, small, blockedRequest) != "time")
+            throw new InvalidOperationException("Closing time reserve not protected.");
+        Reject(() => first.Reserve(job, small, blockedRequest));
+        Reject(() => first.StopForBudget(job, small, stop with { Reason = "count" }));
+        var stopped = first.StopForBudget(job, small,
+            DevelopmentOrderOperationLedger.DecodeBudgetStop(DevelopmentOrderOperationLedger.EncodeBudgetStop(stop)));
+        Reject(() => stopped.Reserve(job, small, stopped.Propose(job, "S02", "model", 1, now)));
+        Reject(() => stopped.Reserve(job, limits, blockedRequest));
+        Reject(() => smallStart.Reserve(job, small, reserve with { Step = "FINAL", Kind = "guest", ReservedSeconds = 1 }));
+        var extension = new OrderBudgetExtensionApproved(1, job, hash, 0, limits, new string('B', 64), afterTen);
+        Reject(() => first.Extend(job, policy, extension));
+        Reject(() => reserved.Extend(job, policy, extension));
+        Reject(() => stopped.Extend(job, policy, extension with { JobId = new string('b', 32) }));
+        Reject(() => stopped.Extend(job, policy, extension with { ArchiveHash = new string('C', 64) }));
+        Reject(() => stopped.Extend(job, policy, extension with { PreviousRevision = 1 }));
+        Reject(() => stopped.Extend(job, policy, extension with { Limits = limits with { Seconds = limits.Seconds + 1 } }));
+        Reject(() => stopped.Extend(job, policy, extension with { Limits = small }));
+        var stillStopped = stopped.Extend(job, policy, extension with { Limits = small with { Seconds = 130 } });
+        if (stillStopped.BudgetStop is null || stillStopped.BudgetRevision != 1)
+            throw new InvalidOperationException("Insufficient extension resumed work.");
+        Reject(() => stillStopped.Extend(job, policy, extension with { PreviousRevision = 1 }));
+        var resumed = stopped.Extend(job, policy,
+            DevelopmentOrderOperationLedger.DecodeBudgetExtension(DevelopmentOrderOperationLedger.EncodeBudgetExtension(extension)));
+        if (resumed.BudgetStop is not null || resumed.BudgetRevision != 1 || resumed.CurrentLimits != limits
+            || resumed.StartedUtcTicks != now || resumed.Sequence != 1 || resumed.Models != 1
+            || resumed.ReservedSeconds != 30 || resumed.LastEvidenceHash != hash)
+            throw new InvalidOperationException("Budget extension reset prior work.");
+        Reject(() => resumed.Extend(job, policy, extension));
+        var next = resumed.Propose(job, "S02", "model", 100, afterTen);
+        var resumedReservation = resumed.Reserve(job, limits, next);
+        if (resumedReservation.ReservedSeconds != 130 || resumedReservation.Sequence != 2)
+            throw new InvalidOperationException("Continuation did not preserve charge.");
+        var tooLate = stopped.Extend(job, policy, extension with { ObservedUtcTicks = expired });
+        if (tooLate.BudgetStop is null)
+            throw new InvalidOperationException("Expired extension created new time window.");
+        Console.WriteLine("PASS: hard budget stop, final time reserve and cumulative approved-extension reducer.");
     }
 
     private static void Reject(Action action)

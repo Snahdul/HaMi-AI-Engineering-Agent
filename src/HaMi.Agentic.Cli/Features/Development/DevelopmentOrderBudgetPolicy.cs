@@ -9,8 +9,9 @@ internal sealed class DevelopmentOrderBudgetPolicy
 {
     private static readonly UTF8Encoding Utf8 = new(false, true);
     private DevelopmentOrderBudgetPolicy(string source, string hash,
-        OrderOperationLimits defaults, OrderOperationLimits maximums)
+        OrderOperationLimits defaults, OrderOperationLimits maximums, int finalVerificationSeconds)
     {
+        FinalVerificationSeconds = finalVerificationSeconds;
         Source = source;
         Sha256 = hash;
         Defaults = defaults;
@@ -21,6 +22,7 @@ internal sealed class DevelopmentOrderBudgetPolicy
     internal string Sha256 { get; }
     internal OrderOperationLimits Defaults { get; }
     internal OrderOperationLimits Maximums { get; }
+    internal int FinalVerificationSeconds { get; }
 
     internal static DevelopmentOrderBudgetPolicy Parse(byte[] bytes)
     {
@@ -29,7 +31,7 @@ internal sealed class DevelopmentOrderBudgetPolicy
         string source = Utf8.GetString(bytes);
         using var json = JsonDocument.Parse(source, new JsonDocumentOptions { MaxDepth = 4 });
         var root = json.RootElement;
-        RequireFields(root, ["version", "defaults", "maximums"]);
+        RequireFields(root, ["version", "defaults", "maximums", "finalVerificationSeconds"]);
         OrderCheck.Require(Read(root, "version") == 1, "ORDER_BUDGET_POLICY_VERSION");
         OrderOperationLimits defaults = ReadLimits(root.GetProperty("defaults"));
         OrderOperationLimits maximums = ReadLimits(root.GetProperty("maximums"));
@@ -37,7 +39,9 @@ internal sealed class DevelopmentOrderBudgetPolicy
         // This slice cannot expand it by loading a different budget policy.
         Validate(maximums, new(4, 5, 1800, 2, 2, 2, 2, 1));
         Validate(defaults, maximums);
-        return new(source, DevelopmentJobState.Hash(bytes), defaults, maximums);
+        int finalSeconds = Read(root, "finalVerificationSeconds");
+        OrderCheck.Require(finalSeconds > 0 && finalSeconds <= defaults.Seconds, "ORDER_BUDGET_FINAL_TIME");
+        return new(source, DevelopmentJobState.Hash(bytes), defaults, maximums, finalSeconds);
     }
 
     internal OrderOperationLimits Resolve(DevelopmentOrder order)
@@ -54,8 +58,14 @@ internal sealed class DevelopmentOrderBudgetPolicy
             Optional(steps[1], "maxModelCalls", Defaults.S02Models),
             Optional(steps[1], "maxSandboxRuns", Defaults.S02Guests),
             Optional(root.GetProperty("finalVerification"), "maxSandboxRuns", Defaults.FinalGuests));
-        Validate(result, Maximums);
+        ValidateEffective(result);
         return result;
+    }
+
+    internal void ValidateEffective(OrderOperationLimits value)
+    {
+        Validate(value, Maximums);
+        OrderCheck.Require(value.Seconds >= FinalVerificationSeconds, "ORDER_BUDGET_FINAL_TIME");
     }
 
     private static int Optional(JsonElement element, string name, int fallback) =>
