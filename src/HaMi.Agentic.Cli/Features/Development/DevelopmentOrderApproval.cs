@@ -15,11 +15,14 @@ internal sealed record OrderCommentObservation(
 
 internal sealed record OrderReviewedProfile(
     string Repository, long OwnerId, string OwnerLogin, string BaseCommit,
-    string ContractHash, string ScopeHash, string PolicyHash);
+    string ContractHash, string ScopeHash, string PolicyHash,
+    string CalculatorBaselineHash, string FormatterBaselineHash);
 
 internal sealed record OrderBinding(
     string Repository, long IssueId, int IssueNumber, int Revision, string OrderHash,
-    string BaseCommit, long ApprovalCommentId, string ContractHash, string ScopeHash, string PolicyHash);
+    string BaseCommit, long ApprovalCommentId, long OwnerId, string OwnerLogin,
+    string ContractHash, string ScopeHash, string PolicyHash,
+    string CalculatorBaselineHash, string FormatterBaselineHash);
 
 internal sealed class DevelopmentOrderApproval
 {
@@ -46,7 +49,9 @@ internal sealed class DevelopmentOrderApproval
             && issue.AuthorId == profile.OwnerId && issue.AuthorLogin == profile.OwnerLogin
             && issue.IsOpen && issue.IsActive && issue.ObservedAt != default, "ORDER_ISSUE_AUTHORITY");
         OrderCheck.Require(OrderCheck.Commit(profile.BaseCommit) && OrderCheck.Hash(profile.ContractHash)
-            && OrderCheck.Hash(profile.ScopeHash) && OrderCheck.Hash(profile.PolicyHash), "ORDER_REVIEW_PROFILE");
+            && OrderCheck.Hash(profile.ScopeHash) && OrderCheck.Hash(profile.PolicyHash)
+            && OrderCheck.Hash(profile.CalculatorBaselineHash) && OrderCheck.Hash(profile.FormatterBaselineHash),
+            "ORDER_REVIEW_PROFILE");
 
         DevelopmentOrder order = DevelopmentOrder.ParseIssueBody(issue.Body);
         JsonElement plan = order.Document;
@@ -65,7 +70,10 @@ internal sealed class DevelopmentOrderApproval
                 && OrderCheck.Text(comment.AuthorLogin, 100) && comment.Body.Length <= 64 * 1024
                 && comment.CreatedAt != default && comment.CreatedAt <= comment.UpdatedAt
                 && comment.UpdatedAt <= issue.ObservedAt, "ORDER_COMMENT_OBSERVATION");
-            if (comment.AuthorId != profile.OwnerId || comment.AuthorLogin != profile.OwnerLogin)
+            bool ownerId = comment.AuthorId == profile.OwnerId;
+            bool ownerLogin = comment.AuthorLogin == profile.OwnerLogin;
+            OrderCheck.Require(ownerId == ownerLogin, "ORDER_COMMENT_AUTHORITY");
+            if (!ownerId)
                 continue;
             if (!comment.Body.Contains("HaMi-Order-Approval", StringComparison.Ordinal)
                 && !comment.Body.Contains("HaMi-Order-Revoke", StringComparison.Ordinal))
@@ -92,8 +100,9 @@ internal sealed class DevelopmentOrderApproval
         OrderCheck.Require(latest.Body == expected, "ORDER_APPROVAL_STALE_OR_REVOKED");
 
         return new DevelopmentOrderApproval(order, new OrderBinding(issue.Repository, issue.IssueId, issue.Number,
-            revision, order.Sha256, profile.BaseCommit, latest.Id, profile.ContractHash, profile.ScopeHash,
-            profile.PolicyHash), issue.Title, issue.ObservedAt, latest);
+            revision, order.Sha256, profile.BaseCommit, latest.Id, profile.OwnerId, profile.OwnerLogin,
+            profile.ContractHash, profile.ScopeHash, profile.PolicyHash, profile.CalculatorBaselineHash,
+            profile.FormatterBaselineHash), issue.Title, issue.ObservedAt, latest);
     }
 }
 

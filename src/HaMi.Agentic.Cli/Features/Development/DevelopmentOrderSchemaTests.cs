@@ -76,6 +76,20 @@ internal static class DevelopmentOrderSchemaTests
         Check(anyOf, "true", false);
         Check(anyOf, "\"invalid\"", false);
 
+        // Selected Draft 2020-12 required.json examples, transcribed as
+        // test inputs and expected outcomes (not the full upstream suite):
+        // https://github.com/json-schema-org/JSON-Schema-Test-Suite/blob/main/tests/draft2020-12/required.json
+        const string upstreamRequired = """{"properties":{"foo":{},"bar":{}},"required":["foo"]}""";
+        Check(upstreamRequired, """{"foo":1}""", true);
+        Check(upstreamRequired, """{"bar":1}""", false);
+        Check(upstreamRequired, "[]", true);
+        Check(upstreamRequired, "\"\"", true);
+        Check(upstreamRequired, "12", true);
+        Check(upstreamRequired, "null", true);
+        Check(upstreamRequired, "true", true);
+        Check("""{"properties":{"foo":{}}}""", "{}", true);
+        Check("""{"properties":{"foo":{}},"required":[]}""", "{}", true);
+
         RejectSchema("""{"type":"object","$ref":"remote"}""");
         RejectSchema("""{"anyOf":[{"type":"null"},{"unknown":true}]}""");
         RejectSchema("""{"properties":{"a":{"minLength":-1}}}""");

@@ -31,11 +31,13 @@ internal sealed record OrderCriterion(string Id, bool Passed);
 
 internal sealed record OrderStepEvidence(
     Guid EvidenceId, OrderAttempt Attempt, OrderVerifier Verifier, OrderArtifact[] Inputs,
-    OrderArtifact[] Outputs, OrderCriterion[] Criteria, bool CleanupSucceeded, bool Accepted, DateTimeOffset ObservedAt);
+    OrderArtifact[] Outputs, string[] ChangedPaths, OrderArtifact[] PreservedOutputs,
+    OrderCriterion[] Criteria, bool CleanupSucceeded, bool Accepted, DateTimeOffset ObservedAt);
 
 internal sealed record OrderFinalEvidence(
     Guid EvidenceId, OrderBinding Binding, Guid JobId, OrderVerifier Verifier, OrderArtifact[] Inputs,
-    OrderCriterion[] Criteria, bool CleanupSucceeded, bool Accepted, DateTimeOffset ObservedAt);
+    string[] ChangedPaths, bool BaselineUnchanged, OrderCriterion[] Criteria,
+    bool CleanupSucceeded, bool Accepted, DateTimeOffset ObservedAt);
 
 internal sealed record OrderKnowledge(
     string Id, OrderAttempt Attempt, Guid EvidenceId, string Claim, string Rationale, string Relevance);
@@ -84,15 +86,17 @@ internal static class DevelopmentOrderHandover
                 && artifacts.TryAdd(artifact.Id, artifact), "ORDER_ARTIFACT_BYTES");
         }
 
-        OrderArtifact Baseline(string id)
+        OrderArtifact Baseline(string id, string expectedHash)
         {
             OrderCheck.Require(artifacts.TryGetValue(id, out OrderArtifact? value) && value.JobId is null
-                && value.StepId is null && value.AttemptId is null, "ORDER_BASELINE_ARTIFACT");
+                && value.StepId is null && value.AttemptId is null && value.Sha256 == expectedHash,
+                "ORDER_BASELINE_ARTIFACT");
             return artifacts[id];
         }
 
-        OrderArtifact calculator = Baseline("calculator-baseline");
-        OrderArtifact formatter = Baseline("formatter-baseline");
+        OrderArtifact calculator = Baseline("calculator-baseline", approval.Binding.CalculatorBaselineHash);
+        OrderArtifact formatter = Baseline("formatter-baseline", approval.Binding.FormatterBaselineHash);
+        string[] assignedAgents = assignments.Select(a => a.Agent.Id).ToArray();
         var attemptIds = new HashSet<Guid>();
         var evidenceIds = new HashSet<Guid>();
         var accepted = new List<OrderArtifact>();
@@ -109,8 +113,7 @@ internal static class DevelopmentOrderHandover
             OrderCheck.Require(attempt.Binding == approval.Binding && attempt.JobId == jobId
                 && attempt.StepId == stepId && attempt.AssignmentRevision == assignment.Revision
                 && attempt.Agent == assignment.Agent && attempt.AttemptId != Guid.Empty && attemptIds.Add(attempt.AttemptId)
-                && attempt.AttemptNumber >= 1 && attempt.AttemptNumber <= step.GetProperty("maxModelCalls").GetInt32()
-                && attempt.AttemptNumber <= step.GetProperty("maxSandboxRuns").GetInt32()
+                && assignment.Revision == 1 && attempt.AttemptNumber == 1
                 && result.Status == "candidate" && OrderCheck.Text(result.Findings, 1500), "ORDER_ATTEMPT_BINDING");
 
             OrderArtifact[] inputs = i == 0 ? [calculator] : [formatter, accepted[0]];
@@ -127,7 +130,11 @@ internal static class DevelopmentOrderHandover
                 && proof.Outputs.SequenceEqual(result.Outputs)
                 && proof.ObservedAt >= last && proof.ObservedAt >= assignment.DecidedAt
                 && proof.CleanupSucceeded && proof.Accepted, "ORDER_STEP_EVIDENCE");
-            ValidateVerifier(step, proof.Verifier, verifiers, [assignment.Agent.Id]);
+            string[] allowedPaths = step.GetProperty("allowedWritePaths").EnumerateArray()
+                .Select(p => p.GetString()!).ToArray();
+            OrderCheck.Require(proof.ChangedPaths.SequenceEqual(allowedPaths)
+                && proof.PreservedOutputs.SequenceEqual(accepted), "ORDER_STEP_SCOPE_EVIDENCE");
+            ValidateVerifier(step, proof.Verifier, verifiers, assignedAgents);
             ValidateCriteria(step, proof.Criteria);
             accepted.Add(output);
             last = proof.ObservedAt;
@@ -138,7 +145,11 @@ internal static class DevelopmentOrderHandover
             && final.EvidenceId != Guid.Empty && evidenceIds.Add(final.EvidenceId)
             && final.Inputs.SequenceEqual(accepted) && final.ObservedAt >= last
             && final.CleanupSucceeded && final.Accepted, "ORDER_FINAL_EVIDENCE");
-        ValidateVerifier(finalPlan, final.Verifier, verifiers, assignments.Select(a => a.Agent.Id).ToArray());
+        OrderCheck.Require(final.BaselineUnchanged && final.ChangedPaths.SequenceEqual(
+            approval.Order.Document.GetProperty("steps").EnumerateArray()
+                .SelectMany(s => s.GetProperty("allowedWritePaths").EnumerateArray().Select(p => p.GetString()!))),
+            "ORDER_FINAL_SCOPE_EVIDENCE");
+        ValidateVerifier(finalPlan, final.Verifier, verifiers, assignedAgents);
         ValidateCriteria(finalPlan, final.Criteria);
 
         var findingIds = new HashSet<string>(StringComparer.Ordinal);

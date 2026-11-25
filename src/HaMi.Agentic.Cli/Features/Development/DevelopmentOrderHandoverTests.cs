@@ -14,7 +14,11 @@ internal static class DevelopmentOrderHandoverTests
         string repository = order.Document.GetProperty("repository").GetString()!;
         string title = order.Document.GetProperty("title").GetString()!;
         int number = order.Document.GetProperty("issueNumber").GetInt32();
-        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", baseCommit, hash, hash, hash);
+        // Expected baseline digests are independent of the supplied artifact store.
+        string baselineOne = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic baseline one"));
+        string baselineTwo = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic baseline two"));
+        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", baseCommit, hash, hash, hash,
+            baselineOne, baselineTwo);
         var comment = new OrderCommentObservation(1, 42, "fixture-owner",
             $"HaMi-Order-Approval: v1 1 {order.Sha256} {baseCommit}", time, time);
         var issue = new OrderIssueObservation(repository, 901, number, title, 42, "fixture-owner",
@@ -46,7 +50,10 @@ internal static class DevelopmentOrderHandoverTests
             "ORDER_OBSERVATION_BINDING");
         Reject(() => Approve(issue with { CompleteHistory = false }), "ORDER_APPROVAL_HISTORY");
         Reject(() => Approve(issue with { Comments = [] }), "ORDER_APPROVAL_AMBIGUOUS");
-        Reject(() => Approve(issue with { Comments = [comment with { AuthorId = 43 }] }), "ORDER_APPROVAL_AMBIGUOUS");
+        Reject(() => Approve(issue with { Comments = [comment with { AuthorId = 43 }] }), "ORDER_COMMENT_AUTHORITY");
+        Reject(() => Approve(issue with { Comments = [comment with { AuthorLogin = "other" }] }), "ORDER_COMMENT_AUTHORITY");
+        Reject(() => Approve(issue with { Comments = [comment with { AuthorId = 43, AuthorLogin = "other" }] }),
+            "ORDER_APPROVAL_AMBIGUOUS");
         Reject(() => Approve(issue with { Comments = [comment with { UpdatedAt = time.AddSeconds(1) }] }), "ORDER_APPROVAL_MARKER");
         Reject(() => Approve(issue with { Comments = [comment with { Body = comment.Body + "\n" }] }), "ORDER_APPROVAL_MARKER");
         Reject(() => Approve(issue with { Comments = [comment, comment with { Id = 2 }] }), "ORDER_APPROVAL_AMBIGUOUS");
@@ -70,8 +77,10 @@ internal static class DevelopmentOrderHandoverTests
         Guid job = new("10000000-0000-0000-0000-000000000001");
         var agent = new OrderAgentIdentity("fixture-agent", "1", hash, "fixture-provider", "fixture-model", hash);
         var catalog = new OrderAgentProfile(agent, true, ["csharp"]);
+        var secondAgent = agent with { Id = "fixture-agent-two" };
+        var secondProfile = new OrderAgentProfile(secondAgent, true, ["csharp"]);
         var a1 = new OrderAssignment(approved.Binding, job, "S01", 1, agent, "Reviewed capability match", time.AddMinutes(2));
-        var a2 = a1 with { StepId = "S02" };
+        var a2 = a1 with { StepId = "S02", Agent = secondAgent };
         OrderAssignment[] assignments = [a1, a2];
         DevelopmentOrderHandover.ValidateAssignment(approved, job, a1, [catalog]);
         Reject(() => DevelopmentOrderHandover.ValidateAssignment(approved, job, a1, [catalog with { Enabled = false }]),
@@ -85,7 +94,7 @@ internal static class DevelopmentOrderHandoverTests
 
         var t1 = new OrderAttempt(approved.Binding, job, "S01", 1,
             new Guid("20000000-0000-0000-0000-000000000001"), 1, agent);
-        var t2 = t1 with { StepId = "S02", AttemptId = new Guid("20000000-0000-0000-0000-000000000002") };
+        var t2 = t1 with { StepId = "S02", Agent = secondAgent, AttemptId = new Guid("20000000-0000-0000-0000-000000000002") };
 
         OrderArtifactObservation Artifact(string id, string content, OrderAttempt? attempt = null)
         {
@@ -108,12 +117,15 @@ internal static class DevelopmentOrderHandoverTests
         var vf = v1 with { Id = "pair-integration" };
         OrderVerifier[] verifiers = [v1, v2, vf];
         var e1 = new OrderStepEvidence(new Guid("30000000-0000-0000-0000-000000000001"), t1, v1,
-            r1.Inputs, r1.Outputs, [new OrderCriterion("C01", true)], true, true, time.AddMinutes(3));
+            r1.Inputs, r1.Outputs, [DevelopmentAgentContract.PairFirst], [],
+            [new OrderCriterion("C01", true)], true, true, time.AddMinutes(3));
         var e2 = new OrderStepEvidence(new Guid("30000000-0000-0000-0000-000000000002"), t2, v2,
-            r2.Inputs, r2.Outputs, [new OrderCriterion("C02", true)], true, true, time.AddMinutes(4));
+            r2.Inputs, r2.Outputs, [DevelopmentAgentContract.PairSecond], [o1.Artifact],
+            [new OrderCriterion("C02", true)], true, true, time.AddMinutes(4));
         OrderStepEvidence[] evidence = [e1, e2];
         var final = new OrderFinalEvidence(new Guid("30000000-0000-0000-0000-000000000003"), approved.Binding,
-            job, vf, [o1.Artifact, o2.Artifact], [new OrderCriterion("C03", true)], true, true, time.AddMinutes(5));
+            job, vf, [o1.Artifact, o2.Artifact], [DevelopmentAgentContract.PairFirst, DevelopmentAgentContract.PairSecond],
+            true, [new OrderCriterion("C03", true)], true, true, time.AddMinutes(5));
         var finding = new OrderKnowledge("finding-1", t1, e1.EvidenceId, "A proposed finding", "Recorded rationale", "S02 context");
         var review = new OrderKnowledgeReview(finding, v1, "verified");
 
@@ -121,7 +133,7 @@ internal static class DevelopmentOrderHandoverTests
             OrderFinalEvidence? ff = null, OrderArtifactObservation[]? ss = null,
             OrderVerifier[]? vv = null, OrderKnowledgeReview[]? kk = null) =>
             DevelopmentOrderHandover.ValidateReference(approved, job, aa ?? assignments, rr ?? results,
-                ee ?? evidence, ff ?? final, [catalog], vv ?? verifiers, ss ?? store, [finding], kk ?? [review]);
+                ee ?? evidence, ff ?? final, [catalog, secondProfile], vv ?? verifiers, ss ?? store, [finding], kk ?? [review]);
 
         Verify();
         Verify(kk: []); // Proposed findings need no assertion of truth.
@@ -139,6 +151,19 @@ internal static class DevelopmentOrderHandoverTests
         Reject(() => Verify(ff: final with { Inputs = [o2.Artifact, o1.Artifact] }), "ORDER_FINAL_EVIDENCE");
         Reject(() => Verify(ff: final with { CleanupSucceeded = false }), "ORDER_FINAL_EVIDENCE");
         Reject(() => Verify(kk: [review with { Contribution = finding with { Claim = "Different claim" } }]), "ORDER_KNOWLEDGE_REVIEW");
+        // Substituting both bytes and descriptor must still fail against the reviewed base.
+        OrderArtifactObservation substituted = Artifact("calculator-baseline", "different but self-consistent baseline");
+        Reject(() => Verify(ss: [substituted, b2, o1, o2], rr: [r1 with { Inputs = [substituted.Artifact] }, r2]),
+            "ORDER_BASELINE_ARTIFACT");
+        OrderVerifier otherParticipant = v1 with { ActorId = secondAgent.Id };
+        Reject(() => Verify(ee: [e1 with { Verifier = otherParticipant }, e2], vv: [otherParticipant, v2, vf]),
+            "ORDER_VERIFIER_INDEPENDENCE");
+        Reject(() => Verify(ee: [e1, e2 with { ChangedPaths = [DevelopmentAgentContract.PairFirst, DevelopmentAgentContract.PairSecond] }]),
+            "ORDER_STEP_SCOPE_EVIDENCE");
+        Reject(() => Verify(ee: [e1, e2 with { PreservedOutputs = [] }]), "ORDER_STEP_SCOPE_EVIDENCE");
+        Reject(() => Verify(ff: final with { BaselineUnchanged = false }), "ORDER_FINAL_SCOPE_EVIDENCE");
+        Reject(() => Verify(ff: final with { ChangedPaths = [DevelopmentAgentContract.PairSecond] }), "ORDER_FINAL_SCOPE_EVIDENCE");
+        Reject(() => Verify(rr: [r1, r2 with { Attempt = t2 with { AttemptNumber = 2 } }]), "ORDER_ATTEMPT_BINDING");
         Console.WriteLine("Development order approval, assignment, synthetic artifact/evidence and knowledge correlation self-test passed.");
     }
 }
