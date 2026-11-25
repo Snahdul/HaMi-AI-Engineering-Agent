@@ -1,5 +1,6 @@
-using System.Diagnostics;
 using System.Data.Common;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Reflection;
 using System.Text;
 using Akka.Actor;
@@ -9,6 +10,7 @@ using Akka.Persistence;
 using Akka.Persistence.Sql.Hosting;
 using HaMi.Agentic.Cli.Features.Development;
 using LinqToDB;
+using LinqToDB.Interceptors;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -51,13 +53,26 @@ internal static class PersistenceBridgeProbe
                         throw new InvalidOperationException("Bridge owner did not terminate abnormally.");
                 }
 
-                string artifact = Path.Combine(root, "s01.bin");
+                string artifact = Path.Combine(root, $"issue-{Issue}.order.db.s01");
                 using (var owner = store.AcquireOrder(Issue))
                 {
                     _ = owner.RequireArchivedOrder();
                     string journal = owner.RequireOrderJournal();
                     Reject(() => owner.CreateOrderJournal());
                     Reject(() => store.Acquire(Issue).Dispose());
+                    if (!unknown && !File.Exists(journal + "-journal"))
+                        throw new InvalidOperationException("Crash did not retain the live rollback sidecar.");
+                    if (!unknown)
+                    {
+                        byte[] original = owner.RequireOrderArtifact("S01", AcceptedHash);
+                        File.WriteAllBytes(artifact, [.. original, 0x20]);
+                        Reject(() => owner.RequireOrderArtifact("S01", AcceptedHash));
+                        File.WriteAllBytes(artifact, original);
+                        File.Move(artifact, artifact + ".saved");
+                        try { Reject(() => owner.RequireOrderArtifact("S01", AcceptedHash)); }
+                        finally { File.Move(artifact + ".saved", artifact); }
+                        Reject(() => owner.StoreOrderArtifact("S01", original));
+                    }
                     // Disposable fault injection only: no recovery path repairs
                     // or recreates missing/empty databases.
                     File.Move(journal, journal + ".saved");
@@ -87,9 +102,9 @@ internal static class PersistenceBridgeProbe
                         line.Trim() == (unknown ? "BRIDGE_BLOCKED" : "BRIDGE_COMPLETED")))
                         throw new InvalidOperationException("Bridge reentry failed: " + result + await errors);
 
-                    if (unknown ? File.Exists(artifact) || File.Exists(Path.Combine(root, "s02.bin"))
+                    if (unknown ? File.Exists(artifact) || File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.s02"))
                         : !File.ReadAllBytes(artifact).SequenceEqual(AcceptedBytes)
-                        || !File.ReadAllBytes(Path.Combine(root, "s02.bin")).SequenceEqual(AcceptedBytes))
+                        || !File.ReadAllBytes(Path.Combine(root, $"issue-{Issue}.order.db.s02")).SequenceEqual(AcceptedBytes))
                         throw new InvalidOperationException("Bridge external effect observation differs.");
                 }
                 finally
@@ -108,6 +123,7 @@ internal static class PersistenceBridgeProbe
         }
 
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
+        Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -156,14 +172,31 @@ internal static class PersistenceBridgeProbe
             Mode = SqliteOpenMode.ReadWrite,
             Pooling = false
         }.ToString();
-        int observedConnections = 0;
+        // The binding is immutable metadata, not a second workflow state.
+        // Validate it before the Akka provider can initialize any tables.
+        using (var binding = new SqliteConnection(connection))
+        {
+            binding.Open();
+            CheckDurability(binding);
+            CheckJournalIdentity(binding, claim, first);
+            if (!first)
+            {
+                using var check = binding.CreateCommand();
+                check.CommandText = "SELECT COUNT(*) FROM hami_crash_probe";
+                if (check.ExecuteScalar() is not long count || count != 0)
+                    throw new InvalidOperationException("Uncommitted fixture transaction survived recovery.");
+                Reject(() => CheckJournalIdentity(binding, claim with { JobId = new string('f', 32) }, false));
+            }
+            using var version = binding.CreateCommand();
+            version.CommandText = "SELECT sqlite_version()";
+            Console.WriteLine("SQLite native version: " + version.ExecuteScalar());
+        }
+
+        var guard = new ProviderConnectionGuard();
         var options = new DataOptions()
             .UseConnectionString(ProviderName.SQLiteMS, connection)
-            .UseAfterConnectionOpened(opened =>
-            {
-                CheckDurability(opened);
-                Interlocked.Increment(ref observedConnections);
-            });
+            .UseAfterConnectionOpened(guard.Configure)
+            .UseInterceptor(guard);
         using IHost host = new HostBuilder()
             .ConfigureServices((_, services) => services.AddAkka("hami-persistence-probe", (builder, provider) =>
                 builder.WithSqlPersistence(options)))
@@ -182,9 +215,8 @@ internal static class PersistenceBridgeProbe
             }
 
             BridgeState current = await ReadAsync();
-            if (Volatile.Read(ref observedConnections) == 0)
-                throw new InvalidOperationException("No actual provider connection was observed.");
-            string artifact = Path.Combine(root, "s01.bin");
+            guard.RequireObserved();
+            string artifact = database + ".s01";
             if (first)
             {
                 if (current.Stage != 0 || File.Exists(artifact))
@@ -197,9 +229,25 @@ internal static class PersistenceBridgeProbe
                 }
                 else
                 {
-                    WriteOnce(artifact, AcceptedBytes);
-                    await AdvanceAsync("s01-accepted:" + AcceptedHash, 3);
+                    string hash = owner.StoreOrderArtifact("S01", AcceptedBytes);
+                    await AdvanceAsync("s01-accepted:" + hash, 3);
+                    // Hold an actual native rollback transaction across process kill.
+                    // This table is a test fixture; Akka event rows are untouched.
+                    using var crashConnection = new SqliteConnection(connection);
+                    crashConnection.Open();
+                    CheckDurability(crashConnection);
+                    using var transaction = crashConnection.BeginTransaction();
+                    using var pending = crashConnection.CreateCommand();
+                    pending.Transaction = transaction;
+                    pending.CommandText = "INSERT INTO hami_crash_probe(value) VALUES (1)";
+                    pending.ExecuteNonQuery();
+                    if (!File.Exists(database + "-journal"))
+                        throw new InvalidOperationException("Live rollback sidecar missing.");
+                    owner.ValidateOrderJournalFiles();
                     Console.WriteLine("BRIDGE_ACCEPTED");
+                    Console.Out.Flush();
+                    await Task.Delay(Timeout.InfiniteTimeSpan);
+                    return 1;
                 }
 
                 owner.ValidateOrderJournalFiles();
@@ -219,14 +267,14 @@ internal static class PersistenceBridgeProbe
 
             if (mode != "bridge-resume" || current.Stage != 3 || current.ArtifactHash != AcceptedHash)
                 throw new InvalidOperationException("Accepted step not recovered.");
-            byte[] input = File.ReadAllBytes(artifact);
-            if (DevelopmentJobState.Hash(input) != current.ArtifactHash)
-                throw new InvalidOperationException("Accepted artifact missing or changed.");
+            byte[] input = owner.RequireOrderArtifact("S01", AcceptedHash);
 
             // Reusing S01 is not a second write to its exclusive effect file.
             await AdvanceAsync("s02-operation-reserved", 4);
-            WriteOnce(Path.Combine(root, "s02.bin"), input);
+            string outputHash = owner.StoreOrderArtifact("S02", input);
+            _ = owner.RequireOrderArtifact("S02", outputHash);
             await AdvanceAsync("s02-accepted", 5);
+            guard.RequireObserved();
             Console.WriteLine("BRIDGE_COMPLETED");
             return 0;
         }
@@ -260,11 +308,54 @@ internal static class PersistenceBridgeProbe
         throw new InvalidOperationException("Invalid journal or claim was accepted.");
     }
 
-    private static void WriteOnce(string path, byte[] bytes)
+    private static void CheckJournalIdentity(SqliteConnection connection, DevelopmentOrderClaim claim, bool first)
     {
-        using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-        stream.Write(bytes);
-        stream.Flush(flushToDisk: true);
+        if (first)
+        {
+            using var initialize = connection.CreateCommand();
+            initialize.CommandText = "CREATE TABLE hami_order_identity (persistence_id TEXT NOT NULL, archive_hash TEXT NOT NULL); "
+                + "CREATE TABLE hami_crash_probe (value INTEGER NOT NULL); "
+                + "INSERT INTO hami_order_identity VALUES ($id, $hash)";
+            initialize.Parameters.AddWithValue("$id", claim.PersistenceId);
+            initialize.Parameters.AddWithValue("$hash", claim.ArchiveHash);
+            initialize.ExecuteNonQuery();
+        }
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT persistence_id, archive_hash FROM hami_order_identity";
+        using var reader = command.ExecuteReader();
+        if (!reader.Read() || reader.GetString(0) != claim.PersistenceId
+            || reader.GetString(1) != claim.ArchiveHash || reader.Read())
+            throw new InvalidOperationException("Journal identity differs from claim.");
+    }
+
+    // Registered in DataOptions so the standard provider's replacement
+    // connection clone retains the interceptor. A command on an unconfigured
+    // connection is a failure, not an implicit fallback to SQLite defaults.
+    private sealed class ProviderConnectionGuard : CommandInterceptor
+    {
+        private readonly ConditionalWeakTable<DbConnection, object> configured = new();
+        private int commands;
+
+        internal void Configure(DbConnection connection)
+        {
+            CheckDurability(connection);
+            _ = configured.GetValue(connection, _ => new object());
+        }
+
+        public override DbCommand CommandInitialized(CommandEventData eventData, DbCommand command)
+        {
+            if (command.Connection is not DbConnection connection
+                || !configured.TryGetValue(connection, out _))
+                throw new InvalidOperationException("Provider used a connection without the durability callback.");
+            Interlocked.Increment(ref commands);
+            return command;
+        }
+
+        internal void RequireObserved()
+        {
+            if (Volatile.Read(ref commands) == 0)
+                throw new InvalidOperationException("No guarded actual provider commands observed.");
+        }
     }
 
     private sealed record ReadState;

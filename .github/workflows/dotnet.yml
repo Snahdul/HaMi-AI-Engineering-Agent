@@ -30,7 +30,10 @@ jobs:
           global-json-file: global.json
 
       - name: Restore CLI and JobState probe dependency graph
-        run: dotnet restore tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj
+        run: dotnet restore tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low
+
+      - name: Record resolved dependency graph (no restore)
+        run: dotnet package list --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --include-transitive --no-restore
 
       - name: Build
         run: dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-restore
@@ -238,7 +241,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Restore CLI and JobState probe dependency graph
-        run: dotnet restore tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj
+        run: dotnet restore tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low
+
+      - name: Record resolved dependency graph (no restore)
+        run: dotnet package list --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --include-transitive --no-restore
 
       - name: Release build with warnings as errors
         run: dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-restore

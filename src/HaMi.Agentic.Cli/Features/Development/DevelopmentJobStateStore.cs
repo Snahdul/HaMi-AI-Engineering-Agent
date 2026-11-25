@@ -242,8 +242,8 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         }
 
         private bool JournalFilesExist() =>
-            new[] { journalPath, journalPath + "-journal", journalPath + "-wal", journalPath + "-shm" }
-                .Any(RegularFileExists);
+            new[] { journalPath, journalPath + "-journal", journalPath + "-wal", journalPath + "-shm",
+                ArtifactPath("S01"), ArtifactPath("S02") }.Any(RegularFileExists);
 
         // Fixed, host-owned path; only the same lease that made the claim
         // can initialize an empty file. Never recreate a missing journal.
@@ -285,6 +285,38 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 throw new InvalidOperationException("Unexpected order journal mode.");
             if (RegularFileExists(journalPath + "-journal"))
                 validatePrivateEntry!(journalPath + "-journal", false);
+        }
+
+        private string ArtifactPath(string step) => step switch
+        {
+            "S01" => journalPath + ".s01",
+            "S02" => journalPath + ".s02",
+            _ => throw new InvalidOperationException("Unknown order artifact slot.")
+        };
+
+        internal string StoreOrderArtifact(string step, byte[] bytes)
+        {
+            RequireOrderStorage();
+            OrderCheck.Require(bytes.Length is > 0 and <= 64 * 1024, "ORDER_ARTIFACT_SIZE");
+            string path = ArtifactPath(step);
+            if (RegularFileExists(path))
+                throw new InvalidOperationException("Order artifact already exists.");
+            WriteNew(path, bytes);
+            string hash = DevelopmentJobState.Hash(bytes);
+            _ = RequireOrderArtifact(step, hash);
+            return hash;
+        }
+
+        internal byte[] RequireOrderArtifact(string step, string hash)
+        {
+            RequireOrderStorage();
+            string path = ArtifactPath(step);
+            if (!OrderCheck.Hash(hash) || !RegularFileExists(path))
+                throw new InvalidOperationException("Order artifact missing or invalid digest.");
+            validatePrivateEntry!(path, false);
+            byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(path, 64 * 1024);
+            OrderCheck.Require(DevelopmentJobState.Hash(bytes) == hash, "ORDER_ARTIFACT_HASH");
+            return bytes;
         }
 
         private void RequireOrderStorage()
