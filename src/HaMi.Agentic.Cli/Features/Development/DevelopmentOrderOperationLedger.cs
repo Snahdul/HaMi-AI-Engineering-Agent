@@ -256,7 +256,8 @@ internal sealed record DevelopmentOrderOperationLedger(
         outcome.Validate(archiveHash, reservation);
         string evidenceHash = DevelopmentJobState.Hash(OrderStorageJson.Encode(outcome, EventMaxBytes));
         return Settle(new(2, reservation.OperationId, evidenceHash, "succeeded", outcome.ObservedUtcTicks))
-            with { LatestGuestOutcome = outcome };
+            with
+        { LatestGuestOutcome = outcome };
     }
 
     private DevelopmentOrderOperationLedger Settle(OrderOperationCompletion completion)
