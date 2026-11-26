@@ -680,26 +680,78 @@ internal static class DevelopmentSandboxRunner
     // The caller supplies an already authenticated historical descriptor
     // under the exclusive order lease. This adapter cannot adopt arbitrary
     // report files, create a VM, or append an event.
-    internal static Task<OrderGuestOutcome> RequireProtectedGuestAsync(
-        DevelopmentJobStateStore.Lease owner, OrderGuestOutcome recorded) =>
-        RequireProtectedGuestCoreAsync(owner, recorded, SbxAsync);
-
-    internal static async Task<OrderGuestOutcome> RequireProtectedGuestCoreAsync(
+    internal static async Task<OrderGuestOutcome> RequireProtectedGuestAsync(
         DevelopmentJobStateStore.Lease owner, OrderGuestOutcome recorded,
-        Func<TimeSpan, string[], Task<SandboxProcess>> transport)
+        CancellationToken cancellationToken = default) =>
+        (await RequireProtectedGuestsAsync(owner, [recorded], cancellationToken))[0];
+
+    // One explicitly authorized read-only reentry pass, not a new business
+    // budget or a retry loop. The host supplies journal-derived descriptors.
+    internal static Task<OrderGuestOutcome[]> RequireProtectedGuestsAsync(
+        DevelopmentJobStateStore.Lease owner, IReadOnlyList<OrderGuestOutcome> recorded,
+        CancellationToken cancellationToken = default) =>
+        RequireProtectedGuestsCoreAsync(owner, recorded, SbxWithCancellationAsync, cancellationToken);
+
+    internal static async Task<OrderGuestOutcome[]> RequireProtectedGuestsCoreAsync(
+        DevelopmentJobStateStore.Lease owner, IReadOnlyList<OrderGuestOutcome> recorded,
+        Func<TimeSpan, CancellationToken, string[], DevelopmentOrderSafetyWindow?, Task<SandboxProcess>> transport,
+        CancellationToken cancellationToken = default, TimeProvider? clock = null)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(owner.RequireArchivedOrder().BudgetPolicy));
+        using var safety = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(policy.SafetyReserveSeconds), clock);
+        safety.Start();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(safety.Token, cancellationToken);
+        void Check()
+        {
+            safety.Check();
+            linked.Token.ThrowIfCancellationRequested();
+        }
+
+        // Copy the trusted descriptor list once. Bound work by the archived
+        // profile, reject duplicate operation IDs before any backend call.
+        OrderCheck.Require(recorded.Count > 0 && recorded.Count <= policy.Maximums.Guests,
+            "ORDER_GUEST_RECONCILIATION_COUNT");
+        OrderGuestOutcome[] items = recorded.ToArray();
+        OrderCheck.Require(items.Length > 0 && items.Length <= policy.Maximums.Guests
+            && items.Select(x => x.Reservation.OperationId).Distinct(StringComparer.Ordinal).Count() == items.Length,
+            "ORDER_GUEST_RECONCILIATION_COUNT");
         using var backend = owner.AcquireOrderSandboxBackend();
-        byte[] bytes = owner.RequireOrderGuestReport(recorded, recorded.Reservation);
-        string runId = DevelopmentOrderGuestReconciliation.RunId(recorded.Reservation);
-        SandboxProcess result = await transport(TimeSpan.FromSeconds(30), ["inspect", RecoverySandboxName(runId)]);
-        // Recheck the private manifest/report after the external observation.
-        // Report identity must not change across the await.
-        byte[] readback = owner.RequireOrderGuestReport(recorded, recorded.Reservation);
-        OrderCheck.Require(bytes.AsSpan().SequenceEqual(readback), "ORDER_GUEST_REPORT_CHANGED");
-        var observed = DevelopmentOrderGuestReconciliation.Observe(recorded.ArchiveHash, recorded.Reservation,
-            readback, result.ExitCode, result.Output, result.Error, DateTime.UtcNow.Ticks);
-        DevelopmentOrderGuestReconciliation.RequireObserved(recorded, observed);
-        return observed ?? throw new InvalidOperationException("ORDER_GUEST_RECONCILIATION");
+        var originals = new byte[items.Length][];
+        for (int i = 0; i < items.Length; i++)
+        {
+            Check();
+            originals[i] = owner.RequireOrderGuestReport(items[i], items[i].Reservation);
+        }
+
+        var observations = new OrderGuestOutcome[items.Length];
+        for (int i = 0; i < items.Length; i++)
+        {
+            Check();
+            OrderGuestOutcome item = items[i];
+            string runId = DevelopmentOrderGuestReconciliation.RunId(item.Reservation);
+            SandboxProcess result = await transport(safety.Limit(TimeSpan.FromSeconds(30)), linked.Token,
+                ["inspect", RecoverySandboxName(runId)], safety);
+            Check();
+            byte[] readback = owner.RequireOrderGuestReport(item, item.Reservation);
+            OrderCheck.Require(originals[i].AsSpan().SequenceEqual(readback), "ORDER_GUEST_REPORT_CHANGED");
+            var observed = DevelopmentOrderGuestReconciliation.Observe(item.ArchiveHash, item.Reservation,
+                readback, result.ExitCode, result.Output, result.Error, DateTime.UtcNow.Ticks);
+            DevelopmentOrderGuestReconciliation.RequireObserved(item, observed);
+            observations[i] = observed ?? throw new InvalidOperationException("ORDER_GUEST_RECONCILIATION");
+        }
+
+        // Earlier evidence must also survive later observations. No partial
+        // batch is returned and no journal event is appended here.
+        for (int i = 0; i < items.Length; i++)
+        {
+            Check();
+            byte[] readback = owner.RequireOrderGuestReport(items[i], items[i].Reservation);
+            OrderCheck.Require(originals[i].AsSpan().SequenceEqual(readback), "ORDER_GUEST_REPORT_CHANGED");
+        }
+
+        Check();
+        return observations;
     }
 
     private static string RecoverySandboxName(string runId)

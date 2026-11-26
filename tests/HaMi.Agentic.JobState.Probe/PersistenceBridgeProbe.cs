@@ -195,14 +195,17 @@ internal static class PersistenceBridgeProbe
         async Task<OrderGuestOutcome> ObserveAsync(DevelopmentSandboxRunner.SandboxProcess result,
             Action? duringInspect = null)
         {
-            return await DevelopmentSandboxRunner.RequireProtectedGuestCoreAsync(owner, recorded, (limit, args) =>
-            {
-                if (limit != TimeSpan.FromSeconds(30) || !args.SequenceEqual(new[] { "inspect", name }))
-                    throw new InvalidOperationException("Unexpected reconciliation command.");
-                calls++;
-                duringInspect?.Invoke();
-                return Task.FromResult(result);
-            });
+            var observations = await DevelopmentSandboxRunner.RequireProtectedGuestsCoreAsync(owner, [recorded],
+                (limit, token, args, safety) =>
+                {
+                    if (limit != TimeSpan.FromSeconds(30) || !args.SequenceEqual(new[] { "inspect", name })
+                        || !token.CanBeCanceled || safety is null)
+                        throw new InvalidOperationException("Unexpected reconciliation command.");
+                    calls++;
+                    duringInspect?.Invoke();
+                    return Task.FromResult(result);
+                });
+            return observations.Single();
         }
 
         async Task RejectObservationAsync(DevelopmentSandboxRunner.SandboxProcess result, Action? duringInspect = null)
@@ -245,7 +248,7 @@ internal static class PersistenceBridgeProbe
         bool timeout = false;
         try
         {
-            _ = await DevelopmentSandboxRunner.RequireProtectedGuestCoreAsync(owner, recorded, (_, args) =>
+            _ = await DevelopmentSandboxRunner.RequireProtectedGuestsCoreAsync(owner, [recorded], (_, _, args, _) =>
             {
                 if (!args.SequenceEqual(new[] { "inspect", name }))
                     throw new InvalidOperationException("Unexpected timeout command.");
@@ -255,6 +258,33 @@ internal static class PersistenceBridgeProbe
         catch (TimeoutException) { timeout = true; }
         if (!timeout)
             throw new InvalidOperationException("Inspect timeout became successful evidence.");
+        using var cancel = new CancellationTokenSource();
+        bool cancelled = false;
+        try
+        {
+            _ = await DevelopmentSandboxRunner.RequireProtectedGuestsCoreAsync(owner, [recorded],
+                (_, token, _, _) =>
+                {
+                    cancel.Cancel();
+                    if (!token.IsCancellationRequested)
+                        throw new InvalidOperationException("Reentry transport lost cancellation.");
+                    return Task.FromResult(new DevelopmentSandboxRunner.SandboxProcess(1, "", absent));
+                }, cancel.Token);
+        }
+        catch (OperationCanceledException) { cancelled = true; }
+        if (!cancelled)
+            throw new InvalidOperationException("Cancelled reentry returned evidence.");
+
+        cancelled = false;
+        try
+        {
+            _ = await DevelopmentSandboxRunner.RequireProtectedGuestsCoreAsync(owner, [recorded],
+                (_, _, _, _) => throw new InvalidOperationException("Precancelled reentry reached backend."), cancel.Token);
+        }
+        catch (OperationCanceledException) { cancelled = true; }
+        if (!cancelled)
+            throw new InvalidOperationException("Precancelled reentry accepted.");
+
         VerifyFixtureSnapshot(owner, recorded.Reservation);
         DevelopmentOrderGuestReconciliation.RequireObserved(recorded, await ObserveAsync(new(1, "", absent)));
         Console.WriteLine("PASS: protected guest read-only adapter requires exact fresh inspect and stable manifest/report; backend failures remain blocked.");
@@ -271,7 +301,7 @@ internal static class PersistenceBridgeProbe
             try
             {
                 using var owner = store.AcquireOrder(Issue);
-                owner.ClaimOrder(Guid.NewGuid().ToString("N"), FixtureApproval());
+                owner.ClaimOrder(Guid.NewGuid().ToString("N"), FixtureApproval(scenario == "success" ? 40 : null));
                 string journal = owner.CreateOrderJournal();
                 DevelopmentOrderClaim claim = owner.CurrentOrder ?? throw new InvalidOperationException("Claim missing.");
                 DevelopmentOrderArchive archive = owner.RequireArchivedOrder();
@@ -401,6 +431,28 @@ internal static class PersistenceBridgeProbe
                 catch (InvalidOperationException) { rejected = true; }
                 if (!rejected || calls != before)
                     throw new InvalidOperationException("Consumed guest was redispatched.");
+                if (scenario == "success")
+                {
+                    // A second synthetic journal descriptor with protected
+                    // bytes exercises a shared reentry window across records.
+                    // It does not claim a second live runner invocation.
+                    OrderGuestOutcome first = outcome!;
+                    var completed = ledger.CompleteGuest(first);
+                    var next = completed.Propose(claim.JobId, "S01", "guest", 30, DateTime.UtcNow.Ticks, null, hash);
+                    owner.StoreOrderSnapshotManifest(next, manifest);
+                    var pending = completed.Reserve(claim.JobId, limits, next);
+                    owner.ConsumeOrderGuestDispatch(pending, next);
+                    byte[] secondBytes = FixtureGuestReport(next);
+                    var second = ObserveFixtureGuest(claim, next, secondBytes)
+                        ?? throw new InvalidOperationException("Second fixture observation missing.");
+                    owner.StoreOrderGuestReport(second, next, secondBytes);
+                    var historical = pending.CompleteGuest(second);
+                    await TestReentryWindowAsync(owner, first, second, policy.SafetyReserveSeconds, slot);
+                    if (historical.Pending is not null || historical.LatestGuestOutcome != second
+                        || historical.Guests != 2 || historical.ReservedSeconds != 60)
+                        throw new InvalidOperationException("Reentry changed charged operations.");
+                }
+
                 owner.ValidateOrderJournalFiles();
             }
             finally
@@ -410,6 +462,66 @@ internal static class PersistenceBridgeProbe
         }
 
         Console.WriteLine("PASS: live reserved runner captures exact protected bytes only after success and fresh absence; raw reports cannot authorize completion.");
+    }
+
+    private sealed class ReentryClock : TimeProvider
+    {
+        internal long Timestamp { get; set; }
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => Timestamp;
+    }
+
+    private static async Task TestReentryWindowAsync(DevelopmentJobStateStore.Lease owner,
+        OrderGuestOutcome first, OrderGuestOutcome second, int reserveSeconds, string firstSlot)
+    {
+        foreach (string scenario in new[] { "shared", "exhausted", "earlier-changed", "duplicate" })
+        {
+            var clock = new ReentryClock();
+            int calls = 0;
+            byte[] original = owner.RequireOrderGuestReport(first, first.Reservation);
+            bool rejected = false;
+            try
+            {
+                var observations = await DevelopmentSandboxRunner.RequireProtectedGuestsCoreAsync(owner,
+                    scenario == "duplicate" ? [first, first] : [first, second],
+                    (limit, token, args, safety) =>
+                    {
+                        OrderGuestOutcome expected = calls == 0 ? first : second;
+                        string name = "hami-code-" + expected.RunId[..12];
+                        TimeSpan expectedLimit = TimeSpan.FromSeconds(calls == 0 ? 30 : 15);
+                        if (!args.SequenceEqual(new[] { "inspect", name }) || limit != expectedLimit
+                            || !token.CanBeCanceled || safety is null || calls >= 2)
+                            throw new InvalidOperationException("Reentry window or command differs.");
+                        calls++;
+                        clock.Timestamp += TimeSpan.FromSeconds(calls == 1 ? reserveSeconds - 15
+                            : scenario == "exhausted" ? 15 : 1).Ticks;
+                        if (scenario == "earlier-changed" && calls == 2)
+                            File.WriteAllBytes(firstSlot, [.. original, 0x20]);
+                        return Task.FromResult(new DevelopmentSandboxRunner.SandboxProcess(1, "",
+                            "error: sandbox '" + name + "' not found"));
+                    }, clock: clock);
+                if (scenario != "shared" || observations.Length != 2 || calls != 2)
+                    throw new InvalidOperationException("Unexpected successful reconciliation batch.");
+                DevelopmentOrderGuestReconciliation.RequireObserved(first, observations[0]);
+                DevelopmentOrderGuestReconciliation.RequireObserved(second, observations[1]);
+            }
+            catch (TimeoutException ex) when (scenario == "exhausted" && ex.Message == "ORDER_SAFETY_RESERVE_EXHAUSTED")
+            { rejected = true; }
+            catch (InvalidOperationException ex) when (scenario == "duplicate" && ex.Message == "ORDER_GUEST_RECONCILIATION_COUNT")
+            { rejected = true; }
+            catch (InvalidOperationException ex) when (scenario == "earlier-changed" && ex.Message == "ORDER_GUEST_REPORT_BYTES")
+            { rejected = true; }
+            finally
+            {
+                if (scenario == "earlier-changed")
+                    File.WriteAllBytes(firstSlot, original);
+            }
+
+            if (rejected != (scenario != "shared") || calls != (scenario == "duplicate" ? 0 : 2))
+                throw new InvalidOperationException("Reentry regression did not exercise expected boundary.");
+        }
+
+        Console.WriteLine("PASS: one policy-bounded read-only reentry window across reports; expiry, duplicate and earlier tampering block the entire batch.");
     }
 
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
@@ -590,7 +702,7 @@ internal static class PersistenceBridgeProbe
         throw new InvalidOperationException("Bridge child stopped before " + expected);
     }
 
-    internal static DevelopmentOrderApproval FixtureApproval()
+    internal static DevelopmentOrderApproval FixtureApproval(int? safetyReserveSeconds = null)
     {
         using Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("HaMi.Probe.Order")
             ?? throw new InvalidOperationException("Order fixture missing.");
@@ -612,6 +724,8 @@ internal static class PersistenceBridgeProbe
         var policyNode = JsonNode.Parse(Encoding.UTF8.GetString(buffer.ToArray()))!.AsObject();
         // Only this disposable process fixture uses a tighter initial window.
         policyNode["defaults"]!["elapsedSeconds"] = 120;
+        if (safetyReserveSeconds is int safetySeconds)
+            policyNode["safetyReserveSeconds"] = safetySeconds;
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(policyNode.ToJsonString()));
         byte[] body = Encoding.UTF8.GetBytes("\x60\x60\x60hami-order-json\n" + plan + "\x60\x60\x60\n");
         DevelopmentOrder order = DevelopmentOrder.ParseIssueBody(body);
