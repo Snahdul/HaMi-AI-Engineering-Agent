@@ -104,6 +104,9 @@ internal static class Program
             or "bridge-model-resume-formatter-rejected-orphan"
             or "bridge-model-resume-formatter-budget-hard" or "bridge-model-resume-formatter-budget-soft"
             or "bridge-model-resume-formatter-budget-hard-generated"
+            or "bridge-model-pair-stop-s01-model" or "bridge-model-pair-stop-s01-guest"
+            or "bridge-model-resume-pair-stop-s01-model" or "bridge-model-resume-pair-stop-s01-guest"
+            or "bridge-model-resume-pair-stop-s02-guest" or "bridge-model-resume-pair-stop-final"
             or "bridge-model-resume-final-pre-dispatch" or "bridge-model-resume-final-wrong-output"
             or "bridge-model-resume-final-orphan")
         {
@@ -135,8 +138,10 @@ internal static class Program
                         or "bridge-guest-unknown" or "bridge-guest-orphan"
                         or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
                         or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan"
-                        or "bridge-soft-stop" or "bridge-model-accepted" or "bridge-model-verified")
+                        or "bridge-soft-stop" or "bridge-model-accepted" or "bridge-model-verified"
+                        or "bridge-model-pair-stop-s01-model" or "bridge-model-pair-stop-s01-guest")
                         owner.ClaimOrder(Guid.NewGuid().ToString("N"), args[0] is "bridge-model-accepted" or "bridge-model-verified"
+                            or "bridge-model-pair-stop-s01-model" or "bridge-model-pair-stop-s01-guest"
                             ? await PersistenceBridgeProbe.CalculatorRecoveryApprovalAsync(root) : PersistenceBridgeProbe.FixtureApproval());
                     _ = owner.RequireArchivedOrder();
                     return await PersistenceBridgeProbe.RunChildAsync(args[0], root, owner);

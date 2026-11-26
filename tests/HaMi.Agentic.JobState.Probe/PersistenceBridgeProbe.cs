@@ -2063,6 +2063,88 @@ internal static class PersistenceBridgeProbe
             }
         }
 
+        // Other actual pair boundaries use the same guarded admission fold.
+        // Each fixture stops at its target without attempting an extension.
+        foreach (string boundary in new[] { "s01-model", "s01-guest", "s02-guest", "final" })
+        {
+            string root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+            _ = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
+            try
+            {
+                await CreateCalculatorRepositoryAsync(root);
+                string resume = "bridge-model-resume-pair-stop-" + boundary;
+                (string Mode, string Marker)[] phases = boundary switch
+                {
+                    "s01-model" or "s01-guest" =>
+                        [("bridge-model-pair-stop-" + boundary, "BRIDGE_PAIR_ADMISSION_STOPPED")],
+                    "s02-guest" =>
+                        [("bridge-model-accepted", "BRIDGE_CALCULATOR_ACCEPTED"), (resume, "BRIDGE_FORMATTER_CAPTURED"),
+                            (resume, "BRIDGE_PAIR_ADMISSION_STOPPED")],
+                    "final" =>
+                        [("bridge-model-accepted", "BRIDGE_CALCULATOR_ACCEPTED"), (resume, "BRIDGE_FORMATTER_CAPTURED"),
+                            (resume, "BRIDGE_FORMATTER_GUEST_CAPTURED"), (resume, "BRIDGE_FORMATTER_ACCEPTED"),
+                            (resume, "BRIDGE_PAIR_ADMISSION_STOPPED")],
+                    _ => throw new InvalidOperationException("Unknown pair boundary.")
+                };
+                foreach (var phase in phases)
+                {
+                    using Process child = start(phase.Mode, root);
+                    Task<string> errors = child.StandardError.ReadToEndAsync();
+                    try
+                    {
+                        await WaitForMarkerAsync(child, phase.Marker).WaitAsync(Deadline);
+                        if (child.HasExited)
+                            throw new InvalidOperationException("Pair boundary owner exited early.");
+                        await expectOwnership(root, "BUSY");
+                    }
+                    finally
+                    {
+                        if (!child.HasExited)
+                            child.Kill(entireProcessTree: true);
+                        await child.WaitForExitAsync().WaitAsync(Deadline);
+                        string diagnostics = await errors.WaitAsync(Deadline);
+                        if (diagnostics.Length > 0)
+                            Console.Error.WriteLine(diagnostics[^Math.Min(diagnostics.Length, 16 * 1024)..]);
+                    }
+
+                    if (child.ExitCode == 0)
+                        throw new InvalidOperationException("Pair boundary owner did not terminate abnormally.");
+                    await expectOwnership(root, "ACQUIRED:order");
+                }
+
+                string pattern = $"issue-{Issue}.order.db.*";
+                var evidence = Directory.GetFiles(root, pattern).ToDictionary(path => path, File.ReadAllBytes, StringComparer.Ordinal);
+                using Process reentry = start(resume, root);
+                Task<string> stdout = reentry.StandardOutput.ReadToEndAsync();
+                Task<string> stderr = reentry.StandardError.ReadToEndAsync();
+                try
+                {
+                    await reentry.WaitForExitAsync().WaitAsync(Deadline);
+                    string output = await stdout;
+                    foreach (string line in output.Split('\n').Where(line => line.StartsWith("BRIDGE_PHASE:", StringComparison.Ordinal)))
+                        Console.WriteLine("[bridge reentry] " + line.TrimEnd('\r'));
+                    if (reentry.ExitCode != 0 || !output.Contains("BRIDGE_PAIR_ADMISSION_RECOVERED", StringComparison.Ordinal))
+                        throw new InvalidOperationException("Pair boundary reentry failed: " + output + await stderr);
+                    if (Directory.GetFiles(root, pattern).Length != evidence.Count
+                        || evidence.Any(file => !File.Exists(file.Key) || !File.ReadAllBytes(file.Key).SequenceEqual(file.Value)))
+                        throw new InvalidOperationException("Pair boundary recovery changed private evidence.");
+                }
+                finally
+                {
+                    if (!reentry.HasExited)
+                    {
+                        reentry.Kill(entireProcessTree: true);
+                        await reentry.WaitForExitAsync().WaitAsync(Deadline);
+                    }
+                }
+            }
+            finally
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
+        Console.WriteLine("PASS: all other actual pair admission boundaries persist hard stops before effects and recover blocked with unchanged protected evidence.");
         Console.WriteLine("PASS: actual calculator acceptance event survives Akka SQL process kill; protected candidate, report, scope and charged budget recovered without redispatch.");
         Console.WriteLine("PASS: calculator guest-complete crash before acceptance replays unaccepted; filesystem stage and evidence rechecked, one acceptance appended without redispatch.");
         Console.WriteLine("PASS: calculator recovery binds real Git commit and four exact tracked objects; dirty checkout, untracked entry, skip-worktree and binding drift rejected.");
@@ -2176,6 +2258,19 @@ internal static class PersistenceBridgeProbe
         OrderOperationLimits limits = archive.EffectiveLimits;
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
         bool modelScenario = mode.StartsWith("bridge-model-", StringComparison.Ordinal);
+        const string pairStopPrefix = "bridge-model-pair-stop-";
+        const string pairStopResumePrefix = "bridge-model-resume-pair-stop-";
+        string pairStop = mode.StartsWith(pairStopPrefix, StringComparison.Ordinal) ? mode[pairStopPrefix.Length..]
+            : mode.StartsWith(pairStopResumePrefix, StringComparison.Ordinal) ? mode[pairStopResumePrefix.Length..] : "";
+        int pairStopStage = pairStop switch
+        {
+            "s01-model" => 1,
+            "s01-guest" => 7,
+            "s02-guest" => 10,
+            "final" => 13,
+            "" => 0,
+            _ => throw new InvalidOperationException("Unknown pair stop boundary.")
+        };
         bool softScenario = mode is "bridge-soft-stop" or "bridge-soft-resume";
         const string formatterModePrefix = "bridge-model-resume-formatter-";
         string formatterCrash = mode.StartsWith(formatterModePrefix, StringComparison.Ordinal)
@@ -2186,12 +2281,13 @@ internal static class PersistenceBridgeProbe
         const string finalModePrefix = "bridge-model-resume-final-";
         string finalCrash = mode.StartsWith(finalModePrefix, StringComparison.Ordinal)
             ? mode[finalModePrefix.Length..] : "completed";
-        bool successfulFormatter = mode == "bridge-model-resume-accepted" || finalCrash != "completed" || generateAfterExtension;
+        bool successfulFormatter = mode == "bridge-model-resume-accepted" || finalCrash != "completed" || generateAfterExtension
+            || pairStopStage is 10 or 13;
         int expectedFormatterModelCharges = generateAfterExtension ? 160 : 70;
         int expectedPairCharges = expectedFormatterModelCharges + 10;
-        bool calculatorScenario = successfulFormatter || mode is "bridge-model-accepted"
+        bool calculatorScenario = pairStopStage != 0 || successfulFormatter || mode is "bridge-model-accepted"
             or "bridge-model-verified" or "bridge-model-resume-verified" || mode.StartsWith(formatterModePrefix, StringComparison.Ordinal);
-        bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
+        bool first = mode.StartsWith(pairStopPrefix, StringComparison.Ordinal) || mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
             or "bridge-guest-unknown" or "bridge-guest-orphan"
             or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
             or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan" or "bridge-soft-stop"
@@ -2303,6 +2399,49 @@ internal static class PersistenceBridgeProbe
             Console.WriteLine("BRIDGE_PHASE: host started; awaiting replay.");
             var recovery = Stopwatch.StartNew();
             BridgeState current = await ReadAsync();
+            async Task<DevelopmentOrderOperationLedger> PersistPairAdmission(OrderOperationReservation request)
+            {
+                Task<BridgeState> reply = actor.Ask<BridgeState>(new AdmitPair(request), Deadline);
+                await guard.AwaitAsync(reply);
+                current = await reply;
+                return current.Ledger;
+            }
+
+            void RequireNoNextPairSlots(DevelopmentOrderOperationLedger before)
+            {
+                string number = (before.Sequence + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                foreach (string slot in new[] { "model-dispatch-", "candidate-", "evidence-", "snapshot-", "guest-dispatch-", "guest-report-" })
+                    if (File.Exists(database + "." + slot + number))
+                        throw new InvalidOperationException("Budget stop created an operation slot.");
+            }
+
+            async Task<int> StopPairBoundaryAsync(OrderOperationReservation request)
+            {
+                var before = current;
+                if (before.Stage != pairStopStage)
+                    throw new InvalidOperationException("Unexpected budget stop stage.");
+                RequireNoNextPairSlots(before.Ledger);
+                bool rawBlocked = false;
+                try { _ = await actor.Ask<BridgeState>(new Advance(DevelopmentOrderOperationLedger.EncodeReservation(request)), Deadline); }
+                catch (InvalidOperationException) { rawBlocked = true; }
+                if (!rawBlocked || await ReadAsync() != before)
+                    throw new InvalidOperationException("Raw pair admission bypassed the supervisor.");
+                var stopped = await DevelopmentOrderAdmission.AdmitDecisionAsync(claim, before.Ledger, request,
+                    PairRequiredAfter(pairStopStage, policy), PersistPairAdmission);
+                if (current.Stage != pairStopStage || current.OtherPairStopOrigin != before.Ledger
+                    || stopped.BudgetStop?.Request != request || stopped.Pending is not null
+                    || stopped.Sequence != before.Ledger.Sequence || stopped.ReservedSeconds != before.Ledger.ReservedSeconds
+                    || stopped.StartedUtcTicks != before.Ledger.StartedUtcTicks || stopped.AcceptedS01 != before.Ledger.AcceptedS01
+                    || stopped.AcceptedS02 != before.Ledger.AcceptedS02 || await ReadAsync() != current)
+                    throw new InvalidOperationException("Pair boundary stop acknowledgement differs.");
+                RequireNoNextPairSlots(before.Ledger);
+                owner.ValidateOrderJournalFiles();
+                Console.WriteLine("BRIDGE_PAIR_ADMISSION_STOPPED");
+                Console.Out.Flush();
+                await Task.Delay(Timeout.InfiniteTimeSpan);
+                return 1;
+            }
+
             guard.RequireObserved();
             Console.WriteLine($"BRIDGE_PHASE: replay state {current.Stage}; {recovery.ElapsedMilliseconds} ms.");
             string artifact = database + ".s01";
@@ -2351,18 +2490,17 @@ internal static class PersistenceBridgeProbe
                     OrderAgentProfile[] catalog = [new(assignment.Agent, true, ["csharp"])];
                     var reservation = current.Ledger.Propose(claim.JobId, "S01", "model", 30,
                         DateTime.UtcNow.Ticks, OrderOperationAgentBinding.FromAssignment(assignment));
-                    async Task<DevelopmentOrderOperationLedger> PersistCalculatorModel(OrderOperationReservation request)
-                    {
-                        current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(request), 2);
-                        return current.Ledger;
-                    }
-
                     if (calculatorScenario)
-                        _ = await DevelopmentOrderAdmission.AdmitAsync(claim, current.Ledger, reservation,
-                            [new("S01", "guest", 30), new("S02", "model", 10), new("S02", "guest", 10),
-                                new("FINAL", "guest", current.Ledger.FinalReserveSeconds)], PersistCalculatorModel);
+                    {
+                        if (pairStopStage == 1)
+                            return await StopPairBoundaryAsync(reservation with { ReservedSeconds = 100 });
+                        _ = await DevelopmentOrderAdmission.AdmitDecisionAsync(claim, current.Ledger, reservation,
+                            PairRequiredAfter(1, policy), PersistPairAdmission);
+                        if (current.Stage != 2 || current.Ledger.Pending != reservation)
+                            throw new InvalidOperationException("Calculator model was not admitted.");
+                    }
                     else
-                        _ = await PersistCalculatorModel(reservation);
+                        current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(reservation), 2);
                     if (mode == "bridge-model-receipt")
                         owner.ConsumeOrderModelDispatch(current.Ledger, reservation);
                     else
@@ -2404,6 +2542,8 @@ internal static class PersistenceBridgeProbe
                             throw new InvalidOperationException("Calculator workflow action differs.");
                         CreateCalculatorStage(root, owner, model);
                         var guest = DevelopmentOrderCalculatorVerifier.ProposeGuest(owner, model, 30, DateTime.UtcNow.Ticks);
+                        if (pairStopStage == 7)
+                            return await StopPairBoundaryAsync(guest with { ReservedSeconds = 100 });
                         string source = Path.Combine(Path.GetTempPath(), "hami-calculator-recovery-" + Guid.NewGuid().ToString("N"));
                         Directory.CreateDirectory(source);
                         try
@@ -2413,15 +2553,10 @@ internal static class PersistenceBridgeProbe
                             DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, model, guest, source);
                         }
                         finally { Directory.Delete(source, recursive: true); }
-                        async Task<DevelopmentOrderOperationLedger> PersistCalculatorGuest(OrderOperationReservation request)
-                        {
-                            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(request), 2);
-                            return current.Ledger;
-                        }
-
-                        _ = await DevelopmentOrderAdmission.AdmitAsync(claim, model, guest,
-                            [new("S02", "model", 10), new("S02", "guest", 10),
-                                new("FINAL", "guest", model.FinalReserveSeconds)], PersistCalculatorGuest);
+                        _ = await DevelopmentOrderAdmission.AdmitDecisionAsync(claim, model, guest,
+                            PairRequiredAfter(7, policy), PersistPairAdmission);
+                        if (current.Stage != 2 || current.Ledger.Pending != guest)
+                            throw new InvalidOperationException("Calculator guest was not admitted.");
                         owner.ConsumeOrderGuestDispatch(current.Ledger, guest);
                         // Controlled transport observation, not a real sandbox run.
                         var report = new DevelopmentSandboxRunner.SandboxRunReport(5,
@@ -2625,6 +2760,29 @@ internal static class PersistenceBridgeProbe
                 Console.Out.Flush();
                 await Task.Delay(Timeout.InfiniteTimeSpan);
                 return 1;
+            }
+
+            if (pairStopStage != 0 && current.Ledger.BudgetStop is { } boundaryStop)
+            {
+                var origin = current.OtherPairStopOrigin ?? throw new InvalidOperationException("Pair stop history missing.");
+                var expected = DevelopmentOrderAdmission.Decide(claim, origin, boundaryStop.Request,
+                    PairRequiredAfter(pairStopStage, policy));
+                DevelopmentOrderAdmission.RequireAcknowledged(claim, expected, current.Ledger);
+                if (current.Stage != pairStopStage || current.Ledger.Pending is not null
+                    || current.Ledger.Sequence != origin.Sequence || current.Ledger.ReservedSeconds != origin.ReservedSeconds
+                    || current.Ledger.AcceptedS01 != origin.AcceptedS01 || current.Ledger.AcceptedS02 != origin.AcceptedS02
+                    || current.Ledger.StartedUtcTicks != origin.StartedUtcTicks)
+                    throw new InvalidOperationException("Replayed boundary stop changed history.");
+                RequireNoNextPairSlots(origin);
+                bool rejectedBoundary = false;
+                try { _ = await actor.Ask<BridgeState>(new AdmitPair(boundaryStop.Request), Deadline); }
+                catch (InvalidOperationException) { rejectedBoundary = true; }
+                if (!rejectedBoundary || await ReadAsync() != current)
+                    throw new InvalidOperationException("Stopped boundary admitted work.");
+                owner.ValidateOrderJournalFiles();
+                Console.WriteLine("BRIDGE_PHASE: " + pairStop + " admission stop recovered; predecessor and charges retained without dispatch.");
+                Console.WriteLine("BRIDGE_PAIR_ADMISSION_RECOVERED");
+                return 0;
             }
 
             if (softScenario)
@@ -3041,7 +3199,7 @@ internal static class PersistenceBridgeProbe
                         acceptedPair.FinalReserveSeconds, DateTime.UtcNow.Ticks, null, pendingFinal.SnapshotHash);
                     Reject(() => current.Ledger.Reserve(claim.JobId, effectiveLimits, retryFinal));
                     bool blockedAdmission = false, blockedAcceptance = false;
-                    try { _ = await actor.Ask<BridgeState>(new AdmitIntegrationGuest(pendingFinal), Deadline); }
+                    try { _ = await actor.Ask<BridgeState>(new AdmitPair(pendingFinal), Deadline); }
                     catch (InvalidOperationException) { blockedAdmission = true; }
                     try { _ = await actor.Ask<BridgeState>(new AcceptOrder(), Deadline); }
                     catch (InvalidOperationException) { blockedAcceptance = true; }
@@ -3230,7 +3388,7 @@ internal static class PersistenceBridgeProbe
                         DevelopmentOrderCalculatorVerifier.ReadStagedPair(Path.Combine(root, "formatter-stage")));
                     async Task<DevelopmentOrderOperationLedger> PersistIntegration(OrderOperationReservation request)
                     {
-                        Task<BridgeState> ack = actor.Ask<BridgeState>(new AdmitIntegrationGuest(request), Deadline);
+                        Task<BridgeState> ack = actor.Ask<BridgeState>(new AdmitPair(request), Deadline);
                         await guard.AwaitAsync(ack);
                         current = await ack;
                         if (current.Stage != 14 || current.PairAcceptance != pairHistory.AcceptedPair)
@@ -3248,8 +3406,11 @@ internal static class PersistenceBridgeProbe
                         return current.Ledger;
                     }
 
+                    if (pairStopStage == 13)
+                        return await StopPairBoundaryAsync(DevelopmentOrderIntegrationVerifier.ProposeGuest(owner,
+                            pairHistory, pairObservation, 100, DateTime.UtcNow.Ticks));
                     await TestIntegrationSnapshotAsync(owner, pairHistory, pairObservation, root, database, finalCrash,
-                        request => DevelopmentOrderAdmission.AdmitAsync(claim, current.Ledger, request, [], PersistIntegration),
+                        request => DevelopmentOrderAdmission.AdmitDecisionAsync(claim, current.Ledger, request, [], PersistIntegration),
                         outcome => DevelopmentOrderCompletion.RecordGuestAsync(claim, current.Ledger, outcome, CompleteIntegration));
                     bool completedIntegration = finalCrash == "completed";
                     if (await ReadAsync() != current || current.Stage != (completedIntegration ? 15 : 14)
@@ -3451,7 +3612,7 @@ internal static class PersistenceBridgeProbe
                         var completedFormatter = current;
                         async Task<DevelopmentOrderOperationLedger> PersistGuest(OrderOperationReservation request)
                         {
-                            Task<BridgeState> ack = actor.Ask<BridgeState>(new AdmitFormatterGuest(request), Deadline);
+                            Task<BridgeState> ack = actor.Ask<BridgeState>(new AdmitPair(request), Deadline);
                             await guard.AwaitAsync(ack);
                             current = await ack;
                             if (current.Stage != 11 || current.FormatterModel != completedFormatter.Ledger)
@@ -3469,9 +3630,12 @@ internal static class PersistenceBridgeProbe
                             return current.Ledger;
                         }
 
+                        if (pairStopStage == 10)
+                            return await StopPairBoundaryAsync(DevelopmentOrderFormatterVerifier.ProposeGuest(owner,
+                                beforeFormatter, completedFormatter.Ledger, recoveredInputs, 100, DateTime.UtcNow.Ticks));
                         await TestFormatterSnapshotAsync(owner, beforeFormatter, completedFormatter.Ledger, recoveredInputs,
                             root, database, successfulFormatter,
-                            request => DevelopmentOrderAdmission.AdmitAsync(claim, current.Ledger, request,
+                            request => DevelopmentOrderAdmission.AdmitDecisionAsync(claim, current.Ledger, request,
                                 [new("FINAL", "guest", current.Ledger.FinalReserveSeconds)], PersistGuest),
                             outcome => DevelopmentOrderCompletion.RecordGuestAsync(claim, current.Ledger, outcome, CompleteGuest));
                         if (await ReadAsync() != current || current.Stage != (successfulFormatter ? 12 : 11))
@@ -4301,10 +4465,9 @@ internal static class PersistenceBridgeProbe
         return new(1, claim.JobId, claim.ArchiveHash, ledger.BudgetRevision, next, approvalHash, now);
     }
     private sealed record RecordFormatter(string Event);
-    private sealed record AdmitFormatterGuest(OrderOperationReservation Request);
+    private sealed record AdmitPair(OrderOperationReservation Request);
     private sealed record RecordFormatterGuest(OrderGuestOutcome Outcome);
     private sealed record AcceptFormatter;
-    private sealed record AdmitIntegrationGuest(OrderOperationReservation Request);
     private sealed record RecordIntegrationGuest(OrderGuestOutcome Outcome);
     private sealed record AcceptOrder;
 
@@ -4318,6 +4481,18 @@ internal static class PersistenceBridgeProbe
             "S02" => [new("S02", "guest", 20), new("FINAL", "guest", policy.FinalVerificationSeconds)],
             _ => throw new InvalidOperationException("Unexpected fixture admission step.")
         };
+    private static OrderRequiredOperation[] PairRequiredAfter(int stage, DevelopmentOrderBudgetPolicy policy) =>
+        stage switch
+        {
+            1 => [new("S01", "guest", 30), new("S02", "model", 10), new("S02", "guest", 10),
+                new("FINAL", "guest", policy.FinalVerificationSeconds)],
+            7 => [new("S02", "model", 10), new("S02", "guest", 10), new("FINAL", "guest", policy.FinalVerificationSeconds)],
+            8 => [new("S02", "guest", 10), new("FINAL", "guest", policy.FinalVerificationSeconds)],
+            10 => [new("FINAL", "guest", policy.FinalVerificationSeconds)],
+            13 => [],
+            _ => throw new InvalidOperationException("Unexpected pair admission stage.")
+        };
+
     private sealed record RecordedOperation(OrderOperationReservation Reservation, OrderOperationCompletion Completion);
     private sealed record BridgeState(int Stage, string? ArtifactHash, DevelopmentOrderOperationLedger Ledger,
         RecordedOperation? S01 = null, RecordedOperation? S02 = null, RecordedOperation? FailedS01 = null,
@@ -4325,7 +4500,7 @@ internal static class PersistenceBridgeProbe
         DevelopmentOrderOperationLedger? FormatterInputState = null, DevelopmentOrderOperationLedger? FormatterModel = null,
         DevelopmentOrderOperationLedger? FormatterGuest = null, DevelopmentOrderOperationLedger? PairAcceptance = null,
         DevelopmentOrderOperationLedger? FinalCompletion = null, DevelopmentOrderOperationLedger? PairBudgetOrigin = null,
-        string[]? PairBudgetEvents = null);
+        string[]? PairBudgetEvents = null, DevelopmentOrderOperationLedger? OtherPairStopOrigin = null);
 
     private static OrderPairHistory RequirePairHistory(BridgeState state) =>
         new(state.CalculatorModel ?? throw new InvalidOperationException("Calculator model history missing."),
@@ -4552,17 +4727,59 @@ internal static class PersistenceBridgeProbe
                         CalculatorRecoveryPair(root));
             }
 
-            Command<AdmitFormatterGuest>(command =>
+            Command<AdmitPair>(command =>
             {
                 try
                 {
-                    if (!recovered || !calculatorScenario || state.Stage != 10)
-                        throw new InvalidOperationException("Formatter guest admission blocked.");
-                    var accepted = state.FormatterInputState ?? throw new InvalidOperationException("Accepted input history missing.");
-                    DevelopmentOrderFormatterVerifier.RequireGuestSnapshot(owner, accepted, state.Ledger,
-                        RequireFormatterInputs(), command.Request, Path.Combine(root, "formatter-verification"));
-                    string evt = DevelopmentOrderOperationLedger.EncodeReservation(command.Request);
+                    if (!recovered || !calculatorScenario || state.Stage is not (1 or 7 or 10 or 13))
+                        throw new InvalidOperationException("Pair admission blocked.");
+                    var request = command.Request;
+                    var decision = DevelopmentOrderAdmission.Decide(claim, state.Ledger, request,
+                        PairRequiredAfter(state.Stage, policy));
+                    bool admitted = decision.Ledger.Pending is not null;
+                    switch (state.Stage)
+                    {
+                        case 1:
+                            VerifyModelFixtureAssignment(claim, archive, request);
+                            break;
+                        case 7:
+                            if (request != DevelopmentOrderCalculatorVerifier.ProposeGuest(owner, state.Ledger,
+                                    request.ReservedSeconds, request.ObservedUtcTicks))
+                                throw new InvalidOperationException("Calculator guest proposal differs.");
+                            if (admitted)
+                            {
+                                byte[] manifest = DevelopmentOrderSnapshot.CaptureBytes(
+                                    DevelopmentOrderCalculatorVerifier.Prepare(owner, state.Ledger), "Demo.csproj");
+                                if (!owner.RequireOrderSnapshotManifest(request).SequenceEqual(manifest))
+                                    throw new InvalidOperationException("Calculator snapshot differs.");
+                            }
+
+                            break;
+                        case 10:
+                            var accepted = state.FormatterInputState ?? throw new InvalidOperationException("Accepted input history missing.");
+                            var inputs = RequireFormatterInputs();
+                            if (request != DevelopmentOrderFormatterVerifier.ProposeGuest(owner, accepted, state.Ledger,
+                                    inputs, request.ReservedSeconds, request.ObservedUtcTicks))
+                                throw new InvalidOperationException("Formatter guest proposal differs.");
+                            if (admitted)
+                                DevelopmentOrderFormatterVerifier.RequireGuestSnapshot(owner, accepted, state.Ledger,
+                                    inputs, request, Path.Combine(root, "formatter-verification"));
+                            break;
+                        case 13:
+                            var history = RequirePairHistory(state);
+                            var observations = ObservePairFixture(owner, claim, history, root);
+                            if (request != DevelopmentOrderIntegrationVerifier.ProposeGuest(owner, history, observations,
+                                    request.ReservedSeconds, request.ObservedUtcTicks))
+                                throw new InvalidOperationException("Integration guest proposal differs.");
+                            if (admitted)
+                                DevelopmentOrderIntegrationVerifier.RequireGuestSnapshot(owner, history, observations,
+                                    request, Path.Combine(root, "integration-verification"));
+                            break;
+                    }
+
+                    string evt = decision.Event;
                     BridgeState next = Next(state, evt);
+                    DevelopmentOrderAdmission.RequireAcknowledged(claim, decision, next.Ledger);
                     IActorRef reply = Sender;
                     Persist(evt, _ =>
                     {
@@ -4618,29 +4835,6 @@ internal static class PersistenceBridgeProbe
                         ObserveCalculatorBaseline(root, claim.Binding),
                         DevelopmentOrderCalculatorVerifier.ReadStagedPair(Path.Combine(root, "formatter-stage")), DateTime.UtcNow.Ticks);
                     string evt = DevelopmentOrderOperationLedger.EncodeS02Accepted(proposal);
-                    BridgeState next = Next(state, evt);
-                    IActorRef reply = Sender;
-                    Persist(evt, _ =>
-                    {
-                        state = next;
-                        reply.Tell(state);
-                    });
-                }
-                catch (Exception ex) when (ex is IOException or InvalidOperationException or System.Text.Json.JsonException)
-                {
-                    Sender.Tell(new Status.Failure(ex));
-                }
-            });
-            Command<AdmitIntegrationGuest>(command =>
-            {
-                try
-                {
-                    if (!recovered || !calculatorScenario || state.Stage != 13)
-                        throw new InvalidOperationException("Integration admission blocked.");
-                    var history = RequirePairHistory(state);
-                    DevelopmentOrderIntegrationVerifier.RequireGuestSnapshot(owner, history,
-                        ObservePairFixture(owner, claim, history, root), command.Request, Path.Combine(root, "integration-verification"));
-                    string evt = DevelopmentOrderOperationLedger.EncodeReservation(command.Request);
                     BridgeState next = Next(state, evt);
                     IActorRef reply = Sender;
                     Persist(evt, _ =>
@@ -4723,7 +4917,7 @@ internal static class PersistenceBridgeProbe
                     return;
                 }
 
-                if (softScenario && (command.Event.StartsWith("reserve-v4:", StringComparison.Ordinal)
+                if ((softScenario || calculatorScenario) && (command.Event.StartsWith("reserve-v4:", StringComparison.Ordinal)
                     || command.Event.StartsWith("soft-stop-v1:", StringComparison.Ordinal)
                     || command.Event.StartsWith("budget-stop-v1:", StringComparison.Ordinal)))
                 {
@@ -4803,6 +4997,30 @@ internal static class PersistenceBridgeProbe
                     Stage = 1,
                     Ledger = previous.Ledger.Start(DevelopmentOrderOperationLedger.DecodeStart(evt), claim.ArchiveHash, limits, policy)
                 };
+            if (calculatorScenario && previous.Stage is (1 or 7 or 10 or 13))
+            {
+                var request = evt.StartsWith("budget-stop-v1:", StringComparison.Ordinal)
+                    ? DevelopmentOrderOperationLedger.DecodeBudgetStop(evt).Request
+                    : evt.StartsWith("soft-stop-v1:", StringComparison.Ordinal)
+                        ? DevelopmentOrderOperationLedger.DecodeSoftStop(evt).Request
+                        : DevelopmentOrderOperationLedger.DecodeReservation(evt);
+                if (previous.Stage == 1)
+                    VerifyModelFixtureAssignment(claim, archive, request);
+                var decision = DevelopmentOrderAdmission.Decide(claim, previous.Ledger, request,
+                    PairRequiredAfter(previous.Stage, policy));
+                if (decision.Event != evt)
+                    throw new InvalidOperationException("Unexpected pair admission event.");
+                if (decision.Ledger.Pending is null)
+                    return previous with { Ledger = decision.Ledger, OtherPairStopOrigin = previous.Ledger };
+                return previous.Stage switch
+                {
+                    1 => previous with { Stage = 2, Ledger = decision.Ledger },
+                    7 => previous with { Stage = 2, Ledger = decision.Ledger, CalculatorModel = previous.Ledger },
+                    10 => previous with { Stage = 11, Ledger = decision.Ledger, FormatterModel = previous.Ledger },
+                    13 => previous with { Stage = 14, Ledger = decision.Ledger, PairAcceptance = previous.Ledger },
+                    _ => throw new InvalidOperationException("Unexpected pair admission stage.")
+                };
+            }
             if (calculatorScenario && previous.Stage == 8)
             {
                 if (evt.StartsWith("budget-extension-v1:", StringComparison.Ordinal))
@@ -4867,20 +5085,6 @@ internal static class PersistenceBridgeProbe
                     throw new InvalidOperationException("Unexpected formatter completion.");
                 return previous with { Stage = 10, Ledger = previous.Ledger.Complete(completion) };
             }
-            if (calculatorScenario && previous.Stage == 10)
-            {
-                var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
-                if (reservation is not { Step: "S02", Kind: "guest" } || previous.Ledger.LastOutcome != "succeeded")
-                    throw new InvalidOperationException("Formatter guest reservation required.");
-                var effective = previous.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
-                return previous with
-                {
-                    Stage = 11,
-                    FormatterModel = previous.Ledger,
-                    Ledger = previous.Ledger.ReserveWithRequiredWork(claim.JobId, effective, reservation,
-                        [new("FINAL", "guest", policy.FinalVerificationSeconds)])
-                };
-            }
             if (calculatorScenario && previous.Stage == 11)
             {
                 var outcome = DevelopmentOrderOperationLedger.DecodeGuestOutcome(evt);
@@ -4895,19 +5099,6 @@ internal static class PersistenceBridgeProbe
                     FormatterGuest = previous.Ledger,
                     Ledger = previous.Ledger.AcceptS02(claim, DevelopmentOrderOperationLedger.DecodeS02Accepted(evt))
                 };
-            if (calculatorScenario && previous.Stage == 13)
-            {
-                var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
-                if (reservation is not { Step: "FINAL", Kind: "guest" } || previous.Ledger.AcceptedS02 is null)
-                    throw new InvalidOperationException("Integration guest reservation required.");
-                var effective = previous.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
-                return previous with
-                {
-                    Stage = 14,
-                    PairAcceptance = previous.Ledger,
-                    Ledger = previous.Ledger.ReserveWithRequiredWork(claim.JobId, effective, reservation, [])
-                };
-            }
             if (calculatorScenario && previous.Stage == 14)
             {
                 var outcome = DevelopmentOrderOperationLedger.DecodeGuestOutcome(evt);
@@ -4922,18 +5113,6 @@ internal static class PersistenceBridgeProbe
                     FinalCompletion = previous.Ledger,
                     Ledger = previous.Ledger.AcceptOrder(claim, DevelopmentOrderOperationLedger.DecodeOrderAccepted(evt))
                 };
-            if (calculatorScenario && previous.Stage == 7)
-            {
-                var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
-                if (reservation is not { Step: "S01", Kind: "guest" })
-                    throw new InvalidOperationException("Calculator guest reservation required.");
-                return previous with
-                {
-                    Stage = 2,
-                    CalculatorModel = previous.Ledger,
-                    Ledger = previous.Ledger.Reserve(claim.JobId, limits, reservation)
-                };
-            }
             if (calculatorScenario && previous.Stage == 6)
                 return previous with
                 {
