@@ -2029,6 +2029,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: journal-derived workflow obligations select pair reentry routes, block pending effects and distinguish rejected models, budget stops and terminal inspection.");
         Console.WriteLine("PASS: bounded workflow admission checks mandatory work and actual journal acknowledgements for S02 model, S02 guest and FINAL; stale and repeated admissions rejected.");
         Console.WriteLine("PASS: common pair admission and completion checks S01 through FINAL; model recovery is read-only and invalid, stale or duplicate completions rejected.");
+        Console.WriteLine("PASS: common read-only guest reconciliation correlates journal action, protected pair report and fresh observation; orphan and unknown effects remain blocked.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2619,6 +2620,13 @@ internal static class PersistenceBridgeProbe
                         || current.Ledger.ReservedSeconds != 60)
                         throw new InvalidOperationException("Guest completion was mistaken for acceptance.");
                     var unaccepted = current;
+                    var calculatorOutcome = current.Ledger.LatestGuestOutcome
+                        ?? throw new InvalidOperationException("Calculator outcome missing.");
+                    var calculatorObservation = ObserveCalculatorFixture(owner, claim, calculatorOutcome);
+                    if (DevelopmentOrderCompletion.ObserveGuest(owner, current.Ledger, calculatorObservation)
+                        != OrderWorkflowAction.AcceptCalculator)
+                        throw new InvalidOperationException("Calculator guest recovery action differs.");
+                    Reject(() => DevelopmentOrderCompletion.ObserveGuest(owner, current.Ledger, null));
                     string formatter = Path.Combine(CalculatorStage(root), "PairFormatter.cs");
                     byte[] originalFormatter = File.ReadAllBytes(formatter);
                     async Task RejectAcceptanceAsync()
@@ -2719,6 +2727,12 @@ internal static class PersistenceBridgeProbe
                     }
                     else if (File.Exists(database + ".guest-report-5"))
                         throw new InvalidOperationException("Unexpected successful FINAL report.");
+                    if (DevelopmentOrderCompletion.ObserveGuest(owner, current.Ledger, orphan)
+                        != OrderWorkflowAction.ReconcilePending)
+                        throw new InvalidOperationException("Pending FINAL guest changed recovery action.");
+                    if (orphan is not null)
+                        Reject(() => DevelopmentOrderCompletion.ObserveGuest(owner, current.Ledger,
+                            orphan with { ReportHash = new string('A', 64) }));
                     Reject(() => DevelopmentOrderIntegrationVerifier.RequireCompletedGuest(owner, pendingHistory,
                         pendingObservations, current.Ledger, orphan));
                     Reject(() => DevelopmentOrderIntegrationVerifier.ProposeAcceptance(owner, pendingHistory,
@@ -2754,6 +2768,10 @@ internal static class PersistenceBridgeProbe
                         ?? throw new InvalidOperationException("Final outcome missing.");
                     byte[] terminalReport = owner.RequireOrderGuestReport(finalOutcome, finalOutcome.Reservation);
                     var freshTerminal = ObserveFixtureGuest(claim, finalOutcome.Reservation, terminalReport);
+                    if (DevelopmentOrderCompletion.ObserveGuest(owner, current.Ledger, freshTerminal)
+                        != OrderWorkflowAction.InspectCompletedOrder)
+                        throw new InvalidOperationException("Terminal guest recovery action differs.");
+                    Reject(() => DevelopmentOrderCompletion.ObserveGuest(owner, current.Ledger, null));
                     if (DevelopmentOrderIntegrationVerifier.RequireCompletedGuest(owner, terminalHistory,
                             terminalObservations, completedFinal, freshTerminal) != finalOutcome
                         || current.Ledger != completedFinal.AcceptOrder(claim, terminal)
@@ -2788,6 +2806,9 @@ internal static class PersistenceBridgeProbe
                         ?? throw new InvalidOperationException("Integration outcome missing.");
                     byte[] finalReport = owner.RequireOrderGuestReport(recordedFinal, recordedFinal.Reservation);
                     var finalObservation = ObserveFixtureGuest(claim, recordedFinal.Reservation, finalReport);
+                    if (DevelopmentOrderCompletion.ObserveGuest(owner, current.Ledger, finalObservation)
+                        != OrderWorkflowAction.AcceptOrder)
+                        throw new InvalidOperationException("FINAL guest recovery action differs.");
                     if (DevelopmentOrderIntegrationVerifier.RequireCompletedGuest(owner, history, observations,
                             current.Ledger, finalObservation) != recordedFinal
                         || current.Ledger.Sequence != 5 || current.Ledger.Models != 2 || current.Ledger.Guests != 3
@@ -2968,6 +2989,11 @@ internal static class PersistenceBridgeProbe
                         byte[] report = owner.RequireOrderGuestReport(recordedFormatterGuest, reservation);
                         var observed = ObserveFixtureGuest(claim, reservation, report)
                             ?? throw new InvalidOperationException("Formatter fixture absence missing.");
+                        if (DevelopmentOrderCompletion.ObserveGuest(owner, current.Ledger, observed)
+                            != OrderWorkflowAction.AcceptFormatter)
+                            throw new InvalidOperationException("Formatter guest recovery action differs.");
+                        Reject(() => DevelopmentOrderCompletion.ObserveGuest(owner, current.Ledger,
+                            observed with { Reservation = reservation with { ReservedSeconds = reservation.ReservedSeconds + 1 } }));
                         var formatter = DevelopmentOrderFormatterVerifier.RequireCompletedGuest(owner, beforeFormatter,
                             completedFormatter, current.Ledger, inputs, observed);
                         DevelopmentOrderFormatterVerifier.RequirePairScope(owner, accepted, formatter,
@@ -3030,6 +3056,9 @@ internal static class PersistenceBridgeProbe
                     }
                     else
                     {
+                        if (DevelopmentOrderCompletion.ObserveGuest(owner, current.Ledger, null)
+                            != OrderWorkflowAction.ReconcilePending)
+                            throw new InvalidOperationException("Pending formatter guest changed recovery action.");
                         Reject(() => owner.ConsumeOrderGuestDispatch(current.Ledger, reservation));
                         Reject(() => DevelopmentOrderFormatterVerifier.RequireCompletedGuest(owner, beforeFormatter,
                             completedFormatter, current.Ledger, inputs, null));

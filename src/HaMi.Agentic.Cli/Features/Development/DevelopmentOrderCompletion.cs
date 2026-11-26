@@ -39,6 +39,53 @@ internal static class DevelopmentOrderCompletion
         return acknowledged;
     }
 
+    // Read-only classification of the latest pair guest. The caller still
+    // verifies the full step-specific history, snapshot and scope. Even a
+    // valid orphan observation never becomes a journal outcome here.
+    internal static OrderWorkflowAction ObserveGuest(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger ledger, OrderGuestOutcome? independentlyObserved)
+    {
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        _ = owner.RequireArchivedOrder();
+        var action = DevelopmentOrderWorkflow.Select(claim, ledger);
+        if (ledger.Pending is { } pending)
+        {
+            OrderCheck.Require(pending.Kind == "guest" && action == OrderWorkflowAction.ReconcilePending,
+                "ORDER_COMPLETION_GUEST_PENDING");
+            _ = owner.RequireOrderSnapshotManifest(pending);
+            if (independentlyObserved is not null)
+                RequirePairGuestReport(owner, claim, pending, independentlyObserved);
+            return OrderWorkflowAction.ReconcilePending;
+        }
+
+        var recorded = ledger.LatestGuestOutcome ?? throw new InvalidOperationException("ORDER_COMPLETION_GUEST_OUTCOME");
+        bool matches = (recorded.Reservation.Step, action) is
+            ("S01", OrderWorkflowAction.AcceptCalculator or OrderWorkflowAction.GenerateFormatter)
+            or ("S02", OrderWorkflowAction.AcceptFormatter or OrderWorkflowAction.VerifyIntegration)
+            or ("FINAL", OrderWorkflowAction.AcceptOrder or OrderWorkflowAction.InspectCompletedOrder);
+        OrderCheck.Require(matches, "ORDER_COMPLETION_GUEST_ACTION");
+        _ = owner.RequireOrderSnapshotManifest(recorded.Reservation);
+        RequirePairGuestReport(owner, claim, recorded.Reservation, recorded);
+        DevelopmentOrderGuestReconciliation.RequireObserved(recorded, independentlyObserved);
+        return action;
+    }
+
+    private static void RequirePairGuestReport(DevelopmentJobStateStore.Lease owner, DevelopmentOrderClaim claim,
+        OrderOperationReservation reservation, OrderGuestOutcome outcome)
+    {
+        outcome.Validate(claim.ArchiveHash, reservation);
+        owner.RequireOrderGuestDispatch(reservation);
+        byte[] report = owner.RequireOrderGuestReport(outcome, reservation);
+        bool valid = reservation.Step switch
+        {
+            "S01" => DevelopmentOrderGuestReconciliation.IsCalculatorReport(reservation, report),
+            "S02" => DevelopmentOrderGuestReconciliation.IsFormatterReport(reservation, report),
+            "FINAL" => DevelopmentOrderGuestReconciliation.IsIntegrationReport(reservation, report),
+            _ => false
+        };
+        OrderCheck.Require(valid, "ORDER_COMPLETION_GUEST_REPORT");
+    }
+
     internal static async Task<DevelopmentOrderOperationLedger> RecordGuestAsync(
         DevelopmentOrderClaim claim, DevelopmentOrderOperationLedger before,
         OrderGuestOutcome outcome, Func<OrderGuestOutcome, Task<DevelopmentOrderOperationLedger>> persist)
