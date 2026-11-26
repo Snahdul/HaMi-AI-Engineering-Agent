@@ -524,9 +524,98 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: one policy-bounded read-only reentry window across reports; expiry, duplicate and earlier tampering block the entire batch.");
     }
 
+    private static async Task TestModelDispatchAsync(string prefix)
+    {
+        byte[] baseline = Encoding.UTF8.GetBytes("internal static class PairCalculator { }");
+        const string candidate = "internal static class PairCalculator { /* generated */ }";
+        foreach (string scenario in new[] { "success", "wrong-input", "wrong-assignment", "cancelled", "unknown", "invalid-source" })
+        {
+            string root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+            var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
+            try
+            {
+                using var owner = store.AcquireOrder(Issue);
+                var approval = FixtureApproval(baselineHash: DevelopmentJobState.Hash(baseline));
+                owner.ClaimOrder(Guid.NewGuid().ToString("N"), approval);
+                string journal = owner.CreateOrderJournal();
+                DevelopmentOrderClaim claim = owner.CurrentOrder ?? throw new InvalidOperationException("Claim missing.");
+                var archive = owner.RequireArchivedOrder();
+                var assignment = FixtureAssignment(claim, archive, "S01");
+                OrderAgentProfile[] catalog = [new(assignment.Agent, true, ["csharp"])];
+                long now = DateTime.UtcNow.Ticks;
+                var ledger = new DevelopmentOrderOperationLedger().Start(new(1, claim.ArchiveHash, now),
+                    claim.ArchiveHash, archive.EffectiveLimits, approval.BudgetPolicy);
+                var operation = ledger.Propose(claim.JobId, "S01", "model", 30, now,
+                    OrderOperationAgentBinding.FromAssignment(assignment));
+                ledger = ledger.Reserve(claim.JobId, archive.EffectiveLimits, operation);
+                using var cancel = new CancellationTokenSource();
+                int calls = 0;
+                Task<string> Generate(string input, CancellationToken token)
+                {
+                    if (input != Encoding.UTF8.GetString(baseline) || !token.CanBeCanceled)
+                        throw new InvalidOperationException("Wrong model input or cancellation.");
+                    calls++;
+                    if (scenario == "cancelled")
+                        cancel.Cancel();
+                    if (scenario == "unknown")
+                        throw new IOException("Synthetic unknown transport outcome.");
+                    return Task.FromResult(scenario == "invalid-source" ? "\0" : candidate);
+                }
+
+                OrderCandidateCheckpoint? checkpoint = null;
+                bool rejected = false;
+                try
+                {
+                    checkpoint = await DevelopmentOrderModelDispatch.RunAsync(owner, ledger, operation, approval,
+                        scenario == "wrong-assignment" ? assignment with { Revision = 2 } : assignment,
+                        catalog, scenario == "wrong-input" ? [1] : baseline, Generate, cancel.Token);
+                }
+                catch (InvalidOperationException) when (scenario is "wrong-input" or "wrong-assignment" or "invalid-source")
+                { rejected = true; }
+                catch (OperationCanceledException) when (scenario == "cancelled") { rejected = true; }
+                catch (IOException) when (scenario == "unknown") { rejected = true; }
+
+                bool dispatched = scenario is not ("wrong-input" or "wrong-assignment");
+                bool success = scenario == "success";
+                string receipt = journal + ".model-dispatch-1";
+                string artifact = journal + ".candidate-1";
+                if (rejected == success || (checkpoint is not null) != success
+                    || calls != (dispatched ? 1 : 0) || File.Exists(receipt) != dispatched
+                    || File.Exists(artifact) != success || ledger.Pending != operation || ledger.Models != 1)
+                    throw new InvalidOperationException("Model dispatch outcome differs: " + scenario);
+                if (dispatched)
+                {
+                    owner.RequireOrderModelDispatch(operation);
+                    Reject(() => owner.ConsumeOrderModelDispatch(ledger, operation));
+                    byte[] original = File.ReadAllBytes(receipt);
+                    File.WriteAllBytes(receipt, [.. original, 0x20]);
+                    try { Reject(() => owner.RequireOrderModelDispatch(operation)); }
+                    finally { File.WriteAllBytes(receipt, original); }
+                    Reject(() => owner.RequireOrderModelDispatch(operation with { ReservedSeconds = 31 }));
+                    owner.RequireOrderModelDispatch(operation);
+                }
+                if (success)
+                {
+                    var recorded = checkpoint ?? throw new InvalidOperationException("Missing checkpoint.");
+                    if (!owner.RequireOrderCandidate(recorded).SequenceEqual(Encoding.UTF8.GetBytes(candidate))
+                        || ledger.Checkpoint(claim, recorded).Pending != operation)
+                        throw new InvalidOperationException("Candidate capture became operation completion.");
+                }
+                owner.ValidateOrderJournalFiles();
+            }
+            finally
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
+        Console.WriteLine("PASS: reserved S01 model dispatch once-only receipt, exact baseline and assignment, generated candidate capture, unknown/cancelled remain pending.");
+    }
+
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
         Func<string, string, Task> expectOwnership)
     {
+        await TestModelDispatchAsync(prefix);
         await TestLiveGuestCaptureAsync(prefix);
         foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan" })
         {
@@ -702,7 +791,7 @@ internal static class PersistenceBridgeProbe
         throw new InvalidOperationException("Bridge child stopped before " + expected);
     }
 
-    internal static DevelopmentOrderApproval FixtureApproval(int? safetyReserveSeconds = null)
+    internal static DevelopmentOrderApproval FixtureApproval(int? safetyReserveSeconds = null, string? baselineHash = null)
     {
         using Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("HaMi.Probe.Order")
             ?? throw new InvalidOperationException("Order fixture missing.");
@@ -733,7 +822,8 @@ internal static class PersistenceBridgeProbe
         string repository = document.GetProperty("repository").GetString()!;
         string commit = document.GetProperty("baseCommit").GetString()!;
         string hash = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic review"));
-        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", commit, hash, hash, policy.Sha256, hash, hash);
+        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", commit, hash, hash, policy.Sha256,
+            baselineHash ?? hash, hash);
         DateTimeOffset time = new(2026, 11, 25, 10, 0, 0, TimeSpan.Zero);
         var comment = new OrderCommentObservation(1, 42, "fixture-owner",
             $"HaMi-Order-Approval: v1 1 {order.Sha256} {commit}", time, time);

@@ -301,7 +301,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             || Enumerable.Range(1, OrderCandidateCheckpoint.MaxSequence)
                 .Any(sequence => RegularFileExists(CandidatePath(sequence)) || RegularFileExists(OperationEvidencePath(sequence))
                     || RegularFileExists(GuestReportPath(sequence)) || RegularFileExists(SnapshotManifestPath(sequence))
-                    || RegularFileExists(GuestDispatchPath(sequence)));
+                    || RegularFileExists(GuestDispatchPath(sequence)) || RegularFileExists(ModelDispatchPath(sequence)));
 
         // Fixed, host-owned path; only the same lease that made the claim
         // can initialize an empty file. Never recreate a missing journal.
@@ -461,6 +461,59 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             var evidence = OrderStorageJson.Decode<OrderOperationEvidence>(bytes, OrderOperationEvidence.MaxBytes);
             evidence.ValidateCompletion(claim, reservation, completion);
             return evidence;
+        }
+
+        private string ModelDispatchPath(int sequence) =>
+            journalPath + ".model-dispatch-" + sequence.ToString(CultureInfo.InvariantCulture);
+
+        private sealed record ModelDispatchReceipt(int Version, string ArchiveHash,
+            OrderOperationReservation Reservation, string InputHash);
+
+        private (string Path, byte[] Bytes) BoundModelDispatch(OrderOperationReservation reservation)
+        {
+            RequireOrderStorage();
+            DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            OrderCheck.Require(reservation.Version == 4 && reservation.Kind == "model" && reservation.Step == "S01"
+                && reservation.SnapshotHash is null && reservation.ReservedSeconds > 0 && reservation.ObservedUtcTicks > 0,
+                "ORDER_MODEL_DISPATCH_RESERVATION");
+            (reservation.Assignment ?? throw new InvalidOperationException("ORDER_OPERATION_ASSIGNMENT")).Validate();
+            string prefix = claim.JobId + ":";
+            string id = reservation.OperationId;
+            if (!id.StartsWith(prefix, StringComparison.Ordinal)
+                || !int.TryParse(id.AsSpan(prefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out int sequence)
+                || sequence is < 1 or > OrderCandidateCheckpoint.MaxSequence
+                || id != prefix + sequence.ToString(CultureInfo.InvariantCulture))
+                throw new InvalidOperationException("ORDER_MODEL_DISPATCH_SEQUENCE");
+            byte[] bytes = OrderStorageJson.Encode(new ModelDispatchReceipt(1, claim.ArchiveHash, reservation,
+                claim.Binding.CalculatorBaselineHash), DevelopmentOrderOperationLedger.EventMaxBytes);
+            return (ModelDispatchPath(sequence), bytes);
+        }
+
+        // This is a private once-only intent, not an outcome or fresh ack.
+        // Consume before calling the external provider; never on replay.
+        internal void ConsumeOrderModelDispatch(DevelopmentOrderOperationLedger acknowledged,
+            OrderOperationReservation reservation)
+        {
+            var (path, bytes) = BoundModelDispatch(reservation);
+            DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            OrderCheck.Require(acknowledged.Pending == reservation && acknowledged.ArchiveHash == claim.ArchiveHash,
+                "ORDER_MODEL_DISPATCH_PENDING");
+            if (RegularFileExists(path))
+                throw new InvalidOperationException("Order model dispatch already consumed.");
+            var limits = acknowledged.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+            _ = acknowledged.DispatchAllowance(limits, reservation.OperationId, DateTime.UtcNow.Ticks);
+            WriteNew(path, bytes);
+            RequireOrderModelDispatch(reservation);
+        }
+
+        internal void RequireOrderModelDispatch(OrderOperationReservation reservation)
+        {
+            var (path, expected) = BoundModelDispatch(reservation);
+            if (!RegularFileExists(path))
+                throw new InvalidOperationException("Order model dispatch receipt missing.");
+            validatePrivateEntry!(path, false);
+            byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(path, DevelopmentOrderOperationLedger.EventMaxBytes);
+            OrderCheck.Require(bytes.AsSpan().SequenceEqual(expected), "ORDER_MODEL_DISPATCH_BYTES");
         }
 
         private string GuestReportPath(int sequence)
