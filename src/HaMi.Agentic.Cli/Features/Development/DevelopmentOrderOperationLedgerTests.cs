@@ -53,6 +53,7 @@ internal static class DevelopmentOrderOperationLedgerTests
             throw new InvalidOperationException("Acknowledgement time not charged.");
         Reject(() => reserved.DispatchAllowance(limits, job + ":2", now));
         Reject(() => reserved.DispatchAllowance(limits, reserve.OperationId, now + 30 * TimeSpan.TicksPerSecond));
+        DispatchDeadlineSelfTest(reserved, reserve, afterTen);
         var failed = reserved.Complete(completion with { Outcome = "failed", ObservedUtcTicks = afterTen });
         var retry = Propose(failed, "S01", "model", 30, afterTen);
         if (failed.LastOutcome != "failed" || failed.LastEvidenceHash != hash || retry.OperationId == reserve.OperationId)
@@ -336,6 +337,59 @@ internal static class DevelopmentOrderOperationLedgerTests
             throw new InvalidOperationException("Reconciled guest refunded budget or lost identity.");
         Reject(() => guestSettled.CompleteGuest(recoveredOutcome));
         Console.WriteLine("PASS: pre-bound guest run identity, exact report and confirmed absence required; unknown guest remains blocked.");
+    }
+
+    private static void DispatchDeadlineSelfTest(DevelopmentOrderOperationLedger acknowledged,
+        OrderOperationReservation reservation, long now)
+    {
+        var clock = new DispatchClock(now);
+        using var stop = new CancellationTokenSource();
+        using var deadline = DevelopmentOrderDispatchDeadline.Start(acknowledged, reservation, stop.Token, clock);
+        if (deadline.Limit(TimeSpan.FromSeconds(90)) != TimeSpan.FromSeconds(20)
+            || deadline.Limit(TimeSpan.FromSeconds(3)) != TimeSpan.FromSeconds(3))
+            throw new InvalidOperationException("Initial dispatch window differs.");
+
+        clock.Timestamp += TimeSpan.FromSeconds(7).Ticks;
+        clock.UtcTicks -= TimeSpan.FromSeconds(60).Ticks;
+        if (deadline.Limit(TimeSpan.FromSeconds(90)) != TimeSpan.FromSeconds(13))
+            throw new InvalidOperationException("New phase or UTC rollback extended dispatch.");
+
+        clock.Timestamp += TimeSpan.FromSeconds(13).Ticks;
+        try
+        {
+            _ = deadline.Limit(TimeSpan.FromSeconds(1));
+            throw new InvalidOperationException("Expired dispatch accepted.");
+        }
+        catch (TimeoutException) { }
+        if (!deadline.Token.IsCancellationRequested)
+            throw new InvalidOperationException("Expired dispatch did not cancel.");
+
+        clock = new DispatchClock(now);
+        using var cooperative = DevelopmentOrderDispatchDeadline.Start(acknowledged, reservation, stop.Token, clock);
+        stop.Cancel();
+        if (!cooperative.Token.IsCancellationRequested)
+            throw new InvalidOperationException("Caller cancellation was not propagated.");
+        try
+        {
+            _ = cooperative.Limit(TimeSpan.FromSeconds(1));
+            throw new InvalidOperationException("Cancelled dispatch accepted.");
+        }
+        catch (OperationCanceledException) { }
+
+        Reject(() => DevelopmentOrderDispatchDeadline.Start(acknowledged,
+            reservation with { ReservedSeconds = reservation.ReservedSeconds + 1 }, CancellationToken.None, clock));
+        Reject(() => DevelopmentOrderDispatchDeadline.Start(acknowledged, reservation, CancellationToken.None,
+            new DispatchClock(reservation.ObservedUtcTicks + TimeSpan.FromSeconds(reservation.ReservedSeconds).Ticks)));
+        Console.WriteLine("PASS: shared monotonic dispatch deadline, phase caps and cooperative cancellation.");
+    }
+
+    private sealed class DispatchClock(long utcTicks) : TimeProvider
+    {
+        internal long UtcTicks { get; set; } = utcTicks;
+        internal long Timestamp { get; set; }
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => Timestamp;
+        public override DateTimeOffset GetUtcNow() => new(UtcTicks, TimeSpan.Zero);
     }
 
     private static void Reject(Action action)
