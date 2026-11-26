@@ -2283,9 +2283,9 @@ internal static class PersistenceBridgeProbe
                         inputs, reservation, Path.Combine(root, "formatter-verification"));
                     if (success)
                     {
-                        var recorded = current.Ledger.LatestGuestOutcome
+                        var recordedFormatterGuest = current.Ledger.LatestGuestOutcome
                             ?? throw new InvalidOperationException("Formatter outcome missing.");
-                        byte[] report = owner.RequireOrderGuestReport(recorded, reservation);
+                        byte[] report = owner.RequireOrderGuestReport(recordedFormatterGuest, reservation);
                         var observed = ObserveFixtureGuest(claim, reservation, report)
                             ?? throw new InvalidOperationException("Formatter fixture absence missing.");
                         var formatter = DevelopmentOrderFormatterVerifier.RequireCompletedGuest(owner, beforeFormatter,
