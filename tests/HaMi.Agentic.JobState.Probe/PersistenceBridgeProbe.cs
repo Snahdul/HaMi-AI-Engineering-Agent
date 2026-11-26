@@ -1090,7 +1090,7 @@ internal static class PersistenceBridgeProbe
     }
 
     private static async Task TestIntegrationSnapshotAsync(DevelopmentJobStateStore.Lease owner,
-        OrderPairHistory history, OrderPairObservation observed, string root, string journal,
+        OrderPairHistory history, OrderPairObservation observed, string root, string journal, string finalCrash,
         Func<OrderOperationReservation, Task<DevelopmentOrderOperationLedger>> admit,
         Func<OrderGuestOutcome, Task<DevelopmentOrderOperationLedger>> complete)
     {
@@ -1192,6 +1192,8 @@ internal static class PersistenceBridgeProbe
         var acknowledged = await admit(proposal);
         if (acknowledged != admitted)
             throw new InvalidOperationException("Integration guest admission acknowledgement differs.");
+        if (finalCrash == "pre-dispatch")
+            return;
         string results = Path.Combine(root, "integration-results");
         Directory.CreateDirectory(results);
         string id = DevelopmentOrderGuestReconciliation.RunId(proposal);
@@ -1249,7 +1251,8 @@ internal static class PersistenceBridgeProbe
                     else if (args.Contains("run", StringComparer.Ordinal))
                     {
                         executions++;
-                        response = new(0, DevelopmentOrderIntegrationVerifier.ExpectedStdout + "\n", "");
+                        response = new(0, (finalCrash == "wrong-output" ? DevelopmentOrderFormatterVerifier.ExpectedStdout
+                            : DevelopmentOrderIntegrationVerifier.ExpectedStdout) + "\n", "");
                     }
                     break;
             }
@@ -1280,9 +1283,21 @@ internal static class PersistenceBridgeProbe
         if (calls != 0 || File.Exists(journal + ".guest-dispatch-5"))
             throw new InvalidOperationException("Invalid integration context reached dispatch.");
 
-        var outcome = await Run(acknowledged, history, observed)
-            ?? throw new InvalidOperationException("Integration runner returned no outcome.");
+        var outcome = await Run(acknowledged, history, observed);
         owner.RequireOrderGuestDispatch(proposal);
+        if (finalCrash == "wrong-output")
+        {
+            if (outcome is not null || !created || !removed || executions != 1
+                || File.Exists(journal + ".guest-report-5"))
+                throw new InvalidOperationException("Wrong integration marker produced a successful outcome.");
+            int priorCalls = calls;
+            await RejectRunAsync(acknowledged, history, observed);
+            if (calls != priorCalls)
+                throw new InvalidOperationException("Wrong-marker dispatch repeated.");
+            return;
+        }
+        if (outcome is null)
+            throw new InvalidOperationException("Integration runner returned no outcome.");
         byte[] captured = owner.RequireOrderGuestReport(outcome, proposal);
         if (!created || !removed || executions != 1 || afterReturn != 1 || originalReport is null
             || !captured.SequenceEqual(originalReport) || captured.SequenceEqual(File.ReadAllBytes(raw))
@@ -1334,6 +1349,8 @@ internal static class PersistenceBridgeProbe
             try { Reject(() => Correlate(completedGuest, fresh)); }
             finally { File.WriteAllBytes(evidence, original); }
         }
+        if (finalCrash == "orphan")
+            return;
         if (await complete(outcome) != completedGuest)
             throw new InvalidOperationException("Integration guest completion acknowledgement differs.");
         Console.WriteLine("BRIDGE_PHASE: FINAL controlled runner and historical correlation verified; exact integration outcome persisted before ack.");
@@ -1629,7 +1646,8 @@ internal static class PersistenceBridgeProbe
         foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan",
             "model-receipt", "model-orphan", "model-checkpoint", "model-generated", "model-rejected", "model-rejected-orphan", "model-accepted", "model-verified", "soft-stop",
             "model-formatter-receipt", "model-formatter-orphan", "model-formatter-checkpoint",
-            "model-formatter-rejected", "model-formatter-rejected-orphan" })
+            "model-formatter-rejected", "model-formatter-rejected-orphan",
+            "model-final-pre-dispatch", "model-final-wrong-output", "model-final-orphan" })
         {
             bool unknown = scenario == "unknown";
             bool failed = scenario == "failed";
@@ -1640,7 +1658,9 @@ internal static class PersistenceBridgeProbe
             bool modelScenario = scenario.StartsWith("model-", StringComparison.Ordinal);
             bool softScenario = scenario == "soft-stop";
             bool formatterScenario = scenario.StartsWith("model-formatter-", StringComparison.Ordinal);
-            bool calculatorScenario = formatterScenario || scenario is "model-accepted" or "model-verified";
+            bool finalScenario = scenario.StartsWith("model-final-", StringComparison.Ordinal);
+            bool successfulFormatter = scenario == "model-accepted" || finalScenario;
+            bool calculatorScenario = formatterScenario || successfulFormatter || scenario == "model-verified";
             bool formatterHasCandidate = scenario is not ("model-formatter-receipt" or "model-formatter-rejected" or "model-formatter-rejected-orphan");
             bool formatterHasEvidence = scenario != "model-formatter-receipt";
             bool modelGenerated = scenario == "model-generated";
@@ -1660,6 +1680,8 @@ internal static class PersistenceBridgeProbe
                     "bridge-model-resume-accepted", "BRIDGE_CALCULATOR_RECOVERED"),
                 "model-verified" => ("bridge-model-verified", "BRIDGE_CALCULATOR_VERIFIED",
                     "bridge-model-resume-verified", "BRIDGE_CALCULATOR_RECOVERED"),
+                _ when finalScenario => ("bridge-model-accepted", "BRIDGE_CALCULATOR_ACCEPTED",
+                    "bridge-model-resume-final-" + scenario["model-final-".Length..], "BRIDGE_CALCULATOR_RECOVERED"),
                 _ when formatterScenario => ("bridge-model-accepted", "BRIDGE_CALCULATOR_ACCEPTED",
                     "bridge-model-resume-formatter-" + scenario["model-formatter-".Length..], "BRIDGE_CALCULATOR_RECOVERED"),
                 _ when modelScenario => ("bridge-" + scenario, "BRIDGE_MODEL_CRASH_READY",
@@ -1793,7 +1815,7 @@ internal static class PersistenceBridgeProbe
                 // Kill the third owner at success or unresolved wrong marker.
                 string[] guestSlots = ["snapshot-4", "guest-dispatch-4", "guest-report-4"];
                 bool formatterGuestScenario = calculatorScenario && !formatterScenario;
-                bool[] expectedGuestSlots = [true, true, scenario == "model-accepted"];
+                bool[] expectedGuestSlots = [true, true, successfulFormatter];
                 byte[][] guestEvidence = [];
                 if (formatterGuestScenario)
                 {
@@ -1828,7 +1850,7 @@ internal static class PersistenceBridgeProbe
 
                 // A successful guest completion is not step acceptance.
                 // Fourth owner accepts independently, then dies after ACK.
-                if (scenario == "model-accepted")
+                if (successfulFormatter)
                 {
                     using Process acceptanceChild = start(resumeMode, root);
                     Task<string> acceptanceErrors = acceptanceChild.StandardError.ReadToEndAsync();
@@ -1855,18 +1877,23 @@ internal static class PersistenceBridgeProbe
                 }
 
                 string[] finalSlots = ["snapshot-5", "guest-dispatch-5", "guest-report-5"];
+                bool[] expectedFinalSlots = [successfulFormatter, successfulFormatter && scenario != "model-final-pre-dispatch",
+                    scenario is "model-accepted" or "model-final-orphan"];
                 byte[][] finalEvidence = [];
-                if (scenario == "model-accepted")
+                if (successfulFormatter)
                 {
                     using Process finalChild = start(resumeMode, root);
                     Task<string> finalErrors = finalChild.StandardError.ReadToEndAsync();
                     try
                     {
-                        await WaitForMarkerAsync(finalChild, "BRIDGE_FINAL_COMPLETED").WaitAsync(Deadline);
+                        await WaitForMarkerAsync(finalChild, finalScenario ? "BRIDGE_FINAL_PENDING" : "BRIDGE_FINAL_COMPLETED").WaitAsync(Deadline);
                         if (finalChild.HasExited)
                             throw new InvalidOperationException("Integration owner stopped before process kill.");
                         await expectOwnership(root, "BUSY");
-                        finalEvidence = finalSlots.Select(slot => File.ReadAllBytes(calculatorPrefix + slot)).ToArray();
+                        if (finalSlots.Where((slot, i) => File.Exists(calculatorPrefix + slot) != expectedFinalSlots[i]).Any())
+                            throw new InvalidOperationException("Unexpected FINAL crash evidence.");
+                        finalEvidence = finalSlots.Select((slot, i) => expectedFinalSlots[i]
+                            ? File.ReadAllBytes(calculatorPrefix + slot) : []).ToArray();
                     }
                     finally
                     {
@@ -1952,7 +1979,7 @@ internal static class PersistenceBridgeProbe
                         || File.Exists(calculatorPrefix + "guest-dispatch-3")
                         || File.Exists(calculatorPrefix + "model-dispatch-4")
                         || File.Exists(calculatorPrefix + "guest-dispatch-4") != !formatterScenario
-                        || File.Exists(calculatorPrefix + "guest-report-4") != (scenario == "model-accepted")
+                        || File.Exists(calculatorPrefix + "guest-report-4") != successfulFormatter
                         || File.Exists(calculatorPrefix + "snapshot-4") != !formatterScenario
                         || formatterSlots.Where((slot, i) => File.Exists(calculatorPrefix + slot) != expectedFormatterSlots[i]
                             || expectedFormatterSlots[i] && !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(formatterEvidence[i])).Any()
@@ -1962,12 +1989,10 @@ internal static class PersistenceBridgeProbe
                     if (formatterGuestScenario && (guestSlots.Where((slot, i) =>
                             File.Exists(calculatorPrefix + slot) != expectedGuestSlots[i]
                             || expectedGuestSlots[i] && !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(guestEvidence[i])).Any()
-                        || File.Exists(calculatorPrefix + "guest-dispatch-5") != (scenario == "model-accepted")
-                        || File.Exists(calculatorPrefix + "snapshot-5") != (scenario == "model-accepted")
-                        || File.Exists(calculatorPrefix + "guest-report-5") != (scenario == "model-accepted")))
+                        || finalSlots.Where((slot, i) => File.Exists(calculatorPrefix + slot) != expectedFinalSlots[i]).Any()))
                         throw new InvalidOperationException("Formatter guest recovery changed protected slots.");
-                    if (scenario == "model-accepted" && (finalSlots.Where((slot, i) =>
-                        !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(finalEvidence[i])).Any()
+                    if (successfulFormatter && (finalSlots.Where((slot, i) =>
+                        expectedFinalSlots[i] && !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(finalEvidence[i])).Any()
                         || File.Exists(calculatorPrefix + "guest-dispatch-6")
                         || File.Exists(calculatorPrefix + "snapshot-6")
                         || File.Exists(calculatorPrefix + "guest-report-6")))
@@ -2000,6 +2025,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: independent S02 acceptance persisted and recovered after process kill; immutable predecessor, exact evidence, budget and no redispatch.");
         Console.WriteLine("PASS: FINAL guest reservation and successful outcome persisted before ack; process kill recovers all three guest proofs and both acceptances without redispatch or budget reset.");
         Console.WriteLine("PASS: terminal order acceptance persisted before ack and recovered after process kill; exact evidence, original budget and no further effects.");
+        Console.WriteLine("PASS: FINAL pre-dispatch, wrong-output and orphan-report process kills recover pending blocked without redispatch, adoption or budget reset.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2094,7 +2120,11 @@ internal static class PersistenceBridgeProbe
         const string formatterModePrefix = "bridge-model-resume-formatter-";
         string formatterCrash = mode.StartsWith(formatterModePrefix, StringComparison.Ordinal)
             ? mode[formatterModePrefix.Length..] : "generated";
-        bool calculatorScenario = mode is "bridge-model-accepted" or "bridge-model-resume-accepted"
+        const string finalModePrefix = "bridge-model-resume-final-";
+        string finalCrash = mode.StartsWith(finalModePrefix, StringComparison.Ordinal)
+            ? mode[finalModePrefix.Length..] : "completed";
+        bool successfulFormatter = mode == "bridge-model-resume-accepted" || finalCrash != "completed";
+        bool calculatorScenario = successfulFormatter || mode is "bridge-model-accepted"
             or "bridge-model-verified" or "bridge-model-resume-verified" || mode.StartsWith(formatterModePrefix, StringComparison.Ordinal);
         bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
             or "bridge-guest-unknown" or "bridge-guest-orphan"
@@ -2601,6 +2631,67 @@ internal static class PersistenceBridgeProbe
                     DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state,
                         ObserveCalculatorFixture(owner, claim, outcome), baseline, pair);
 
+                if (current.Stage == 14)
+                {
+                    if (finalCrash is not ("pre-dispatch" or "wrong-output" or "orphan"))
+                        throw new InvalidOperationException("Unexpected pending FINAL fixture.");
+                    var pendingHistory = RequirePairHistory(current);
+                    var pendingObservations = ObservePairFixture(owner, claim, pendingHistory, root);
+                    var pendingFinal = current.Ledger.Pending
+                        ?? throw new InvalidOperationException("FINAL reservation missing.");
+                    var acceptedPair = pendingHistory.AcceptedPair;
+                    var effectiveLimits = acceptedPair.CurrentLimits ?? throw new InvalidOperationException("Missing effective budget.");
+                    if (pendingFinal is not { Step: "FINAL", Kind: "guest" }
+                        || current.Ledger != acceptedPair.ReserveWithRequiredWork(claim.JobId, effectiveLimits, pendingFinal, [])
+                        || current.Ledger.Sequence != 5 || current.Ledger.Models != 2 || current.Ledger.Guests != 3
+                        || current.Ledger.ReservedSeconds != 80 + acceptedPair.FinalReserveSeconds
+                        || current.Ledger.AcceptedOrder is not null)
+                        throw new InvalidOperationException("Pending FINAL recovery changed history.");
+                    DevelopmentOrderIntegrationVerifier.RequireGuestSnapshot(owner, pendingHistory, pendingObservations,
+                        pendingFinal, Path.Combine(root, "integration-verification"));
+                    if (finalCrash == "pre-dispatch")
+                        Reject(() => owner.RequireOrderGuestDispatch(pendingFinal));
+                    else
+                    {
+                        owner.RequireOrderGuestDispatch(pendingFinal);
+                        Reject(() => owner.ConsumeOrderGuestDispatch(current.Ledger, pendingFinal));
+                    }
+
+                    OrderGuestOutcome? orphan = null;
+                    if (finalCrash == "orphan")
+                    {
+                        byte[] orphanBytes = File.ReadAllBytes(database + ".guest-report-5");
+                        orphan = ObserveFixtureGuest(claim, pendingFinal, orphanBytes)
+                            ?? throw new InvalidOperationException("Orphan FINAL observation missing.");
+                        if (!owner.RequireOrderGuestReport(orphan, pendingFinal).SequenceEqual(orphanBytes)
+                            || !DevelopmentOrderGuestReconciliation.IsIntegrationReport(pendingFinal, orphanBytes))
+                            throw new InvalidOperationException("Orphan FINAL report differs.");
+                    }
+                    else if (File.Exists(database + ".guest-report-5"))
+                        throw new InvalidOperationException("Unexpected successful FINAL report.");
+                    Reject(() => DevelopmentOrderIntegrationVerifier.RequireCompletedGuest(owner, pendingHistory,
+                        pendingObservations, current.Ledger, orphan));
+                    Reject(() => DevelopmentOrderIntegrationVerifier.ProposeAcceptance(owner, pendingHistory,
+                        pendingObservations, current.Ledger, orphan, DateTime.UtcNow.Ticks));
+                    var retryFinal = current.Ledger.Propose(claim.JobId, "FINAL", "guest",
+                        acceptedPair.FinalReserveSeconds, DateTime.UtcNow.Ticks, null, pendingFinal.SnapshotHash);
+                    Reject(() => current.Ledger.Reserve(claim.JobId, effectiveLimits, retryFinal));
+                    bool blockedAdmission = false, blockedAcceptance = false;
+                    try { _ = await actor.Ask<BridgeState>(new AdmitIntegrationGuest(pendingFinal), Deadline); }
+                    catch (InvalidOperationException) { blockedAdmission = true; }
+                    try { _ = await actor.Ask<BridgeState>(new AcceptOrder(), Deadline); }
+                    catch (InvalidOperationException) { blockedAcceptance = true; }
+                    // Replay and classification do not call the runner or adopt
+                    // even a valid orphan. Explicit reconciliation is separate.
+                    if (!blockedAdmission || !blockedAcceptance || await ReadAsync() != current
+                        || File.Exists(database + ".guest-dispatch-6"))
+                        throw new InvalidOperationException("Pending FINAL recovery mutated journal.");
+                    Console.WriteLine("BRIDGE_PHASE: FINAL " + finalCrash
+                        + " recovered pending blocked; no redispatch, evidence adoption or budget reset.");
+                    Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
+                    return 0;
+                }
+
                 if (current.Stage == 16)
                 {
                     var terminalHistory = RequirePairHistory(current);
@@ -2775,13 +2866,15 @@ internal static class PersistenceBridgeProbe
                         return current.Ledger;
                     }
 
-                    await TestIntegrationSnapshotAsync(owner, pairHistory, pairObservation, root, database,
+                    await TestIntegrationSnapshotAsync(owner, pairHistory, pairObservation, root, database, finalCrash,
                         AdmitIntegration, CompleteIntegration);
-                    if (await ReadAsync() != current || current.Stage != 15 || File.Exists(database + ".guest-dispatch-6"))
+                    bool completedIntegration = finalCrash == "completed";
+                    if (await ReadAsync() != current || current.Stage != (completedIntegration ? 15 : 14)
+                        || File.Exists(database + ".guest-dispatch-6"))
                         throw new InvalidOperationException("Integration completion changed history.");
                     owner.ValidateOrderJournalFiles();
                     Console.WriteLine("BRIDGE_PHASE: persisted S02 acceptance recovered after process kill; exact predecessor, candidate, guest evidence and budget unchanged.");
-                    Console.WriteLine("BRIDGE_FINAL_COMPLETED");
+                    Console.WriteLine(completedIntegration ? "BRIDGE_FINAL_COMPLETED" : "BRIDGE_FINAL_PENDING");
                     Console.Out.Flush();
                     await Task.Delay(Timeout.InfiniteTimeSpan);
                     return 1;
@@ -2795,7 +2888,7 @@ internal static class PersistenceBridgeProbe
                         ?? throw new InvalidOperationException("Formatter model history missing.");
                     var inputs = ReadFormatterInputs(beforeFormatter,
                         ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root));
-                    bool success = mode == "bridge-model-resume-accepted";
+                    bool success = successfulFormatter;
                     if (current.Stage != (success ? 12 : 11)
                         || (current.Ledger.Pending is not null) == success
                         || current.Ledger.Sequence != 4 || current.Ledger.Models != 2 || current.Ledger.Guests != 2
@@ -2975,8 +3068,8 @@ internal static class PersistenceBridgeProbe
                         }
 
                         await TestFormatterSnapshotAsync(owner, beforeFormatter, completedFormatter.Ledger, recoveredInputs,
-                            root, database, mode == "bridge-model-resume-accepted", AdmitGuest, CompleteGuest);
-                        if (await ReadAsync() != current || current.Stage != (mode == "bridge-model-resume-accepted" ? 12 : 11))
+                            root, database, successfulFormatter, AdmitGuest, CompleteGuest);
+                        if (await ReadAsync() != current || current.Stage != (successfulFormatter ? 12 : 11))
                             throw new InvalidOperationException("Formatter guest journal differs before kill.");
                         owner.ValidateOrderJournalFiles();
                         Console.WriteLine("BRIDGE_FORMATTER_GUEST_CAPTURED");

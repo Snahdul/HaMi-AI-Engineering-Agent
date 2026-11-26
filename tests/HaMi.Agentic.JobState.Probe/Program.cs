@@ -101,7 +101,9 @@ internal static class Program
             or "bridge-model-verified" or "bridge-model-resume-verified"
             or "bridge-model-resume-formatter-receipt" or "bridge-model-resume-formatter-orphan"
             or "bridge-model-resume-formatter-checkpoint" or "bridge-model-resume-formatter-rejected"
-            or "bridge-model-resume-formatter-rejected-orphan")
+            or "bridge-model-resume-formatter-rejected-orphan"
+            or "bridge-model-resume-final-pre-dispatch" or "bridge-model-resume-final-wrong-output"
+            or "bridge-model-resume-final-orphan")
         {
             string root = args[1];
             string name = Path.GetFileName(root);
