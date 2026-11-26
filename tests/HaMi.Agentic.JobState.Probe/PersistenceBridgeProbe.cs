@@ -2030,6 +2030,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: bounded workflow admission checks mandatory work and actual journal acknowledgements for S02 model, S02 guest and FINAL; stale and repeated admissions rejected.");
         Console.WriteLine("PASS: common pair admission and completion checks S01 through FINAL; model recovery is read-only and invalid, stale or duplicate completions rejected.");
         Console.WriteLine("PASS: common read-only guest reconciliation correlates journal action, protected pair report and fresh observation; orphan and unknown effects remain blocked.");
+        Console.WriteLine("PASS: common budget decision classifies reservation, hard stop and soft stop; denied pair requests never reach reservation callbacks.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -3285,6 +3286,29 @@ internal static class PersistenceBridgeProbe
                         throw new InvalidOperationException("Invalid workflow admission accepted.");
                 }
 
+                var softPlan = new OrderRequiredOperation[]
+                {
+                    new("S02", "guest", 1800), formatterRequired[1]
+                };
+                var softDecision = DevelopmentOrderAdmission.Decide(claim, acceptedState.Ledger, actualRequest, softPlan);
+                var hardRequest = actualRequest with { ReservedSeconds = 1800 };
+                var hardDecision = DevelopmentOrderAdmission.Decide(claim, acceptedState.Ledger, hardRequest, formatterRequired);
+                if (softDecision.Ledger.SoftStop is not { Reason: "time" } soft
+                    || !soft.RequiredAfter.SequenceEqual(softPlan)
+                    || DevelopmentOrderOperationLedger.DecodeSoftStop(softDecision.Event).Request != actualRequest
+                    || hardDecision.Ledger.BudgetStop is not { Reason: "time" } hard || hard.Request != hardRequest
+                    || DevelopmentOrderOperationLedger.DecodeBudgetStop(hardDecision.Event) != hard
+                    || softDecision.Ledger.Pending is not null || hardDecision.Ledger.Pending is not null
+                    || softDecision.Ledger.ReservedSeconds != acceptedState.Ledger.ReservedSeconds
+                    || hardDecision.Ledger.Sequence != acceptedState.Ledger.Sequence
+                    || softDecision.Ledger.AcceptedS01 != accepted || hardDecision.Ledger.AcceptedS01 != accepted
+                    || DevelopmentOrderWorkflow.Select(claim, softDecision.Ledger) != OrderWorkflowAction.AwaitBudgetExtension
+                    || DevelopmentOrderWorkflow.Select(claim, hardDecision.Ledger) != OrderWorkflowAction.AwaitBudgetExtension)
+                    throw new InvalidOperationException("Pair budget decision differs.");
+                await RejectWorkflowAdmissionAsync(acceptedState.Ledger, actualRequest, softPlan);
+                await RejectWorkflowAdmissionAsync(acceptedState.Ledger, hardRequest, formatterRequired);
+                await RejectWorkflowAdmissionAsync(softDecision.Ledger, actualRequest, formatterRequired);
+                await RejectWorkflowAdmissionAsync(hardDecision.Ledger, actualRequest, formatterRequired);
                 await RejectWorkflowAdmissionAsync(acceptedState.Ledger, actualRequest with { Step = "S01" }, formatterRequired);
                 await RejectWorkflowAdmissionAsync(acceptedState.Ledger, actualRequest, [formatterRequired[1]]);
                 if (syntheticAdmissionCalls != 0)
@@ -4025,21 +4049,9 @@ internal static class PersistenceBridgeProbe
                 }
 
                 var request = command.Request;
-                var effective = state.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
                 var required = FixtureRequiredAfter(request.Step, policy);
-                string? hard = state.Ledger.BudgetDenial(claim.JobId, effective, request);
-                string? soft = state.Ledger.SoftStopDenial(claim.JobId, effective, request, required);
-                string evt;
-                if (hard is not null)
-                    evt = DevelopmentOrderOperationLedger.EncodeBudgetStop(new(1, request, hard));
-                else if (soft is not null)
-                    evt = DevelopmentOrderOperationLedger.EncodeSoftStop(new(1, request, required, soft));
-                else
-                {
-                    _ = state.Ledger.ReserveWithRequiredWork(claim.JobId, effective, request, required);
-                    evt = DevelopmentOrderOperationLedger.EncodeReservation(request);
-                }
-
+                var decision = DevelopmentOrderAdmission.DecideBudget(claim.JobId, state.Ledger, request, required);
+                string evt = decision.Event;
                 BridgeState next = Next(state, evt);
                 IActorRef reply = Sender;
                 Persist(evt, _ =>
