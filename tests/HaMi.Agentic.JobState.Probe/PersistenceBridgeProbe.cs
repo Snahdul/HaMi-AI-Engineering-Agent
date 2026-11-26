@@ -99,7 +99,7 @@ internal static class PersistenceBridgeProbe
     {
         if (reservation.SnapshotHash != FixtureSnapshotHash)
             throw new InvalidOperationException("Fixture snapshot identity differs.");
-        var report = new DevelopmentSandboxRunner.SandboxRunReport(2,
+        var report = new DevelopmentSandboxRunner.SandboxRunReport(3,
             DevelopmentOrderGuestReconciliation.RunId(reservation), "Demo.csproj", "run",
             0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null, FixtureSnapshotHash);
         return System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(report,

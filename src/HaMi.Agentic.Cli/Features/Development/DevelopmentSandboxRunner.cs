@@ -45,6 +45,15 @@ internal static class DevelopmentSandboxRunner
         "if [ -n \"$v\" ]; then printf 'NONEMPTY_CREDENTIAL_ENV=%s\\n' \"$n\"; exit 19; fi; " +
         "done; printf 'CREDENTIAL_ENV=clean\\n';";
 
+    // Fixed trusted template utilities, before any candidate build or code.
+    // The only argument is the host-derived guest directory. Nonregular
+    // entries yield an invalid record; any failure omits the end marker.
+    private const string GuestSnapshotCheckScript =
+        "set -eu; export LC_ALL=C; test ! -L \"$1\"; cd \"$1\"; " +
+        "find . ! -type d ! -type f -printf 'INVALID\\0'; " +
+        "find . -type f -exec sha256sum --zero -- {} +; " +
+        "printf 'HAMI_SNAPSHOT_END\\0'";
+
     internal sealed record SandboxRunReport(
         int SchemaVersion, string RunId, string Project, string Mode,
         int RestoreExitCode, int BuildExitCode, int ExecutionExitCode,
@@ -104,6 +113,7 @@ internal static class DevelopmentSandboxRunner
         Directory.CreateDirectory(reportDir);
 
         string? verifiedSnapshotHash = null;
+        string[]? expectedGuestRecords = null;
         bool createAttempted = false;
         bool createConfirmed = false;
         bool sandboxRemovalSucceeded = false;
@@ -141,8 +151,7 @@ internal static class DevelopmentSandboxRunner
             {
                 // Hash the actual copied files, not just the input directory.
                 // Never label a mismatched staging snapshot as verified.
-                DevelopmentOrderSnapshot.Require(stage, project, reservation.SnapshotHash);
-                verifiedSnapshotHash = reservation.SnapshotHash;
+                expectedGuestRecords = DevelopmentOrderSnapshot.RequireGuestRecords(stage, project, reservation.SnapshotHash);
             }
 
             Stopwatch watch = Stopwatch.StartNew();
@@ -206,6 +215,17 @@ internal static class DevelopmentSandboxRunner
                 "Set guest snapshot owner");
             copyMs = watch.ElapsedMilliseconds;
             ProgressMessage($"Snapshot übertragen und Rechte gesetzt ({copyMs / 1000.0:F2} s).", "SNAPSHOT_TRANSFERRED");
+
+            if (reservation is not null)
+            {
+                SandboxProcess observedSnapshot = await InvokeAsync(TimeSpan.FromSeconds(30),
+                    "exec", sandbox, "/bin/sh", "-c", GuestSnapshotCheckScript, "hami-snapshot", guest);
+                DevelopmentOrderSnapshot.RequireGuestRecords(
+                    expectedGuestRecords ?? throw new InvalidOperationException("Expected snapshot missing."),
+                    observedSnapshot.ExitCode, observedSnapshot.Output, observedSnapshot.Error);
+                verifiedSnapshotHash = reservation.SnapshotHash;
+                ProgressMessage("Gast-Snapshot bestätigt.", "SNAPSHOT_VERIFIED");
+            }
 
             // No shell interpolation: the project name is a validated relative
             // path and each component of the dotnet command is a fixed argv item.
@@ -303,7 +323,7 @@ internal static class DevelopmentSandboxRunner
                 sandboxRemovalSucceeded ? 0 : 1);
         }
 
-        var report = new SandboxRunReport(reservation is null ? 1 : 2, id, guestProject, mode, restore, build,
+        var report = new SandboxRunReport(reservation is null ? 1 : 3, id, guestProject, mode, restore, build,
             execution, timedOut, createMs, copyMs, restoreMs, buildMs, executionMs, cleanupMs, lifecycle.ElapsedMilliseconds,
             sandboxRemovalSucceeded, error, verifiedSnapshotHash);
         string reportPath = Path.Combine(reportDir, "report.json");
@@ -779,7 +799,14 @@ internal static class DevelopmentSandboxRunner
                 "Auth mode: not configured", "State: running"
             });
 
-            foreach (string scenario in new[] { "existing", "backend", "ambiguous-create", "success" })
+            string[] expectedRecords = DevelopmentOrderSnapshot.RequireGuestRecords(source, "Demo.csproj", snapshotHash);
+            string guestOutput = string.Join('\0', expectedRecords.Reverse()) + "\0"
+                + DevelopmentOrderSnapshot.GuestEndMarker + "\0";
+            foreach (string scenario in new[]
+            {
+                "existing", "backend", "ambiguous-create", "guest-modified", "guest-extra",
+                "guest-missing", "guest-link", "guest-truncated", "guest-stderr", "success"
+            })
             {
                 string results = Path.Combine(root, scenario);
                 Directory.CreateDirectory(results);
@@ -809,6 +836,20 @@ internal static class DevelopmentSandboxRunner
                                 response = new(0, "CREDENTIAL_ENV=clean", "");
                             else if (args.Contains("--version", StringComparer.Ordinal))
                                 response = new(0, "11.0.100", "");
+                            else if (args.Contains(GuestSnapshotCheckScript, StringComparer.Ordinal))
+                            {
+                                string observed = scenario switch
+                                {
+                                    "guest-modified" => guestOutput.Replace(expectedRecords[0],
+                                        new string('f', 64) + expectedRecords[0][64..], StringComparison.Ordinal),
+                                    "guest-extra" => expectedRecords[0] + "\0" + guestOutput,
+                                    "guest-missing" => guestOutput.Replace(expectedRecords[0] + "\0", "", StringComparison.Ordinal),
+                                    "guest-link" => "INVALID\0" + guestOutput,
+                                    "guest-truncated" => guestOutput[..^1],
+                                    _ => guestOutput
+                                };
+                                response = new(0, observed, scenario == "guest-stderr" ? "unexpected stderr" : "");
+                            }
                             break;
                     }
                     return Task.FromResult(response);
@@ -817,10 +858,15 @@ internal static class DevelopmentSandboxRunner
                 int exit = await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
                     (_, _, _, _) => { }, reservation, FakeTransport);
                 bool success = scenario == "success";
+                bool guestChecked = success || scenario.StartsWith("guest-", StringComparison.Ordinal);
                 int creates = calls.Count(a => a[0] == "create");
                 int removes = calls.Count(a => a[0] == "rm");
-                if ((exit == 0) != success || creates != (scenario is "success" or "ambiguous-create" ? 1 : 0)
-                    || removes != (success ? 1 : 0)
+                int checkIndex = calls.FindIndex(a => a.Contains(GuestSnapshotCheckScript, StringComparer.Ordinal));
+                int restoreIndex = calls.FindIndex(a => a.Contains("restore", StringComparer.Ordinal));
+                if ((exit == 0) != success || creates != (guestChecked || scenario == "ambiguous-create" ? 1 : 0)
+                    || removes != (guestChecked ? 1 : 0)
+                    || (checkIndex >= 0) != guestChecked
+                    || (success ? restoreIndex <= checkIndex : restoreIndex != -1)
                     || calls[0][0] != "inspect" || calls[0][1] != name
                     || calls.Any(a => a[0] == "create" && a[2] != name)
                     || calls.Any(a => a[0] == "rm" && a[^1] != name))
@@ -830,8 +876,9 @@ internal static class DevelopmentSandboxRunner
                 byte[] bytes = File.ReadAllBytes(reportPath);
                 var report = JsonSerializer.Deserialize<SandboxRunReport>(bytes, new JsonSerializerOptions(JsonSerializerDefaults.Web))
                     ?? throw new InvalidOperationException("Reserved runner report missing.");
-                if (report.SchemaVersion != 2 || report.RunId != id || report.SnapshotHash != snapshotHash
-                    || report.SandboxRemovalSucceeded != success)
+                if (report.SchemaVersion != 3 || report.RunId != id
+                    || report.SnapshotHash != (success ? snapshotHash : null)
+                    || report.SandboxRemovalSucceeded != guestChecked)
                     throw new InvalidOperationException("Reserved report identity or cleanup differs.");
                 var observed = DevelopmentOrderGuestReconciliation.Observe(new string('A', 64),
                     reservation, bytes, 1, "", absent, DateTime.UtcNow.Ticks);
@@ -853,6 +900,7 @@ internal static class DevelopmentSandboxRunner
                     throw new InvalidOperationException("Reserved run was dispatched twice.");
             }
             Console.WriteLine("PASS: reserved sandbox runner uses pre-bound identity, rejects collisions and ambiguous create, retains one-shot slot.");
+            Console.WriteLine("PASS: guest snapshot observation precedes restore; changed/extra/missing/nonregular/truncated/diagnostic evidence blocks execution.");
         }
         finally
         {

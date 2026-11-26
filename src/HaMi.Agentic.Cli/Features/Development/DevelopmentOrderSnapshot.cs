@@ -13,7 +13,13 @@ internal static class DevelopmentOrderSnapshot
     private sealed record SnapshotFile(string Path, long Bytes, string Sha256);
     private sealed record SnapshotManifest(int Version, SnapshotFile[] Files);
 
-    internal static string Capture(string source, string project)
+    internal static string Capture(string source, string project) =>
+        ManifestHash(CaptureManifest(source, project));
+
+    private static string ManifestHash(SnapshotManifest manifest) =>
+        DevelopmentJobState.Hash(OrderStorageJson.Encode(manifest, MaxManifestBytes));
+
+    private static SnapshotManifest CaptureManifest(string source, string project)
     {
         string[] paths = DevelopmentSandboxRunner.InspectSnapshot(source, project);
         var entries = new List<SnapshotFile>();
@@ -23,7 +29,8 @@ internal static class DevelopmentOrderSnapshot
         {
             string normalized = relative.Replace(Path.DirectorySeparatorChar, '/');
             OrderCheck.Require(!normalized.Contains('\\') && normalized.Length <= 1024
-                && !normalized.Any(char.IsControl) && unique.Add(normalized), "ORDER_SNAPSHOT_PATH");
+                && !normalized.Contains('\uFFFD') && !normalized.Any(char.IsControl)
+                && unique.Add(normalized), "ORDER_SNAPSHOT_PATH");
             string path = Path.Combine(source, relative);
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
             long length = stream.Length;
@@ -35,14 +42,38 @@ internal static class DevelopmentOrderSnapshot
             total += length;
             entries.Add(new(normalized, length, Convert.ToHexString(SHA256.HashData(bytes))));
         }
-        var manifest = new SnapshotManifest(1, entries.OrderBy(entry => entry.Path, StringComparer.Ordinal).ToArray());
-        return DevelopmentJobState.Hash(OrderStorageJson.Encode(manifest, MaxManifestBytes));
+        return new SnapshotManifest(1, entries.OrderBy(entry => entry.Path, StringComparer.Ordinal).ToArray());
     }
 
     internal static void Require(string source, string project, string? expectedHash)
     {
         OrderCheck.Require(OrderCheck.Hash(expectedHash)
             && Capture(source, project) == expectedHash, "ORDER_SNAPSHOT_MISMATCH");
+    }
+
+    // Exact GNU sha256sum --zero records. The content digest binds the
+    // file length as well. NUL separators make whitespace in paths literal.
+    internal static string[] RequireGuestRecords(string source, string project, string? expectedHash)
+    {
+        SnapshotManifest manifest = CaptureManifest(source, project);
+        OrderCheck.Require(OrderCheck.Hash(expectedHash) && ManifestHash(manifest) == expectedHash,
+            "ORDER_SNAPSHOT_MISMATCH");
+        return manifest.Files.Select(file => file.Sha256.ToLowerInvariant() + "  ./" + file.Path).ToArray();
+    }
+
+    internal const string GuestEndMarker = "HAMI_SNAPSHOT_END";
+
+    internal static void RequireGuestRecords(string[] expected, int exitCode, string output, string error)
+    {
+        // No tolerant parsing, duplicate collapse, diagnostic logging or
+        // trusting a guest-supplied aggregate hash. Truncation fails closed.
+        string[] actual = output.Split('\0');
+        OrderCheck.Require(exitCode == 0 && error.Length == 0
+            && actual.Length == expected.Length + 2 && actual[^1].Length == 0
+            && actual[^2] == GuestEndMarker
+            && actual.Take(expected.Length).OrderBy(record => record, StringComparer.Ordinal)
+                .SequenceEqual(expected.OrderBy(record => record, StringComparer.Ordinal), StringComparer.Ordinal),
+            "ORDER_GUEST_SNAPSHOT_MISMATCH");
     }
 
     internal static void SelfTest(string source)
