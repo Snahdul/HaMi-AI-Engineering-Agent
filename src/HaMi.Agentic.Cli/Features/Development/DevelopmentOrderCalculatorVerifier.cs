@@ -75,6 +75,36 @@ internal static class DevelopmentOrderCalculatorVerifier
         return manifest;
     }
 
+    // Read-only historical correlation, not an Accepted event. The trusted
+    // host must supply genuine adjacent replay views and an independent fresh
+    // absence observation under the exclusive lease. A local file cannot
+    // settle a pending guest or substitute for its journalled outcome.
+    internal static OrderCandidateCheckpoint RequireCompletedGuest(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger completedModel, DevelopmentOrderOperationLedger completedGuest,
+        OrderGuestOutcome? independentlyObserved)
+    {
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var outcome = completedGuest.LatestGuestOutcome
+            ?? throw new InvalidOperationException("ORDER_CALCULATOR_VERIFIER_OUTCOME");
+        var reservation = outcome.Reservation;
+        byte[] manifest = ExpectedManifest(owner, completedModel);
+        var limits = completedModel.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+        OrderCheck.Require(reservation == completedModel.Propose(claim.JobId, "S01", "guest",
+            reservation.ReservedSeconds, reservation.ObservedUtcTicks, null, DevelopmentJobState.Hash(manifest))
+            && completedGuest == completedModel.Reserve(claim.JobId, limits, reservation).CompleteGuest(outcome),
+            "ORDER_CALCULATOR_VERIFIER_HISTORY");
+        OrderCheck.Require(owner.RequireOrderSnapshotManifest(reservation).AsSpan().SequenceEqual(manifest),
+            "ORDER_CALCULATOR_VERIFIER_MANIFEST");
+        byte[] report = owner.RequireOrderGuestReport(outcome, reservation);
+        OrderCheck.Require(DevelopmentOrderGuestReconciliation.IsCalculatorReport(reservation, report),
+            "ORDER_CALCULATOR_VERIFIER_REPORT");
+        DevelopmentOrderGuestReconciliation.RequireObserved(outcome, independentlyObserved);
+        // Generated remains Generated; independent baseline/scope verification
+        // and a journalled acceptance are separate gates.
+        return completedModel.LatestCandidate
+            ?? throw new InvalidOperationException("ORDER_CALCULATOR_VERIFIER_CANDIDATE");
+    }
+
     // Linux guest writes one exact line. Accept CRLF for transport portability,
     // but no trimming, extra lines, whitespace or stderr diagnostics.
     internal static bool MatchesOutput(string output, string error) =>

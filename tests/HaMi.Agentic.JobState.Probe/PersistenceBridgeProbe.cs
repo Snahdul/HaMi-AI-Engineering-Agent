@@ -502,6 +502,55 @@ internal static class PersistenceBridgeProbe
                         || DevelopmentOrderGuestReconciliation.IsCalculatorReport(reservation, captured) != calculator
                         || (scenario == "raw-replaced" && captured.SequenceEqual(File.ReadAllBytes(raw))))
                         throw new InvalidOperationException("Protected report differs from live bytes.");
+                    if (completedModel is not null)
+                    {
+                        var completed = ledger.CompleteGuest(outcome!);
+                        var observed = ObserveFixtureGuest(claim, reservation, captured);
+                        var candidate = DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner,
+                            completedModel, completed, observed);
+                        if (candidate != completedModel.LatestCandidate || candidate.Quality != "Generated"
+                            || completed.Pending is not null || completed.Guests != 1
+                            || completed.ReservedSeconds != 60)
+                            throw new InvalidOperationException("Correlated calculator evidence changed history.");
+
+                        Reject(() => DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner,
+                            completedModel, ledger, observed));
+                        Reject(() => DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner,
+                            completedModel, completed, null));
+                        Reject(() => DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner,
+                            completedModel, completed, outcome! with { ObservedUtcTicks = outcome!.ObservedUtcTicks - 1 }));
+                        Reject(() => DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner,
+                            completedModel, completed with { LastEvidenceHash = new string('0', 64) }, observed));
+                        Reject(() => DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner,
+                            completedModel, completed with { ReservedSeconds = 0 }, observed));
+
+                        byte[] changed = captured.ToArray();
+                        changed[0] ^= 1;
+                        File.WriteAllBytes(slot, changed);
+                        try
+                        {
+                            Reject(() => DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner,
+                                completedModel, completed, observed));
+                        }
+                        finally { File.WriteAllBytes(slot, captured); }
+
+                        string candidateSlot = journal + ".candidate-1";
+                        byte[] candidateBytes = owner.RequireOrderCandidate(candidate);
+                        changed = candidateBytes.ToArray();
+                        changed[0] ^= 1;
+                        File.WriteAllBytes(candidateSlot, changed);
+                        try
+                        {
+                            Reject(() => DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner,
+                                completedModel, completed, observed));
+                        }
+                        finally { File.WriteAllBytes(candidateSlot, candidateBytes); }
+
+                        if (DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner,
+                            completedModel, completed, observed) != candidate)
+                            throw new InvalidOperationException("Read-only calculator correlation changed.");
+                        Console.WriteLine("PASS: historical calculator guest correlation requires adjacent completed ledger, exact protected evidence and fresh observation; Generated remains unaccepted.");
+                    }
                 }
                 else if (File.Exists(slot))
                     throw new InvalidOperationException("Failed runner or inspect wrote protected report.");
