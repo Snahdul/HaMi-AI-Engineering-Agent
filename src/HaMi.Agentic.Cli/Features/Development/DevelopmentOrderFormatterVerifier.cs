@@ -33,6 +33,23 @@ internal static class DevelopmentOrderFormatterVerifier
         return new(accepted, owner.RequireOrderCandidate(candidate), baseline.Formatter.ToArray());
     }
 
+    // S01 acceptance is still verified against its exact historical view.
+    // The distinct current S02 admission view must follow from actual
+    // stop/extension journal events without changing any accepted work.
+    internal static OrderFormatterInputs RequireInputsAfterBudgetContinuation(
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger completedModel,
+        DevelopmentOrderOperationLedger completedGuest, DevelopmentOrderOperationLedger acceptedLedger,
+        DevelopmentOrderOperationLedger resumedLedger, IReadOnlyList<string> budgetEvents,
+        IReadOnlyList<OrderRequiredOperation> requiredAfter, OrderGuestOutcome? independentlyObserved,
+        OrderGitBaseline baseline, IReadOnlyDictionary<string, byte[]> stagedPair)
+    {
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var archive = owner.RequireArchivedOrder();
+        var policy = DevelopmentOrderBudgetPolicy.Parse(System.Text.Encoding.UTF8.GetBytes(archive.BudgetPolicy));
+        DevelopmentOrderAdmission.RequireContinuation(claim, policy, acceptedLedger, resumedLedger, budgetEvents, requiredAfter);
+        return RequireInputs(owner, completedModel, completedGuest, acceptedLedger, independentlyObserved, baseline, stagedPair);
+    }
+
     // Revalidate copies at the next operation boundary. The hash commits to
     // the complete acceptance descriptor, not just a calculator file hash.
     internal static string RequireInputHash(DevelopmentOrderClaim claim, OrderS01Accepted accepted,

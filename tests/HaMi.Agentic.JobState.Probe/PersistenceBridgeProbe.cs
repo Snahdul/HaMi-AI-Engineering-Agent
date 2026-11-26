@@ -2062,6 +2062,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: common budget decision classifies reservation, hard stop and soft stop; denied pair requests never reach reservation callbacks.");
         Console.WriteLine("PASS: actual pair S02 hard and soft stops persisted before ACK and replayed after process kill; exact predecessor and charges retained, no dispatch.");
         Console.WriteLine("PASS: pair budget extensions persisted; insufficient and unreviewed extension blocked, sufficient extension permits one fresh reservation; process kill recovers pending without dispatch.");
+        Console.WriteLine("PASS: S02 verifier handover validates exact replayed stop and extension history; omitted, reordered or substituted events and changed charges rejected.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2825,7 +2826,30 @@ internal static class PersistenceBridgeProbe
                         ?? throw new InvalidOperationException("Extended pre-reservation state missing.");
                     var pendingPair = current.Ledger.Pending
                         ?? throw new InvalidOperationException("Resumed pair reservation missing.");
-                    _ = ReadFormatterInputs(pairOrigin, ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root));
+                    var replayedBudgetEvents = current.PairBudgetEvents
+                        ?? throw new InvalidOperationException("Replayed pair budget events missing.");
+                    var continuationRequired = new OrderRequiredOperation[]
+                    {
+                        new("S02", "guest", 10), new("FINAL", "guest", extendedPair.FinalReserveSeconds)
+                    };
+                    OrderFormatterInputs VerifyBudgetHandover(DevelopmentOrderOperationLedger resumed, IReadOnlyList<string> events) =>
+                        DevelopmentOrderFormatterVerifier.RequireInputsAfterBudgetContinuation(owner, model, guest,
+                            pairOrigin, resumed, events, continuationRequired, ObserveCalculatorFixture(owner, claim, outcome),
+                            ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root));
+                    var budgetInputs = VerifyBudgetHandover(extendedPair, replayedBudgetEvents);
+                    if (replayedBudgetEvents.Length != 3 || budgetInputs.CalculatorAcceptance != accepted
+                        || !budgetInputs.Calculator.AsSpan().SequenceEqual(owner.RequireOrderCandidate(accepted.Candidate)))
+                        throw new InvalidOperationException("Budget handover evidence differs.");
+                    Reject(() => VerifyBudgetHandover(extendedPair, replayedBudgetEvents[..^1]));
+                    Reject(() => VerifyBudgetHandover(extendedPair,
+                        [replayedBudgetEvents[0], replayedBudgetEvents[2], replayedBudgetEvents[1]]));
+                    Reject(() => VerifyBudgetHandover(extendedPair with { ReservedSeconds = extendedPair.ReservedSeconds - 1 },
+                        replayedBudgetEvents));
+                    var changedExtension = DevelopmentOrderOperationLedger.DecodeBudgetExtension(replayedBudgetEvents[2])
+                        with { ApprovalHash = new string('A', 64) };
+                    Reject(() => VerifyBudgetHandover(extendedPair,
+                        [replayedBudgetEvents[0], replayedBudgetEvents[1],
+                            DevelopmentOrderOperationLedger.EncodeBudgetExtension(changedExtension)]));
                     var extendedPairLimits = extendedPair.CurrentLimits ?? throw new InvalidOperationException("Pair limits missing.");
                     if (nextAction != OrderWorkflowAction.ReconcilePending || current.Stage != 9
                         || pendingPair is not { Step: "S02", Kind: "model" } || current.Ledger.BudgetRevision != 2
@@ -4175,7 +4199,8 @@ internal static class PersistenceBridgeProbe
         DevelopmentOrderOperationLedger? CalculatorModel = null, DevelopmentOrderOperationLedger? CalculatorGuest = null,
         DevelopmentOrderOperationLedger? FormatterInputState = null, DevelopmentOrderOperationLedger? FormatterModel = null,
         DevelopmentOrderOperationLedger? FormatterGuest = null, DevelopmentOrderOperationLedger? PairAcceptance = null,
-        DevelopmentOrderOperationLedger? FinalCompletion = null, DevelopmentOrderOperationLedger? PairBudgetOrigin = null);
+        DevelopmentOrderOperationLedger? FinalCompletion = null, DevelopmentOrderOperationLedger? PairBudgetOrigin = null,
+        string[]? PairBudgetEvents = null);
 
     private static OrderPairHistory RequirePairHistory(BridgeState state) =>
         new(state.CalculatorModel ?? throw new InvalidOperationException("Calculator model history missing."),
@@ -4323,11 +4348,17 @@ internal static class PersistenceBridgeProbe
                     var guest = state.CalculatorGuest ?? throw new InvalidOperationException("Guest history missing.");
                     var outcome = guest.LatestGuestOutcome ?? throw new InvalidOperationException("Guest outcome missing.");
                     var acceptedHistory = state.FormatterInputState ?? state.Ledger;
-                    _ = DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, acceptedHistory,
-                        ObserveCalculatorFixture(owner, claim, outcome), ObserveCalculatorBaseline(root, claim.Binding),
-                        CalculatorRecoveryPair(root));
-                    if (state.Ledger.AcceptedS01 != acceptedHistory.AcceptedS01)
-                        throw new InvalidOperationException("Pair acceptance changed during budget extension.");
+                    var observation = ObserveCalculatorFixture(owner, claim, outcome);
+                    var baseline = ObserveCalculatorBaseline(root, claim.Binding);
+                    var stagedPair = CalculatorRecoveryPair(root);
+                    if (state.PairBudgetEvents is { } budgetEvents)
+                        _ = DevelopmentOrderFormatterVerifier.RequireInputsAfterBudgetContinuation(owner, model, guest,
+                            acceptedHistory, state.Ledger, budgetEvents,
+                            [new("S02", "guest", 10), new("FINAL", "guest", policy.FinalVerificationSeconds)],
+                            observation, baseline, stagedPair);
+                    else
+                        _ = DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, acceptedHistory,
+                            observation, baseline, stagedPair);
                     var decision = DevelopmentOrderAdmission.Decide(claim, state.Ledger, command.Request,
                         [new("S02", "guest", 10), new("FINAL", "guest", policy.FinalVerificationSeconds)]);
                     string evt = decision.Event;
@@ -4644,7 +4675,12 @@ internal static class PersistenceBridgeProbe
                     if (previous.FormatterInputState is null
                         || approved != PairExtensionFixture(claim, policy, previous.Ledger, approved.ObservedUtcTicks))
                         throw new InvalidOperationException("Unexpected pair extension event.");
-                    return previous with { Ledger = previous.Ledger.Extend(claim.JobId, policy, approved) };
+                    return previous with
+                    {
+                        Ledger = previous.Ledger.Extend(claim.JobId, policy, approved),
+                        PairBudgetEvents = [.. (previous.PairBudgetEvents
+                            ?? throw new InvalidOperationException("Pair stop history missing.")), evt]
+                    };
                 }
 
                 if (evt.StartsWith("budget-stop-v1:", StringComparison.Ordinal)
@@ -4658,7 +4694,12 @@ internal static class PersistenceBridgeProbe
                         [new("S02", "guest", 10), new("FINAL", "guest", policy.FinalVerificationSeconds)]);
                     if (decision.Event != evt || decision.Ledger.Pending is not null)
                         throw new InvalidOperationException("Unexpected pair stop event.");
-                    return previous with { FormatterInputState = previous.FormatterInputState ?? previous.Ledger, Ledger = decision.Ledger };
+                    return previous with
+                    {
+                        FormatterInputState = previous.FormatterInputState ?? previous.Ledger,
+                        Ledger = decision.Ledger,
+                        PairBudgetEvents = [.. (previous.PairBudgetEvents ?? []), evt]
+                    };
                 }
 
                 var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);

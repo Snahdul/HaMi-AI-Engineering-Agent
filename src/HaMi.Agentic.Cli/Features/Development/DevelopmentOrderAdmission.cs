@@ -58,6 +58,41 @@ internal static class DevelopmentOrderAdmission
             before.ReserveWithRequiredWork(jobId, limits, request, requiredAfter));
     }
 
+    // Validate an actual replay segment between two adjacent work phases.
+    // The host supplies genuine journal events and their authenticated
+    // approval evidence; this fold does not authenticate a human decision.
+    internal static void RequireContinuation(DevelopmentOrderClaim claim, DevelopmentOrderBudgetPolicy policy,
+        DevelopmentOrderOperationLedger origin, DevelopmentOrderOperationLedger resumed,
+        IReadOnlyList<string> events, IReadOnlyList<OrderRequiredOperation> requiredAfter)
+    {
+        OrderCheck.Require(events.Count >= 2 && origin.PolicyHash == policy.Sha256,
+            "ORDER_CONTINUATION_HISTORY");
+        var action = DevelopmentOrderWorkflow.Select(claim, origin);
+        string first = events[0];
+        var request = first.StartsWith("budget-stop-v1:", StringComparison.Ordinal)
+            ? DevelopmentOrderOperationLedger.DecodeBudgetStop(first).Request
+            : first.StartsWith("soft-stop-v1:", StringComparison.Ordinal)
+                ? DevelopmentOrderOperationLedger.DecodeSoftStop(first).Request
+                : throw new InvalidOperationException("ORDER_CONTINUATION_STOP");
+        var stop = Decide(claim, origin, request, requiredAfter);
+        OrderCheck.Require(stop.Event == first
+            && DevelopmentOrderWorkflow.Select(claim, stop.Ledger) == OrderWorkflowAction.AwaitBudgetExtension,
+            "ORDER_CONTINUATION_STOP");
+        var folded = stop.Ledger;
+        for (int i = 1; i < events.Count; i++)
+        {
+            var extension = DevelopmentOrderOperationLedger.DecodeBudgetExtension(events[i]);
+            OrderCheck.Require(DevelopmentOrderOperationLedger.EncodeBudgetExtension(extension) == events[i],
+                "ORDER_CONTINUATION_EVENT");
+            folded = folded.Extend(claim.JobId, policy, extension);
+        }
+
+        OrderCheck.Require(folded == resumed && folded.Pending is null
+            && folded.BudgetStop is null && folded.SoftStop is null
+            && DevelopmentOrderWorkflow.Select(claim, resumed) == action,
+            "ORDER_CONTINUATION_HISTORY");
+    }
+
     // The host independently recomputes the decision under its journal
     // ownership and persists exactly one event before acknowledging it.
     internal static async Task<DevelopmentOrderOperationLedger> AdmitDecisionAsync(
