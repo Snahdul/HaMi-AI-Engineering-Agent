@@ -5,6 +5,7 @@
   <ItemGroup>
     <EmbeddedResource Include="../../contracts/development/development-order.schema.json" LogicalName="HaMi.DevelopmentOrder.Schema" />
     <EmbeddedResource Include="../../prompts/development/OrderS01Calculator.prompty" LogicalName="HaMi.DevelopmentOrder.S01Prompt" />
+    <EmbeddedResource Include="../../prompts/development/OrderS02Formatter.prompty" LogicalName="HaMi.DevelopmentOrder.S02Prompt" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="../../samples/DevelopmentOrder/Verifiers/PairCalculatorVerifier.cs" Link="Features/Development/PairCalculatorVerifier.cs" />

@@ -33,6 +33,20 @@ internal static class DevelopmentOrderFormatterVerifier
         return new(accepted, owner.RequireOrderCandidate(candidate), baseline.Formatter.ToArray());
     }
 
+    // Revalidate copies at the next operation boundary. The hash commits to
+    // the complete acceptance descriptor, not just a calculator file hash.
+    internal static string RequireInputHash(DevelopmentOrderClaim claim, OrderS01Accepted accepted,
+        OrderFormatterInputs inputs)
+    {
+        OrderCheck.Require(inputs.CalculatorAcceptance == accepted
+            && inputs.Calculator.Length is > 0 and <= OrderCandidateCheckpoint.MaxBytes
+            && inputs.FormatterBaseline.Length is > 0 and <= OrderCandidateCheckpoint.MaxBytes
+            && DevelopmentJobState.Hash(inputs.FormatterBaseline) == claim.Binding.FormatterBaselineHash,
+            "ORDER_FORMATTER_INPUT_BYTES");
+        accepted.Candidate.ValidateBytes(inputs.Calculator);
+        return OrderCandidateCheckpoint.FormatterInputHash(claim, accepted);
+    }
+
     internal static bool MatchesOutput(string output, string error) =>
         error.Length == 0 && (output == ExpectedStdout + "\n" || output == ExpectedStdout + "\r\n");
 

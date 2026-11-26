@@ -1092,6 +1092,7 @@ internal static class PersistenceBridgeProbe
         Func<string, string, Task> expectOwnership)
     {
         await DevelopmentAiGenerator.SelfTestS01Async();
+        await DevelopmentAiGenerator.SelfTestS02Async();
         await TestModelDispatchAsync(prefix);
         await TestLiveGuestCaptureAsync(prefix);
         foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan",
@@ -1279,6 +1280,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: calculator guest-complete crash before acceptance replays unaccepted; filesystem stage and evidence rechecked, one acceptance appended without redispatch.");
         Console.WriteLine("PASS: calculator recovery binds real Git commit and four exact tracked objects; dirty checkout, untracked entry, skip-worktree and binding drift rejected.");
         Console.WriteLine("PASS: S02 input handover from actual recovered S01 acceptance; unaccepted or tampered history and input bytes rejected.");
+        Console.WriteLine("PASS: S02 versioned candidate fold from recovered S01 acceptance; exact predecessor input hash and source scope enforced.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -1919,6 +1921,33 @@ internal static class PersistenceBridgeProbe
                     || !unchangedInputs.FormatterBaseline.AsSpan().SequenceEqual(reviewedBaseline.Formatter))
                     throw new InvalidOperationException("Caller mutated trusted input evidence.");
                 VerifyAccepted();
+                string inputHash = DevelopmentOrderFormatterVerifier.RequireInputHash(claim, accepted, unchangedInputs);
+                Reject(() => DevelopmentOrderFormatterVerifier.RequireInputHash(claim, accepted, handover));
+                Reject(() => DevelopmentOrderFormatterVerifier.RequireInputHash(claim,
+                    accepted with { ObservedUtcTicks = accepted.ObservedUtcTicks + 1 }, unchangedInputs));
+                var formatterRequest = ProposeModel(current.Ledger, "S02", 1, DateTime.UtcNow.Ticks);
+                var formatterPending = current.Ledger.Reserve(claim.JobId, limits, formatterRequest);
+                byte[] formatterBytes = Encoding.UTF8.GetBytes("class PairFormatter {}");
+                var formatterCandidate = new OrderCandidateCheckpoint(2, claim.ArchiveHash, formatterRequest.OperationId,
+                    "S02", DevelopmentAgentContract.PairSecond, claim.Binding.FormatterBaselineHash,
+                    inputHash, formatterBytes.Length, DevelopmentJobState.Hash(formatterBytes), "Generated",
+                    formatterRequest.ObservedUtcTicks);
+                var folded = formatterPending.Checkpoint(claim, formatterCandidate);
+                string encoded = DevelopmentOrderOperationLedger.EncodeCandidate(formatterCandidate);
+                if (!encoded.StartsWith("candidate-v2:", StringComparison.Ordinal)
+                    || DevelopmentOrderOperationLedger.DecodeCandidate(encoded) != formatterCandidate
+                    || folded.AcceptedS01 != accepted || folded.Pending != formatterRequest
+                    || folded.LatestCandidate != formatterCandidate || folded.Sequence != 3)
+                    throw new InvalidOperationException("S02 checkpoint fold differs.");
+                Reject(() => formatterPending.Checkpoint(claim, formatterCandidate with { InputHash = new string('0', 64) }));
+                Reject(() => formatterPending.Checkpoint(claim, formatterCandidate with { SourcePath = DevelopmentAgentContract.PairFirst }));
+                Reject(() => formatterPending.Checkpoint(claim, formatterCandidate with { Version = 1 }));
+                Reject(() => (formatterPending with { AcceptedS01 = null }).Checkpoint(claim, formatterCandidate));
+                Reject(() => DevelopmentOrderOperationLedger.DecodeCandidate("candidate-v1:" + encoded["candidate-v2:".Length..]));
+                if (DevelopmentOrderOperationLedger.DecodeCandidate(
+                    DevelopmentOrderOperationLedger.EncodeCandidate(accepted.Candidate)) != accepted.Candidate)
+                    throw new InvalidOperationException("Historical S01 candidate encoding changed.");
+                Console.WriteLine("BRIDGE_PHASE: S02 versioned checkpoint binds accepted predecessor; changed input, path, version and missing acceptance rejected.");
                 Console.WriteLine("BRIDGE_PHASE: accepted S01 bytes handed to S02 read-only input gate; missing or changed acceptance, budget, baseline and predecessor rejected.");
                 Reject(() => current.Ledger.Reserve(claim.JobId, limits,
                     ProposeModel(current.Ledger, "S01", 1, DateTime.UtcNow.Ticks)));

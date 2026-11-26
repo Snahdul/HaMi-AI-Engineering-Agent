@@ -333,6 +333,9 @@ internal sealed record DevelopmentOrderOperationLedger(
             && Pending.Step == candidate.Step && Pending.OperationId == candidate.OperationId
             && sequence == Sequence && LatestCandidate?.OperationId != candidate.OperationId,
             "ORDER_CANDIDATE_PENDING");
+        if (candidate.Step == "S02")
+            candidate.RequireFormatterInput(claim, AcceptedS01
+                ?? throw new InvalidOperationException("ORDER_FORMATTER_PREDECESSOR"));
         RequireObservation(candidate.ObservedUtcTicks);
         return this with { LatestCandidate = candidate, LastUtcTicks = candidate.ObservedUtcTicks };
     }
@@ -454,11 +457,21 @@ internal sealed record DevelopmentOrderOperationLedger(
     internal static OrderBudgetExtensionApproved DecodeBudgetExtension(string evt) =>
         OrderStorageJson.Decode<OrderBudgetExtensionApproved>(EventBytes(evt, "budget-extension-v1:"), EventMaxBytes);
 
-    internal static string EncodeCandidate(OrderCandidateCheckpoint candidate) =>
-        "candidate-v1:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(candidate, EventMaxBytes));
+    internal static string EncodeCandidate(OrderCandidateCheckpoint candidate)
+    {
+        OrderCheck.Require(candidate.Version is 1 or 2, "ORDER_CANDIDATE_VERSION");
+        return (candidate.Version == 1 ? "candidate-v1:" : "candidate-v2:")
+            + Encoding.UTF8.GetString(OrderStorageJson.Encode(candidate, EventMaxBytes));
+    }
 
-    internal static OrderCandidateCheckpoint DecodeCandidate(string evt) =>
-        OrderStorageJson.Decode<OrderCandidateCheckpoint>(EventBytes(evt, "candidate-v1:"), EventMaxBytes);
+    internal static OrderCandidateCheckpoint DecodeCandidate(string evt)
+    {
+        bool v2 = evt.StartsWith("candidate-v2:", StringComparison.Ordinal);
+        var candidate = OrderStorageJson.Decode<OrderCandidateCheckpoint>(
+            EventBytes(evt, v2 ? "candidate-v2:" : "candidate-v1:"), EventMaxBytes);
+        OrderCheck.Require(candidate.Version == (v2 ? 2 : 1), "ORDER_CANDIDATE_VERSION");
+        return candidate;
+    }
 
     internal static string EncodeGuestOutcome(OrderGuestOutcome outcome) =>
         "guest-outcome-v1:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(outcome, EventMaxBytes));
