@@ -1089,6 +1089,103 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: calculator guest proposal binds exactly four trusted input files and protected candidate bytes; substituted, missing, extra and tampered snapshots rejected.");
     }
 
+    private static void TestIntegrationSnapshot(DevelopmentJobStateStore.Lease owner,
+        OrderPairHistory history, OrderPairObservation observed, string root, string journal)
+    {
+        var files = DevelopmentOrderIntegrationVerifier.Prepare(owner, history, observed);
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var accepted = history.AcceptedPair.AcceptedS02 ?? throw new InvalidOperationException("Pair acceptance missing.");
+        string[] names = ["Demo.csproj", "PairCalculator.cs", "PairFormatter.cs", "Program.cs"];
+        if (!files.Keys.OrderBy(name => name, StringComparer.Ordinal).SequenceEqual(names)
+            || !files["PairCalculator.cs"].SequenceEqual(owner.RequireOrderCandidate(accepted.Predecessor.Candidate))
+            || !files["PairFormatter.cs"].SequenceEqual(owner.RequireOrderCandidate(accepted.Candidate))
+            || !files["Program.cs"].SequenceEqual(DevelopmentOrderIntegrationVerifier.ReadProgram())
+            || !Encoding.UTF8.GetString(files["Program.cs"]).Contains(
+                DevelopmentOrderIntegrationVerifier.ExpectedStdout, StringComparison.Ordinal))
+            throw new InvalidOperationException("Integration verifier input differs.");
+        Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner,
+            history with { AcceptedPair = history.FormatterGuest }, observed));
+        Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner,
+            history with { AcceptedCalculator = history.CalculatorGuest }, observed));
+        Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner,
+            history with { AcceptedPair = history.AcceptedPair with { ReservedSeconds = 0 } }, observed));
+        Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner, history, observed with { Calculator = null }));
+        Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner, history, observed with { Formatter = null }));
+        var changedPair = observed.PairStage.ToDictionary(file => file.Key, file => file.Value.ToArray(), StringComparer.Ordinal);
+        changedPair[DevelopmentAgentContract.PairFirst][0] ^= 1;
+        Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner, history, observed with { PairStage = changedPair }));
+        changedPair[DevelopmentAgentContract.PairFirst][0] ^= 1;
+        changedPair[DevelopmentAgentContract.PairSecond][0] ^= 1;
+        Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner, history, observed with { PairStage = changedPair }));
+        foreach (string suffix in new[] { ".guest-report-2", ".guest-report-4", ".candidate-1", ".candidate-3" })
+        {
+            string evidence = journal + suffix;
+            byte[] original = File.ReadAllBytes(evidence);
+            File.WriteAllBytes(evidence, [.. original, 0x20]);
+            try { Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner, history, observed)); }
+            finally { File.WriteAllBytes(evidence, original); }
+        }
+
+        string source = Path.Combine(root, "integration-verification");
+        Directory.CreateDirectory(source);
+        foreach (var file in files)
+            File.WriteAllBytes(Path.Combine(source, file.Key), file.Value);
+        var ledger = history.AcceptedPair;
+        int seconds = ledger.FinalReserveSeconds;
+        Reject(() => DevelopmentOrderIntegrationVerifier.ProposeGuest(owner, history, observed, seconds - 1, DateTime.UtcNow.Ticks));
+        var proposal = DevelopmentOrderIntegrationVerifier.ProposeGuest(owner, history, observed, seconds, DateTime.UtcNow.Ticks);
+        var limits = ledger.CurrentLimits ?? throw new InvalidOperationException("Missing limits.");
+        var admitted = ledger.ReserveWithRequiredWork(claim.JobId, limits, proposal, []);
+        string slot = journal + ".snapshot-5";
+        if (proposal.Step != "FINAL" || proposal.Kind != "guest" || admitted.Pending != proposal
+            || admitted.Sequence != 5 || admitted.Models != 2 || admitted.Guests != 3 || admitted.FinalGuests != 1
+            || admitted.ReservedSeconds != ledger.ReservedSeconds + seconds
+            || admitted.AcceptedS01 != ledger.AcceptedS01 || admitted.AcceptedS02 != accepted
+            || proposal.SnapshotHash != DevelopmentOrderSnapshot.Capture(source, "Demo.csproj")
+            || File.Exists(slot))
+            throw new InvalidOperationException("Integration guest proposal differs.");
+
+        Reject(() => DevelopmentOrderIntegrationVerifier.RequireGuestSnapshot(owner, history, observed, proposal, source));
+        Reject(() => DevelopmentOrderIntegrationVerifier.StoreGuestSnapshot(owner, history, observed,
+            proposal with { Step = "S02" }, source));
+        Reject(() => DevelopmentOrderIntegrationVerifier.StoreGuestSnapshot(owner, history, observed,
+            proposal with { SnapshotHash = new string('A', 64) }, source));
+        foreach (var file in files)
+        {
+            string path = Path.Combine(source, file.Key);
+            File.WriteAllBytes(path, [.. file.Value, 0x20]);
+            try { Reject(() => DevelopmentOrderIntegrationVerifier.StoreGuestSnapshot(owner, history, observed, proposal, source)); }
+            finally { File.WriteAllBytes(path, file.Value); }
+        }
+        string extra = Path.Combine(source, "Extra.cs");
+        File.WriteAllText(extra, "// forbidden");
+        try { Reject(() => DevelopmentOrderIntegrationVerifier.StoreGuestSnapshot(owner, history, observed, proposal, source)); }
+        finally { File.Delete(extra); }
+        string program = Path.Combine(source, "Program.cs");
+        File.Delete(program);
+        try { Reject(() => DevelopmentOrderIntegrationVerifier.StoreGuestSnapshot(owner, history, observed, proposal, source)); }
+        finally { File.WriteAllBytes(program, files["Program.cs"]); }
+        if (File.Exists(slot))
+            throw new InvalidOperationException("Rejected integration snapshot created protected evidence.");
+        DevelopmentOrderIntegrationVerifier.StoreGuestSnapshot(owner, history, observed, proposal, source);
+        DevelopmentOrderIntegrationVerifier.RequireGuestSnapshot(owner, history, observed, proposal, source);
+        Reject(() => DevelopmentOrderIntegrationVerifier.StoreGuestSnapshot(owner, history, observed, proposal, source));
+        byte[] manifest = File.ReadAllBytes(slot);
+        File.WriteAllBytes(slot, [.. manifest, 0x20]);
+        try { Reject(() => DevelopmentOrderIntegrationVerifier.RequireGuestSnapshot(owner, history, observed, proposal, source)); }
+        finally { File.WriteAllBytes(slot, manifest); }
+        DevelopmentOrderIntegrationVerifier.RequireGuestSnapshot(owner, history, observed, proposal, source);
+        if (!DevelopmentOrderIntegrationVerifier.MatchesOutput(DevelopmentOrderIntegrationVerifier.ExpectedStdout + "\n", "")
+            || !DevelopmentOrderIntegrationVerifier.MatchesOutput(DevelopmentOrderIntegrationVerifier.ExpectedStdout + "\r\n", "")
+            || DevelopmentOrderIntegrationVerifier.MatchesOutput(DevelopmentOrderFormatterVerifier.ExpectedStdout + "\n", "")
+            || DevelopmentOrderIntegrationVerifier.MatchesOutput(DevelopmentOrderIntegrationVerifier.ExpectedStdout + "\n\n", "")
+            || DevelopmentOrderIntegrationVerifier.MatchesOutput(DevelopmentOrderIntegrationVerifier.ExpectedStdout + "\n", "diagnostic")
+            || File.Exists(journal + ".guest-dispatch-5") || File.Exists(journal + ".guest-report-5")
+            || ledger.Pending is not null || ledger.FinalGuests != 0)
+            throw new InvalidOperationException("Integration snapshot preparation dispatched or accepted work.");
+        Console.WriteLine("BRIDGE_PHASE: exact four-file FINAL snapshot binds both accepted candidates and original integration harness; substitutions rejected.");
+    }
+
     private static async Task TestFormatterSnapshotAsync(DevelopmentJobStateStore.Lease owner,
         DevelopmentOrderOperationLedger accepted, DevelopmentOrderOperationLedger completed,
         OrderFormatterInputs inputs, string root, string journal, bool expectSuccess,
@@ -1658,7 +1755,8 @@ internal static class PersistenceBridgeProbe
                             File.Exists(calculatorPrefix + slot) != expectedGuestSlots[i]
                             || expectedGuestSlots[i] && !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(guestEvidence[i])).Any()
                         || File.Exists(calculatorPrefix + "guest-dispatch-5")
-                        || File.Exists(calculatorPrefix + "snapshot-5")))
+                        || File.Exists(calculatorPrefix + "snapshot-5") != (scenario == "model-accepted")
+                        || File.Exists(calculatorPrefix + "guest-report-5")))
                         throw new InvalidOperationException("Formatter guest recovery changed protected slots.");
                 }
                 finally
@@ -2325,6 +2423,12 @@ internal static class PersistenceBridgeProbe
                         throw new InvalidOperationException("Duplicate formatter acceptance returned success.");
                     }
                     catch (InvalidOperationException ex) when (ex.Message == "Formatter acceptance blocked.") { }
+                    var pairHistory = new OrderPairHistory(model, guest, beforeFormatterAcceptance,
+                        historicalFormatterModel, historicalFormatterGuest, current.Ledger);
+                    var pairObservation = new OrderPairObservation(ObserveCalculatorFixture(owner, claim, outcome),
+                        freshFormatterObservation, ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root),
+                        DevelopmentOrderCalculatorVerifier.ReadStagedPair(Path.Combine(root, "formatter-stage")));
+                    TestIntegrationSnapshot(owner, pairHistory, pairObservation, root, database);
                     if (await ReadAsync() != current || File.Exists(database + ".guest-dispatch-5"))
                         throw new InvalidOperationException("Formatter acceptance recovery mutated journal.");
                     Console.WriteLine("BRIDGE_PHASE: persisted S02 acceptance recovered after process kill; exact predecessor, candidate, guest evidence and budget unchanged.");
