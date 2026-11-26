@@ -250,7 +250,8 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 ArtifactPath("S01"), ArtifactPath("S02") }.Any(RegularFileExists)
             || Enumerable.Range(1, OrderCandidateCheckpoint.MaxSequence)
                 .Any(sequence => RegularFileExists(CandidatePath(sequence)) || RegularFileExists(OperationEvidencePath(sequence))
-                    || RegularFileExists(GuestReportPath(sequence)) || RegularFileExists(SnapshotManifestPath(sequence)));
+                    || RegularFileExists(GuestReportPath(sequence)) || RegularFileExists(SnapshotManifestPath(sequence))
+                    || RegularFileExists(GuestDispatchPath(sequence)));
 
         // Fixed, host-owned path; only the same lease that made the claim
         // can initialize an empty file. Never recreate a missing journal.
@@ -459,12 +460,55 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             return bytes;
         }
 
+        private sealed record GuestDispatchReceipt(int Version, string ArchiveHash,
+            OrderOperationReservation Reservation, string RunId);
+
+        private string GuestDispatchPath(int sequence) =>
+            journalPath + ".guest-dispatch-" + sequence.ToString(CultureInfo.InvariantCulture);
+
+        private byte[] GuestDispatchBytes(OrderOperationReservation reservation)
+        {
+            DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            return OrderStorageJson.Encode(new GuestDispatchReceipt(1, claim.ArchiveHash, reservation,
+                DevelopmentOrderGuestReconciliation.RunId(reservation)), DevelopmentOrderOperationLedger.EventMaxBytes);
+        }
+
+        // A one-shot private intent receipt, not a workflow transition or
+        // proof that sbx create succeeded. Only the trusted host may consume
+        // it after a fresh journal ack. A recovered ledger is not a fresh ack.
+        internal void ConsumeOrderGuestDispatch(DevelopmentOrderOperationLedger acknowledged,
+            OrderOperationReservation reservation)
+        {
+            string path = GuestDispatchPath(BoundGuestSequence(reservation));
+            DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            OrderCheck.Require(acknowledged.Pending == reservation && acknowledged.ArchiveHash == claim.ArchiveHash,
+                "ORDER_GUEST_DISPATCH_PENDING");
+            _ = RequireOrderSnapshotManifest(reservation);
+            if (RegularFileExists(path))
+                throw new InvalidOperationException("Order guest dispatch already consumed.");
+            var limits = acknowledged.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+            _ = acknowledged.DispatchAllowance(limits, reservation.OperationId, DateTime.UtcNow.Ticks);
+            WriteNew(path, GuestDispatchBytes(reservation));
+            RequireOrderGuestDispatch(reservation);
+        }
+
+        internal void RequireOrderGuestDispatch(OrderOperationReservation reservation)
+        {
+            string path = GuestDispatchPath(BoundGuestSequence(reservation));
+            if (!RegularFileExists(path))
+                throw new InvalidOperationException("Order guest dispatch receipt missing.");
+            validatePrivateEntry!(path, false);
+            byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(path, DevelopmentOrderOperationLedger.EventMaxBytes);
+            OrderCheck.Require(bytes.AsSpan().SequenceEqual(GuestDispatchBytes(reservation)), "ORDER_GUEST_DISPATCH_BYTES");
+        }
+
         private string BoundGuestReportPath(OrderGuestOutcome outcome, OrderOperationReservation reservation)
         {
             int sequence = BoundGuestSequence(reservation);
             DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
             outcome.Validate(claim.ArchiveHash, reservation);
             _ = RequireOrderSnapshotManifest(reservation);
+            RequireOrderGuestDispatch(reservation);
             return GuestReportPath(sequence);
         }
 

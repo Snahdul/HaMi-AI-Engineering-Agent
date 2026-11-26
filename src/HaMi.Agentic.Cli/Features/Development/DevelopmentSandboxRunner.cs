@@ -73,10 +73,12 @@ internal static class DevelopmentSandboxRunner
     // The caller supplies an existing private, exclusively controlled
     // results root and a reviewed immutable source snapshot.
     internal static Task<int> RunReservedAsync(string repo, string source, string resultsDirectory,
-        DevelopmentJobStateStore.Lease owner, OrderOperationReservation reservation,
-        Action<string, string, long, int>? phaseObserver = null)
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
+        OrderOperationReservation reservation, Action<string, string, long, int>? phaseObserver = null)
     {
-        _ = owner.RequireOrderSnapshotManifest(reservation);
+        // Consume once in the private job root, independently of any chosen
+        // output directory. Failure after this point must never redispatch.
+        owner.ConsumeOrderGuestDispatch(acknowledged, reservation);
         return RunCoreAsync(repo, source, "Demo.csproj", "run", resultsDirectory, phaseObserver, reservation, SbxAsync);
     }
 
