@@ -36,6 +36,42 @@ internal static class Program
             return 0;
         }
 
+        if (args.Length == 2 && args[0] is "transport-parent" or "transport-leaf")
+        {
+            string root = args[1];
+            string name = Path.GetFileName(root);
+            if (!name.StartsWith(Prefix, StringComparison.Ordinal)
+                || !Guid.TryParseExact(name[Prefix.Length..], "N", out _)
+                || Path.Combine(Path.GetTempPath(), name) != root || !Directory.Exists(root))
+                throw new InvalidOperationException("Transport probe root rejected.");
+
+            if (args[0] == "transport-leaf")
+            {
+                Console.WriteLine("TRANSPORT_LEAF_READY");
+                Console.Out.Flush();
+                await Task.Delay(Timeout.InfiniteTimeSpan);
+                return 1;
+            }
+
+            using var leaf = Start("transport-leaf", root);
+            try
+            {
+                if (await leaf.StandardOutput.ReadLineAsync().WaitAsync(Deadline) != "TRANSPORT_LEAF_READY"
+                    || leaf.HasExited)
+                    throw new InvalidOperationException("Transport leaf did not become ready.");
+                Console.WriteLine("TRANSPORT_READY:" + leaf.Id);
+                Console.Out.Flush();
+                await Task.Delay(Timeout.InfiniteTimeSpan);
+                return 1;
+            }
+            finally
+            {
+                if (!leaf.HasExited)
+                    leaf.Kill(entireProcessTree: true);
+                await leaf.WaitForExitAsync().WaitAsync(Deadline);
+            }
+        }
+
         if (args.Length == 2 && args[0] is "backend-hold" or "backend-probe")
         {
             var backendStore = DevelopmentJobStateRoot.OpenOrderProbeFixture(args[1], create: false);
@@ -154,6 +190,7 @@ internal static class Program
             }
             await ExpectProbeAsync(fixture, "ACQUIRED:recovery-blocked");
             Console.WriteLine("PASS: cross-process exclusive ownership and abrupt termination retain claim.");
+            await RunReservedTransportProbeAsync(fixture);
             await RunBackendLeaseProbeAsync();
             await PersistenceBridgeProbe.RunAsync(Prefix, Start,
                 (root, expected) => ExpectProbeAsync(root, expected, "bridge-probe"));
@@ -163,6 +200,118 @@ internal static class Program
         {
             Directory.Delete(fixture, recursive: true);
         }
+    }
+
+    private static async Task RunReservedTransportProbeAsync(string root)
+    {
+        foreach (bool callerCancellation in new[] { false, true })
+        {
+            using var parent = Start("transport-parent", root);
+            Process? leaf = null;
+            try
+            {
+                const string marker = "TRANSPORT_READY:";
+                string? ready = await parent.StandardOutput.ReadLineAsync().WaitAsync(Deadline);
+                if (ready is null || !ready.StartsWith(marker, StringComparison.Ordinal)
+                    || !int.TryParse(ready[marker.Length..], out int pid) || pid <= 0 || pid == parent.Id
+                    || pid == Environment.ProcessId || parent.HasExited)
+                    throw new InvalidOperationException("Transport parent did not become ready.");
+                leaf = Process.GetProcessById(pid);
+                if (NoLongerExecuting(leaf))
+                    throw new InvalidOperationException("Transport leaf exited before cancellation.");
+
+                using var caller = new CancellationTokenSource();
+                using var safety = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(10));
+                TimeSpan phaseLimit = callerCancellation ? Deadline : TimeSpan.FromMilliseconds(250);
+                Task<DevelopmentSandboxRunner.SandboxProcess> operation =
+                    DevelopmentSandboxRunner.ObserveReservedProcessForProbeAsync(parent, phaseLimit, caller.Token, safety);
+                if (callerCancellation)
+                    caller.Cancel();
+
+                bool expected = false;
+                try { _ = await operation.WaitAsync(Deadline); }
+                catch (OperationCanceledException ex) when (callerCancellation && ex.CancellationToken == caller.Token)
+                { expected = true; }
+                catch (TimeoutException ex) when (!callerCancellation && ex.Message == "sbx operation timed out: offline-probe")
+                { expected = true; }
+                if (!expected || !parent.HasExited || parent.ExitCode == 0)
+                    throw new InvalidOperationException("Reserved transport did not terminate with the expected outcome.");
+                // The cleanup token remains independent of the cancelled
+                // business token, and uses the already-started safety window.
+                safety.Check();
+                if (safety.Token.IsCancellationRequested)
+                    throw new InvalidOperationException("Safety token inherited business cancellation.");
+
+                // A killed Linux grandchild can briefly remain as a zombie
+                // until the OS reaps it. A zombie cannot execute instructions.
+                var observation = Stopwatch.StartNew();
+                while (!NoLongerExecuting(leaf) && observation.Elapsed < TimeSpan.FromSeconds(5))
+                    await Task.Delay(25);
+                if (!NoLongerExecuting(leaf))
+                    throw new InvalidOperationException("Controlled transport descendant still executing.");
+                Console.WriteLine("PASS: reserved transport " + (callerCancellation ? "caller cancellation" : "phase timer")
+                    + " terminated the controlled process and descendant.");
+            }
+            finally
+            {
+                // A failing regression must not leave the controlled fixture
+                // running. This fallback does not count towards test success.
+                try
+                {
+                    if (!parent.HasExited)
+                        parent.Kill(entireProcessTree: true);
+                    await parent.WaitForExitAsync().WaitAsync(Deadline);
+                    if (leaf is not null && !NoLongerExecuting(leaf))
+                    {
+                        leaf.Kill(entireProcessTree: true);
+                        var fallback = Stopwatch.StartNew();
+                        while (!NoLongerExecuting(leaf) && fallback.Elapsed < Deadline)
+                            await Task.Delay(25);
+                        if (!NoLongerExecuting(leaf))
+                            throw new InvalidOperationException("Transport fixture cleanup failed.");
+                    }
+                }
+                finally
+                {
+                    leaf?.Dispose();
+                }
+            }
+        }
+
+        // Exercise the real safety timer as well as deterministic clock
+        // exhaustion in the existing reserved runner self-tests.
+        using var window = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(1));
+        CancellationToken safetyToken = window.Token;
+        bool expired = false;
+        try { await Task.Delay(Timeout.InfiniteTimeSpan, safetyToken).WaitAsync(Deadline); }
+        catch (OperationCanceledException ex) when (ex.CancellationToken == safetyToken) { expired = true; }
+        if (!expired || !safetyToken.IsCancellationRequested)
+            throw new InvalidOperationException("Safety timer did not cancel.");
+        try
+        {
+            window.Check();
+            throw new InvalidOperationException("Expired safety window restarted.");
+        }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+        {
+            Console.WriteLine("PASS: real safety timer cancels without restarting its window.");
+        }
+    }
+
+    private static bool NoLongerExecuting(Process process)
+    {
+        if (process.HasExited)
+            return true;
+        if (!OperatingSystem.IsLinux())
+            return false;
+        try
+        {
+            string stat = File.ReadAllText("/proc/" + process.Id + "/stat");
+            int nameEnd = stat.LastIndexOf(')');
+            return nameEnd >= 0 && stat.Length > nameEnd + 2 && stat[nameEnd + 2] is 'Z' or 'X';
+        }
+        catch (FileNotFoundException) { return process.HasExited; }
+        catch (DirectoryNotFoundException) { return process.HasExited; }
     }
 
     private static async Task RunBackendLeaseProbeAsync()

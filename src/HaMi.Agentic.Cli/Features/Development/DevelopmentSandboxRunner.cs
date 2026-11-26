@@ -807,13 +807,31 @@ internal static class DevelopmentSandboxRunner
         cts.Token.ThrowIfCancellationRequested();
         using Process process = Process.Start(info)
             ?? throw new InvalidOperationException("sbx CLI is not available.");
-        Task<string> stdout = ReadBoundedAsync(process.StandardOutput, cts.Token);
-        Task<string> stderr = ReadBoundedAsync(process.StandardError, cts.Token);
+        return await ObserveStartedProcessAsync(process, cts.Token, cancellationToken, arguments[0], safety);
+    }
+
+    // Test assembly only: observe an already-started controlled child with
+    // the same cancellation/termination path as the reserved sbx transport.
+    // No executable selection or additional production command.
+    internal static async Task<SandboxProcess> ObserveReservedProcessForProbeAsync(Process process,
+        TimeSpan limit, CancellationToken cancellationToken, DevelopmentOrderSafetyWindow safety)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(limit);
+        return await ObserveStartedProcessAsync(process, cts.Token, cancellationToken, "offline-probe", safety);
+    }
+
+    private static async Task<SandboxProcess> ObserveStartedProcessAsync(Process process,
+        CancellationToken phaseToken, CancellationToken cancellationToken, string operation,
+        DevelopmentOrderSafetyWindow? safety)
+    {
+        Task<string> stdout = ReadBoundedAsync(process.StandardOutput, phaseToken);
+        Task<string> stderr = ReadBoundedAsync(process.StandardError, phaseToken);
         try
         {
-            await process.WaitForExitAsync(cts.Token);
+            await process.WaitForExitAsync(phaseToken);
             if (safety is not null)
-                await Task.WhenAll(stdout, stderr).WaitAsync(cts.Token);
+                await Task.WhenAll(stdout, stderr).WaitAsync(phaseToken);
             return new SandboxProcess(process.ExitCode, await stdout, await stderr);
         }
         catch (OperationCanceledException)
@@ -843,7 +861,7 @@ internal static class DevelopmentSandboxRunner
             }
 
             cancellationToken.ThrowIfCancellationRequested();
-            throw new TimeoutException("sbx operation timed out: " + arguments[0]);
+            throw new TimeoutException("sbx operation timed out: " + operation);
         }
     }
 
