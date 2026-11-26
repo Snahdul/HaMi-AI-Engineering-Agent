@@ -19,6 +19,25 @@ internal static class DevelopmentOrderSnapshot
     internal static byte[] CaptureBytes(string source, string project) =>
         OrderStorageJson.Encode(CaptureManifest(source, project), MaxManifestBytes);
 
+    // Build the expected manifest from trusted in-memory inputs, not from
+    // a caller's materialized directory. Use exactly the existing format.
+    internal static byte[] CaptureBytes(IReadOnlyDictionary<string, byte[]> files, string project)
+    {
+        OrderCheck.Require(files.Count is > 0 and <= 512, "ORDER_SNAPSHOT_MANIFEST");
+        long total = 0;
+        var entries = new List<SnapshotFile>();
+        foreach (var file in files)
+        {
+            OrderCheck.Require(file.Value.LongLength <= MaxFileBytes - total, "ORDER_SNAPSHOT_SIZE");
+            total += file.Value.LongLength;
+            entries.Add(new(file.Key, file.Value.LongLength, DevelopmentJobState.Hash(file.Value)));
+        }
+
+        var manifest = new SnapshotManifest(1, entries.OrderBy(entry => entry.Path, StringComparer.Ordinal).ToArray());
+        ValidateManifest(manifest, project);
+        return OrderStorageJson.Encode(manifest, MaxManifestBytes);
+    }
+
     internal static void ValidateBytes(byte[] bytes, string project, string? expectedHash)
     {
         OrderCheck.Require(OrderCheck.Hash(expectedHash) && bytes.Length is > 0 and <= MaxManifestBytes

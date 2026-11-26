@@ -710,6 +710,7 @@ internal static class PersistenceBridgeProbe
                     }
 
                     _ = owner.RequireOrderOperationEvidence(operation, completion, recorded);
+                    TestCalculatorSnapshotBinding(owner, completed, root, journal);
                     if (ledger.Pending != operation || File.Exists(journal + ".s01"))
                         throw new InvalidOperationException("Private model evidence became journal or step authority.");
                 }
@@ -774,6 +775,71 @@ internal static class PersistenceBridgeProbe
         }
 
         Console.WriteLine("PASS: reserved S01 model dispatch, generated and terminal-rejected host outcomes, exact evidence, unknown/cancelled remain pending.");
+    }
+
+    private static void TestCalculatorSnapshotBinding(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger completed, string root, string journal)
+    {
+        string source = Path.Combine(root, "calculator-verification");
+        Directory.CreateDirectory(source);
+        var files = DevelopmentOrderCalculatorVerifier.Prepare(owner, completed);
+        foreach (var file in files)
+            File.WriteAllBytes(Path.Combine(source, file.Key), file.Value);
+
+        var proposal = DevelopmentOrderCalculatorVerifier.ProposeGuest(owner, completed, 30, DateTime.UtcNow.Ticks);
+        var limits = completed.CurrentLimits ?? throw new InvalidOperationException("Missing limits.");
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Missing claim.");
+        // Synthetic admission only; no journal append or transport.
+        var admitted = completed.ReserveWithRequiredWork(claim.JobId, limits, proposal,
+            [new("S02", "model", 10), new("S02", "guest", 10), new("FINAL", "guest", completed.FinalReserveSeconds)]);
+        string slot = journal + ".snapshot-2";
+        if (proposal.Step != "S01" || proposal.Kind != "guest" || admitted.Pending != proposal
+            || proposal.SnapshotHash != DevelopmentOrderSnapshot.Capture(source, "Demo.csproj")
+            || completed.Pending is not null || completed.Guests != 0 || admitted.Guests != 1
+            || admitted.ReservedSeconds != completed.ReservedSeconds + 30 || File.Exists(slot))
+            throw new InvalidOperationException("Calculator guest proposal differs.");
+
+        Reject(() => DevelopmentOrderCalculatorVerifier.RequireGuestSnapshot(owner, completed, proposal, source));
+        Reject(() => DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, completed,
+            proposal with { Step = "S02" }, source));
+        Reject(() => DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, completed,
+            proposal with { SnapshotHash = new string('A', 64) }, source));
+        Reject(() => DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, completed,
+            proposal with { OperationId = claim.JobId + ":3" }, source));
+
+        foreach (var file in files)
+        {
+            string path = Path.Combine(source, file.Key);
+            byte[] changed = file.Value.ToArray();
+            changed[0] ^= 1;
+            File.WriteAllBytes(path, changed);
+            try { Reject(() => DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, completed, proposal, source)); }
+            finally { File.WriteAllBytes(path, file.Value); }
+        }
+
+        string extra = Path.Combine(source, "Extra.cs");
+        File.WriteAllText(extra, "// forbidden extra");
+        try { Reject(() => DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, completed, proposal, source)); }
+        finally { File.Delete(extra); }
+        string program = Path.Combine(source, "Program.cs");
+        File.Delete(program);
+        try { Reject(() => DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, completed, proposal, source)); }
+        finally { File.WriteAllBytes(program, files["Program.cs"]); }
+        if (File.Exists(slot))
+            throw new InvalidOperationException("Rejected snapshot created protected evidence.");
+
+        DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, completed, proposal, source);
+        DevelopmentOrderCalculatorVerifier.RequireGuestSnapshot(owner, completed, proposal, source);
+        Reject(() => DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, completed, proposal, source));
+        byte[] manifest = File.ReadAllBytes(slot);
+        File.WriteAllBytes(slot, [.. manifest, 0x20]);
+        try { Reject(() => DevelopmentOrderCalculatorVerifier.RequireGuestSnapshot(owner, completed, proposal, source)); }
+        finally { File.WriteAllBytes(slot, manifest); }
+        DevelopmentOrderCalculatorVerifier.RequireGuestSnapshot(owner, completed, proposal, source);
+        if (File.Exists(journal + ".guest-dispatch-2") || File.Exists(journal + ".s01")
+            || completed.Pending is not null || completed.Guests != 0)
+            throw new InvalidOperationException("Verifier preparation dispatched or accepted work.");
+        Console.WriteLine("PASS: calculator guest proposal binds exactly four trusted input files and protected candidate bytes; substituted, missing, extra and tampered snapshots rejected.");
     }
 
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,

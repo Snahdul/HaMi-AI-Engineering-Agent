@@ -2,8 +2,8 @@ using HaMi.Agentic.Verification;
 
 namespace HaMi.Agentic.Cli.Features.Development;
 
-// Read-only preparation of the fixed S01 guest input. No file writes,
-// dispatch, verification evidence or step acceptance. The caller must
+// Preparation and exact manifest binding of the fixed S01 guest input.
+// No dispatch, verification evidence or step acceptance. The caller must
 // supply the actual journal-derived ledger under the exclusive issue lease.
 internal static class DevelopmentOrderCalculatorVerifier
 {
@@ -25,6 +25,54 @@ internal static class DevelopmentOrderCalculatorVerifier
             ["PairCalculatorVerifier.cs"] = ReadAsset("Checks"),
             ["PairCalculator.cs"] = owner.RequireOrderCandidate(candidate)
         };
+    }
+
+    // Prepare a proposal, not a reservation acknowledgement. The caller
+    // still has to admit mandatory remaining work and persist before dispatch.
+    internal static OrderOperationReservation ProposeGuest(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger completedModel, int seconds, long now)
+    {
+        byte[] manifest = ExpectedManifest(owner, completedModel);
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        return completedModel.Propose(claim.JobId, "S01", "guest", seconds, now, null,
+            DevelopmentJobState.Hash(manifest));
+    }
+
+    // Only the trusted host may materialize the prepared files into an
+    // exclusive source directory. Verify exact content before writing the
+    // existing immutable manifest slot, never bless arbitrary directory bytes.
+    // Called after admission, before journal acknowledgement. No dispatch.
+    internal static void StoreGuestSnapshot(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger completedModel, OrderOperationReservation proposal, string source)
+    {
+        byte[] manifest = RequireExpectedSnapshot(owner, completedModel, proposal, source);
+        owner.StoreOrderSnapshotManifest(proposal, manifest);
+        RequireGuestSnapshot(owner, completedModel, proposal, source);
+    }
+
+    internal static void RequireGuestSnapshot(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger completedModel, OrderOperationReservation proposal, string source)
+    {
+        byte[] expected = RequireExpectedSnapshot(owner, completedModel, proposal, source);
+        OrderCheck.Require(owner.RequireOrderSnapshotManifest(proposal).AsSpan().SequenceEqual(expected),
+            "ORDER_CALCULATOR_VERIFIER_MANIFEST");
+    }
+
+    private static byte[] ExpectedManifest(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger completedModel) =>
+        DevelopmentOrderSnapshot.CaptureBytes(Prepare(owner, completedModel), "Demo.csproj");
+
+    private static byte[] RequireExpectedSnapshot(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger completedModel, OrderOperationReservation proposal, string source)
+    {
+        byte[] manifest = ExpectedManifest(owner, completedModel);
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        OrderCheck.Require(proposal == completedModel.Propose(claim.JobId, "S01", "guest",
+            proposal.ReservedSeconds, proposal.ObservedUtcTicks, null, DevelopmentJobState.Hash(manifest)),
+            "ORDER_CALCULATOR_VERIFIER_RESERVATION");
+        byte[] actual = DevelopmentOrderSnapshot.CaptureBytes(source, "Demo.csproj");
+        OrderCheck.Require(actual.AsSpan().SequenceEqual(manifest), "ORDER_CALCULATOR_VERIFIER_SNAPSHOT");
+        return manifest;
     }
 
     private static byte[] ReadAsset(string name)
