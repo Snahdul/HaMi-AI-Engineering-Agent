@@ -3830,7 +3830,8 @@ internal static class PersistenceBridgeProbe
 
                 if (nextAction != OrderWorkflowAction.GenerateFormatter
                     || current.Stage != 8 || current.Ledger.Sequence != 2 || current.Ledger.ReservedSeconds != 60
-                    || current.Ledger.Pending is not null || current.Ledger.StartedUtcTicks >= processStart)
+                    || current.Ledger.Pending is not null
+                    || (first ? current.Ledger.StartedUtcTicks != processStart : current.Ledger.StartedUtcTicks >= processStart))
                     throw new InvalidOperationException("Replayed calculator budget differs.");
                 VerifyAccepted();
                 string path = database + ".guest-report-2";
