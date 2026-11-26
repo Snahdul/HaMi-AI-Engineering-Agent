@@ -260,9 +260,162 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: protected guest read-only adapter requires exact fresh inspect and stable manifest/report; backend failures remain blocked.");
     }
 
+    // Separate disposable storage/transport integration fixture. Existing
+    // process-kill cases retain their exact historical reference reports.
+    private static async Task TestLiveGuestCaptureAsync(string prefix)
+    {
+        foreach (string scenario in new[] { "success", "raw-replaced", "nonzero", "late-inspect-unknown", "late-inspect-timeout" })
+        {
+            string root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+            var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
+            try
+            {
+                using var owner = store.AcquireOrder(Issue);
+                owner.ClaimOrder(Guid.NewGuid().ToString("N"), FixtureApproval());
+                string journal = owner.CreateOrderJournal();
+                DevelopmentOrderClaim claim = owner.CurrentOrder ?? throw new InvalidOperationException("Claim missing.");
+                DevelopmentOrderArchive archive = owner.RequireArchivedOrder();
+                var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
+                var limits = archive.EffectiveLimits;
+                string repo = Path.Combine(root, "repo");
+                string source = Path.Combine(root, "source");
+                string results = Path.Combine(root, "results");
+                Directory.CreateDirectory(repo);
+                Directory.CreateDirectory(source);
+                Directory.CreateDirectory(results);
+                File.WriteAllText(Path.Combine(source, "Demo.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"/>");
+                File.WriteAllText(Path.Combine(source, "Program.cs"), "Console.WriteLine(42);");
+                byte[] manifest = DevelopmentOrderSnapshot.CaptureBytes(source, "Demo.csproj");
+                string hash = DevelopmentJobState.Hash(manifest);
+                long now = DateTime.UtcNow.Ticks;
+                var ledger = new DevelopmentOrderOperationLedger().Start(new(1, claim.ArchiveHash, now),
+                    claim.ArchiveHash, limits, policy);
+                var reservation = ledger.Propose(claim.JobId, "S01", "guest", 30, now, null, hash);
+                owner.StoreOrderSnapshotManifest(reservation, manifest);
+                // Synthetic acknowledged view only in this integration test;
+                // actual Persist/replay is exercised in the six cases below.
+                ledger = ledger.Reserve(claim.JobId, limits, reservation);
+                string id = DevelopmentOrderGuestReconciliation.RunId(reservation);
+                string name = "hami-code-" + id[..12];
+                string absent = "error: sandbox '" + name + "' not found";
+                string healthy = string.Join('\n', new[]
+                {
+                    "Name: " + name, "Agent: shell", "Workspace: -", "Clone source: -",
+                    "Configured host mounts: none", "Secrets: none", "MCP mode: static",
+                    "MCP servers: none", "Ports: none published", "Network policy: global (local policy)",
+                    "Auth mode: not configured", "State: running"
+                });
+                string guestOutput = string.Join('\0', DevelopmentOrderSnapshot.RequireGuestRecords(source, "Demo.csproj", hash))
+                    + "\0" + DevelopmentOrderSnapshot.GuestEndMarker + "\0";
+                string raw = Path.Combine(results, "reports", "hami-code-" + id, "report.json");
+                bool created = false, removed = false;
+                int calls = 0, afterReturn = 0;
+                byte[]? original = null;
+
+                Task<DevelopmentSandboxRunner.SandboxProcess> Transport(TimeSpan limit, CancellationToken token,
+                    string[] args, DevelopmentOrderSafetyWindow? safety)
+                {
+                    token.ThrowIfCancellationRequested();
+                    if (safety is null || limit <= TimeSpan.Zero)
+                        throw new InvalidOperationException("Missing reserved transport safety window.");
+                    calls++;
+                    DevelopmentSandboxRunner.SandboxProcess response = new(0, "", "");
+                    switch (args[0])
+                    {
+                        case "inspect":
+                            if (args.Contains("--json", StringComparer.Ordinal))
+                                response = new(0, System.Text.Json.JsonSerializer.Serialize(new { name, id = "fixture-backend-id" }), "");
+                            else if (!created || removed)
+                            {
+                                response = new(1, "", absent);
+                                if (File.Exists(raw))
+                                {
+                                    afterReturn++;
+                                    original = File.ReadAllBytes(raw);
+                                    if (scenario == "raw-replaced")
+                                        File.WriteAllText(raw, "not the captured report");
+                                    if (scenario == "late-inspect-unknown")
+                                        response = new(1, "", "backend unavailable");
+                                    if (scenario == "late-inspect-timeout")
+                                        throw new TimeoutException("fixture late inspect");
+                                }
+                            }
+                            else
+                                response = new(0, healthy, "");
+                            break;
+                        case "create": created = true; break;
+                        case "rm": removed = true; break;
+                        case "policy": response = new(1, "Denied: " + args[^1] + " default deny", ""); break;
+                        case "exec":
+                            if (args.Any(a => a.Contains("CREDENTIAL_ENV=clean", StringComparison.Ordinal)))
+                                response = new(0, "CREDENTIAL_ENV=clean", "");
+                            else if (args.Contains("--version", StringComparer.Ordinal))
+                                response = new(0, "11.0.100", "");
+                            else if (args.Contains("hami-snapshot", StringComparer.Ordinal))
+                                response = new(0, guestOutput, "");
+                            else if (scenario == "nonzero" && args.Contains("run", StringComparer.Ordinal))
+                                response = new(1, "", "");
+                            break;
+                    }
+                    return Task.FromResult(response);
+                }
+
+                OrderGuestOutcome? outcome = null;
+                bool timeout = false;
+                try
+                {
+                    outcome = await DevelopmentSandboxRunner.RunReservedCoreAsync(repo, source, results, owner,
+                        ledger, reservation, Transport, (_, _, _, _) => { });
+                }
+                catch (TimeoutException ex) when (scenario == "late-inspect-timeout" && ex.Message == "fixture late inspect")
+                {
+                    timeout = true;
+                }
+
+                bool success = scenario is "success" or "raw-replaced";
+                if ((outcome is not null) != success || timeout != (scenario == "late-inspect-timeout")
+                    || !created || !removed || afterReturn != (scenario == "nonzero" ? 0 : 1)
+                    || !File.Exists(raw) || ledger.Pending != reservation || ledger.Guests != 1)
+                    throw new InvalidOperationException("Live guest capture outcome differs: " + scenario);
+                owner.RequireOrderGuestDispatch(reservation);
+                string slot = journal + ".guest-report-1";
+                if (success)
+                {
+                    byte[] captured = owner.RequireOrderGuestReport(outcome!, reservation);
+                    if (original is null || !captured.SequenceEqual(original)
+                        || DevelopmentJobState.Hash(captured) != outcome!.ReportHash
+                        || !DevelopmentOrderGuestReconciliation.IsSuccessfulReport(reservation, captured)
+                        || (scenario == "raw-replaced" && captured.SequenceEqual(File.ReadAllBytes(raw))))
+                        throw new InvalidOperationException("Protected report differs from live bytes.");
+                }
+                else if (File.Exists(slot))
+                    throw new InvalidOperationException("Failed runner or inspect wrote protected report.");
+
+                int before = calls;
+                bool rejected = false;
+                try
+                {
+                    _ = await DevelopmentSandboxRunner.RunReservedCoreAsync(repo, source, results, owner,
+                        ledger, reservation, Transport, (_, _, _, _) => { });
+                }
+                catch (InvalidOperationException) { rejected = true; }
+                if (!rejected || calls != before)
+                    throw new InvalidOperationException("Consumed guest was redispatched.");
+                owner.ValidateOrderJournalFiles();
+            }
+            finally
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
+        Console.WriteLine("PASS: live reserved runner captures exact protected bytes only after success and fresh absence; raw reports cannot authorize completion.");
+    }
+
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
         Func<string, string, Task> expectOwnership)
     {
+        await TestLiveGuestCaptureAsync(prefix);
         foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan" })
         {
             bool unknown = scenario == "unknown";

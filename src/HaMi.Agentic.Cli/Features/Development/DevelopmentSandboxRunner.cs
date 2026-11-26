@@ -63,23 +63,36 @@ internal static class DevelopmentSandboxRunner
         [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
         string? SnapshotHash = null);
 
-    public static Task<int> RunAsync(
+    private sealed record SandboxRunResult(int ExitCode, byte[]? SuccessfulReport);
+
+    public static async Task<int> RunAsync(
         string repo, string source, string project, string mode, string resultsDirectory,
         Action<string, string, long, int>? phaseObserver = null) =>
-        RunCoreAsync(repo, source, project, mode, resultsDirectory, phaseObserver, null,
-            SbxWithCancellationAsync);
+        (await RunCoreAsync(repo, source, project, mode, resultsDirectory, phaseObserver, null,
+            SbxWithCancellationAsync)).ExitCode;
 
     // Only a trusted order host may call this after a fresh journal ack,
     // current authorization and budget admission. Never call during replay.
     // The caller supplies an existing private, exclusively controlled
     // results root and a reviewed immutable source snapshot.
-    internal static async Task<int> RunReservedAsync(string repo, string source, string resultsDirectory,
+    internal static Task<OrderGuestOutcome?> RunReservedAsync(string repo, string source, string resultsDirectory,
         DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
         OrderOperationReservation reservation, Action<string, string, long, int>? phaseObserver = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        RunReservedCoreAsync(repo, source, resultsDirectory, owner, acknowledged, reservation,
+            SbxWithCancellationAsync, phaseObserver, cancellationToken);
+
+    // Offline probe supplies the transport, not a result or report path.
+    // The production entry above fixes the executable and command surface.
+    internal static async Task<OrderGuestOutcome?> RunReservedCoreAsync(string repo, string source, string resultsDirectory,
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
+        OrderOperationReservation reservation,
+        Func<TimeSpan, CancellationToken, string[], DevelopmentOrderSafetyWindow?, Task<SandboxProcess>> transport,
+        Action<string, string, long, int>? phaseObserver = null, CancellationToken cancellationToken = default)
     {
         using var deadline = DevelopmentOrderDispatchDeadline.Start(acknowledged, reservation, cancellationToken);
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(owner.RequireArchivedOrder().BudgetPolicy));
+        OrderCheck.Require(acknowledged.PolicyHash == policy.Sha256, "ORDER_BUDGET_POLICY_BINDING");
         using var safety = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(policy.SafetyReserveSeconds));
         // Lock order: issue lease first, account-wide backend lease second.
         // Fail before dispatch consumption if another owner is active.
@@ -88,11 +101,38 @@ internal static class DevelopmentSandboxRunner
         // output directory. Failure after this point must never redispatch.
         _ = deadline.Limit(TimeSpan.FromSeconds(1));
         owner.ConsumeOrderGuestDispatch(acknowledged, reservation);
-        return await RunCoreAsync(repo, source, "Demo.csproj", "run", resultsDirectory, phaseObserver, reservation,
-            (limit, token, arguments) => SbxWithCancellationAsync(limit, token, arguments, safety), deadline, safety);
+        SandboxRunResult result = await RunCoreAsync(repo, source, "Demo.csproj", "run", resultsDirectory, phaseObserver, reservation,
+            (limit, token, arguments) => transport(limit, token, arguments, safety), deadline, safety);
+        if (result.ExitCode != 0)
+            return null;
+
+        // Only a successful live return can supply the original serialized
+        // bytes. Never reopen a raw report or adopt it on recovery.
+        byte[] bytes = result.SuccessfulReport ?? throw new InvalidOperationException("ORDER_GUEST_CAPTURE_MISSING");
+        DevelopmentOrderClaim claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        safety.Check();
+        _ = owner.RequireOrderSnapshotManifest(reservation);
+        owner.RequireOrderGuestDispatch(reservation);
+        string name = RecoverySandboxName(DevelopmentOrderGuestReconciliation.RunId(reservation));
+        SandboxProcess observed = await transport(safety.Limit(TimeSpan.FromSeconds(30)), safety.Token,
+            ["inspect", name], safety);
+        safety.Check();
+        var outcome = DevelopmentOrderGuestReconciliation.Observe(claim.ArchiveHash, reservation, bytes,
+            observed.ExitCode, observed.Output, observed.Error, DateTime.UtcNow.Ticks);
+        if (outcome is null)
+            return null;
+
+        // Existing protected slot revalidates the claim/archive, manifest,
+        // dispatch and canonical bytes; exclusive flushed write/readback.
+        // If the safety window expires during the synchronous durable write,
+        // no outcome returns; an orphan is not authority to append or retry.
+        safety.Check();
+        owner.StoreOrderGuestReport(outcome, reservation, bytes);
+        safety.Check();
+        return outcome;
     }
 
-    private static async Task<int> RunCoreAsync(
+    private static async Task<SandboxRunResult> RunCoreAsync(
         string repo, string source, string project, string mode, string resultsDirectory,
         Action<string, string, long, int>? phaseObserver, OrderOperationReservation? reservation,
         Func<TimeSpan, CancellationToken, string[], Task<SandboxProcess>> transport,
@@ -401,11 +441,18 @@ internal static class DevelopmentSandboxRunner
             execution, timedOut, createMs, copyMs, restoreMs, buildMs, executionMs, cleanupMs, lifecycle.ElapsedMilliseconds,
             sandboxRemovalSucceeded, error, verifiedSnapshotHash);
         string reportPath = Path.Combine(reportDir, "report.json");
-        await File.WriteAllTextAsync(reportPath,
-            JsonSerializer.Serialize(report, new JsonSerializerOptions(JsonSerializerDefaults.Web)
-            {
-                WriteIndented = true
-            }), safety?.Token ?? CancellationToken.None);
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true };
+        byte[]? reportBytes = null;
+        if (reservation is null)
+            await File.WriteAllTextAsync(reportPath, JsonSerializer.Serialize(report, options));
+        else
+        {
+            reportBytes = JsonSerializer.SerializeToUtf8Bytes(report, options);
+            // Raw diagnostic copy only. Protected capture below uses these
+            // exact live bytes, not a subsequent path lookup.
+            await File.WriteAllBytesAsync(reportPath, reportBytes, safety!.Token);
+        }
+
         safety?.Check();
         ProgressMessage($"Auftrag beendet ({report.TotalMilliseconds / 1000.0:F2} s), Bericht erstellt.");
         if (phaseObserver is null)
@@ -415,8 +462,10 @@ internal static class DevelopmentSandboxRunner
             if (error is not null) Console.Error.WriteLine(error);
             ShowResultLog(reportDir, mode, restore, build, timedOut);
         }
-        return error is null && sandboxRemovalSucceeded && restore == 0 && build == 0
-            && (mode == "build" || execution == 0) ? 0 : 1;
+        bool succeeded = error is null && sandboxRemovalSucceeded && restore == 0 && build == 0
+            && (mode == "build" || execution == 0);
+        safety?.Check();
+        return new(succeeded ? 0 : 1, succeeded ? reportBytes : null);
     }
 
     private static bool EntryExists(string path)
@@ -1112,8 +1161,8 @@ internal static class DevelopmentSandboxRunner
                 int exit;
                 try
                 {
-                    exit = await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
-                        (_, _, _, _) => { }, reservation, FakeTransport, deadline, safety);
+                    exit = (await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
+                        (_, _, _, _) => { }, reservation, FakeTransport, deadline, safety)).ExitCode;
                 }
                 catch (TimeoutException ex) when (scenario == "cleanup-reserve-exhausted"
                     && ex.Message == "ORDER_SAFETY_RESERVE_EXHAUSTED")
