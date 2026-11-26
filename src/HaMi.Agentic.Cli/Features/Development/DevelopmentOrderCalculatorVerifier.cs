@@ -1,3 +1,4 @@
+using System.Text;
 using HaMi.Agentic.Verification;
 
 namespace HaMi.Agentic.Cli.Features.Development;
@@ -103,6 +104,48 @@ internal static class DevelopmentOrderCalculatorVerifier
         // and a journalled acceptance are separate gates.
         return completedModel.LatestCandidate
             ?? throw new InvalidOperationException("ORDER_CALCULATOR_VERIFIER_CANDIDATE");
+    }
+
+    // The host supplies independently observed, exact approved baseline
+    // bytes and the complete two-file staged pair. No candidate code runs
+    // here. This is bounded pair scope, not whole-checkout attestation.
+    internal static OrderS01Accepted ProposeAcceptance(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger completedModel, DevelopmentOrderOperationLedger completedGuest,
+        OrderGuestOutcome? independentlyObserved, string baseCommit, byte[] scopeBytes,
+        byte[] calculatorBaseline, byte[] formatterBaseline, IReadOnlyDictionary<string, byte[]> stagedPair,
+        long now)
+    {
+        var candidate = RequireCompletedGuest(owner, completedModel, completedGuest, independentlyObserved);
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var binding = claim.Binding;
+        OrderCheck.Require(baseCommit == binding.BaseCommit
+            && DevelopmentJobState.Hash(scopeBytes) == binding.ScopeHash
+            && DevelopmentJobState.Hash(calculatorBaseline) == binding.CalculatorBaselineHash
+            && DevelopmentJobState.Hash(formatterBaseline) == binding.FormatterBaselineHash,
+            "ORDER_CALCULATOR_ACCEPTANCE_BASELINE");
+        var scope = DevelopmentContract.Parse(new UTF8Encoding(false, true).GetString(scopeBytes));
+        OrderCheck.Require(scope.TaskId == "sandbox-pair"
+            && scope.AllowedWritePaths.SequenceEqual(
+                [DevelopmentAgentContract.PairFirst, DevelopmentAgentContract.PairSecond], StringComparer.Ordinal),
+            "ORDER_CALCULATOR_ACCEPTANCE_SCOPE");
+        // Enumerate the actual keys with ordinal semantics; a caller's
+        // dictionary comparer must not widen the approved path set.
+        OrderCheck.Require(stagedPair.Count == 2 && stagedPair.Keys.OrderBy(p => p, StringComparer.Ordinal)
+            .SequenceEqual(scope.AllowedWritePaths.OrderBy(p => p, StringComparer.Ordinal), StringComparer.Ordinal),
+            "ORDER_CALCULATOR_ACCEPTANCE_SCOPE");
+        byte[] accepted = owner.RequireOrderCandidate(candidate);
+        OrderCheck.Require(!accepted.AsSpan().SequenceEqual(calculatorBaseline)
+            && stagedPair[DevelopmentAgentContract.PairFirst].AsSpan().SequenceEqual(accepted)
+            && stagedPair[DevelopmentAgentContract.PairSecond].AsSpan().SequenceEqual(formatterBaseline),
+            "ORDER_CALCULATOR_ACCEPTANCE_BYTES");
+        var guest = completedGuest.LatestGuestOutcome
+            ?? throw new InvalidOperationException("ORDER_CALCULATOR_VERIFIER_OUTCOME");
+        var proposal = new OrderS01Accepted(1, claim.ArchiveHash, candidate, guest.Reservation.OperationId,
+            guest.ReportHash, binding.ScopeHash, binding.FormatterBaselineHash, now);
+        OrderCheck.Require(independentlyObserved is not null && now >= independentlyObserved.ObservedUtcTicks,
+            "ORDER_CALCULATOR_ACCEPTANCE_CLOCK");
+        _ = completedGuest.AcceptS01(claim, proposal);
+        return proposal;
     }
 
     // Linux guest writes one exact line. Accept CRLF for transport portability,

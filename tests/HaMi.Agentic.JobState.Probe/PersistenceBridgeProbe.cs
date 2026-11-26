@@ -30,6 +30,10 @@ internal static class PersistenceBridgeProbe
     private static readonly byte[] ModelBaseline = Encoding.UTF8.GetBytes("synthetic review");
     private const string ModelCandidate = "internal static class PairCalculator { /* generated fixture */ }";
     private const string ModelName = "fixture-model";
+    private static readonly byte[] CalculatorScope = Encoding.UTF8.GetBytes(
+        """
+        {"schemaVersion":1,"taskId":"sandbox-pair","description":"Reviewed offline pair fixture","targetFramework":"net11.0","allowedWritePaths":["src/HaMi.Agentic.Cli/Features/Development/PairCalculator.cs","src/HaMi.Agentic.Cli/Features/Development/PairFormatter.cs"],"acceptanceCriteria":["Exact fixture scope"]}
+        """);
 
     private static OrderAssignment ModelFixtureAssignment(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive)
     {
@@ -329,7 +333,8 @@ internal static class PersistenceBridgeProbe
                 bool calculator = scenario.StartsWith("calculator-", StringComparison.Ordinal);
                 byte[] baseline = Encoding.UTF8.GetBytes("internal static class PairCalculator { }");
                 var approval = FixtureApproval(scenario == "success" ? 40 : null,
-                    calculator ? DevelopmentJobState.Hash(baseline) : null);
+                    calculator ? DevelopmentJobState.Hash(baseline) : null,
+                    calculator ? DevelopmentJobState.Hash(CalculatorScope) : null);
                 owner.ClaimOrder(Guid.NewGuid().ToString("N"), approval);
                 string journal = owner.CreateOrderJournal();
                 DevelopmentOrderClaim claim = owner.CurrentOrder ?? throw new InvalidOperationException("Claim missing.");
@@ -550,6 +555,58 @@ internal static class PersistenceBridgeProbe
                             completedModel, completed, observed) != candidate)
                             throw new InvalidOperationException("Read-only calculator correlation changed.");
                         Console.WriteLine("PASS: historical calculator guest correlation requires adjacent completed ledger, exact protected evidence and fresh observation; Generated remains unaccepted.");
+
+                        var pair = new Dictionary<string, byte[]>(StringComparer.Ordinal)
+                        {
+                            [DevelopmentAgentContract.PairFirst] = candidateBytes,
+                            [DevelopmentAgentContract.PairSecond] = ModelBaseline.ToArray()
+                        };
+                        long acceptedAt = DateTime.UtcNow.Ticks;
+                        OrderS01Accepted Propose() => DevelopmentOrderCalculatorVerifier.ProposeAcceptance(owner,
+                            completedModel, completed, observed, claim.Binding.BaseCommit, CalculatorScope,
+                            baseline, ModelBaseline, pair, acceptedAt);
+                        var acceptance = Propose();
+                        string evt = DevelopmentOrderOperationLedger.EncodeS01Accepted(acceptance);
+                        var accepted = completed.AcceptS01(claim, DevelopmentOrderOperationLedger.DecodeS01Accepted(evt));
+                        if (accepted.AcceptedS01 != acceptance || accepted.LatestCandidate != candidate
+                            || accepted.ReservedSeconds != completed.ReservedSeconds || accepted.Sequence != completed.Sequence
+                            || accepted.StartedUtcTicks != completed.StartedUtcTicks)
+                            throw new InvalidOperationException("S01 acceptance changed operation history.");
+
+                        Reject(() => accepted.AcceptS01(claim, acceptance));
+                        Reject(() => completed.AcceptS01(claim, acceptance with { GuestReportHash = new string('0', 64) }));
+                        Reject(() => completed.AcceptS01(claim, acceptance with { ScopeHash = new string('0', 64) }));
+                        Reject(() => completed.AcceptS01(claim, acceptance with { ObservedUtcTicks = acceptedAt - TimeSpan.TicksPerMinute }));
+                        Reject(() => completed.AcceptS01(claim, acceptance with
+                        {
+                            ObservedUtcTicks = completed.StartedUtcTicks + TimeSpan.TicksPerDay
+                        }));
+                        Reject(() => accepted.Reserve(claim.JobId, limits, accepted.Propose(claim.JobId,
+                            "S01", "guest", 1, acceptedAt, null, reservation.SnapshotHash)));
+                        Reject(() => DevelopmentOrderCalculatorVerifier.ProposeAcceptance(owner,
+                            completedModel, completed, observed, new string('0', 40), CalculatorScope,
+                            baseline, ModelBaseline, pair, acceptedAt));
+                        Reject(() => DevelopmentOrderCalculatorVerifier.ProposeAcceptance(owner,
+                            completedModel, completed, observed, claim.Binding.BaseCommit, [.. CalculatorScope, 0x20],
+                            baseline, ModelBaseline, pair, acceptedAt));
+                        Reject(() => DevelopmentOrderCalculatorVerifier.ProposeAcceptance(owner,
+                            completedModel, completed, observed, claim.Binding.BaseCommit, CalculatorScope,
+                            [.. baseline, 0x20], ModelBaseline, pair, acceptedAt));
+                        pair[DevelopmentAgentContract.PairSecond] = [.. ModelBaseline, 0x20];
+                        Reject(() => Propose());
+                        pair[DevelopmentAgentContract.PairSecond] = ModelBaseline.ToArray();
+                        pair[DevelopmentAgentContract.PairFirst] = baseline;
+                        Reject(() => Propose());
+                        pair[DevelopmentAgentContract.PairFirst] = candidateBytes;
+                        pair.Add("unexpected.cs", [1]);
+                        Reject(() => Propose());
+                        pair.Remove("unexpected.cs");
+                        pair.Remove(DevelopmentAgentContract.PairSecond);
+                        Reject(() => Propose());
+                        pair[DevelopmentAgentContract.PairSecond] = ModelBaseline.ToArray();
+                        if (Propose() != acceptance)
+                            throw new InvalidOperationException("Rejected scope checks changed accepted evidence.");
+                        Console.WriteLine("PASS: bounded S01 baseline and scope acceptance proposal, canonical event fold, no duplicate acceptance or S01 redispatch; tampering rejected.");
                     }
                 }
                 else if (File.Exists(slot))
@@ -1155,7 +1212,8 @@ internal static class PersistenceBridgeProbe
         throw new InvalidOperationException("Bridge child stopped before " + expected);
     }
 
-    internal static DevelopmentOrderApproval FixtureApproval(int? safetyReserveSeconds = null, string? baselineHash = null)
+    internal static DevelopmentOrderApproval FixtureApproval(int? safetyReserveSeconds = null, string? baselineHash = null,
+        string? scopeHash = null)
     {
         using Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("HaMi.Probe.Order")
             ?? throw new InvalidOperationException("Order fixture missing.");
@@ -1186,7 +1244,7 @@ internal static class PersistenceBridgeProbe
         string repository = document.GetProperty("repository").GetString()!;
         string commit = document.GetProperty("baseCommit").GetString()!;
         string hash = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic review"));
-        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", commit, hash, hash, policy.Sha256,
+        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", commit, hash, scopeHash ?? hash, policy.Sha256,
             baselineHash ?? hash, hash);
         DateTimeOffset time = new(2026, 11, 25, 10, 0, 0, TimeSpan.Zero);
         var comment = new OrderCommentObservation(1, 42, "fixture-owner",
