@@ -7,6 +7,10 @@
     <EmbeddedResource Include="../../prompts/development/OrderS01Calculator.prompty" LogicalName="HaMi.DevelopmentOrder.S01Prompt" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="../../samples/DevelopmentOrder/Verifiers/PairCalculatorVerifier.cs" Link="Features/Development/PairCalculatorVerifier.cs" />
+    <EmbeddedResource Include="../../samples/DevelopmentOrder/Verifiers/PairCalculatorVerifier.cs" LogicalName="HaMi.DevelopmentOrder.CalculatorVerifier.Checks" />
+    <EmbeddedResource Include="../../samples/DevelopmentOrder/Verifiers/PairCalculatorProgram.cs.txt" LogicalName="HaMi.DevelopmentOrder.CalculatorVerifier.Program" />
+    <EmbeddedResource Include="../../samples/SandboxCodingPair/Demo.csproj" LogicalName="HaMi.DevelopmentOrder.CalculatorVerifier.Project" />
     <InternalsVisibleTo Include="HaMi.Agentic.JobState.Probe" />
   </ItemGroup>
   <ItemGroup>

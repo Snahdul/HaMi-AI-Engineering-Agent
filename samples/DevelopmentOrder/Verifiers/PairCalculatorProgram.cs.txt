@@ -1,0 +1,6 @@
+// TRUSTED: candidate generation must never modify this entry point.
+using HaMi.Agentic.Cli.Features.Development;
+using HaMi.Agentic.Verification;
+
+PairCalculatorVerifier.Verify(PairCalculator.Clamp);
+Console.WriteLine("HaMi calculator acceptance passed");

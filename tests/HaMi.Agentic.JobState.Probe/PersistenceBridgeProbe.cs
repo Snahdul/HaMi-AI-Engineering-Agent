@@ -1430,6 +1430,26 @@ internal static class PersistenceBridgeProbe
                     || (current.Ledger.Pending is not null) != (expected == OrderModelRecoveryStatus.PendingBlocked))
                     throw new InvalidOperationException("Replayed model outcome differs.");
                 owner.RequireOrderModelDispatch(observation.Reservation);
+                if (expected == OrderModelRecoveryStatus.Generated)
+                {
+                    var files = DevelopmentOrderCalculatorVerifier.Prepare(owner, current.Ledger);
+                    var candidate = observation.Candidate ?? throw new InvalidOperationException("Missing candidate.");
+                    if (files.Count != 4 || !files.ContainsKey("Demo.csproj") || !files.ContainsKey("Program.cs")
+                        || !files.ContainsKey("PairCalculatorVerifier.cs")
+                        || !files["PairCalculator.cs"].SequenceEqual(owner.RequireOrderCandidate(candidate))
+                        || !Encoding.UTF8.GetString(files["Program.cs"]).Contains(
+                            DevelopmentOrderCalculatorVerifier.ExpectedStdout, StringComparison.Ordinal))
+                        throw new InvalidOperationException("Calculator verifier input differs.");
+                    files["PairCalculator.cs"][0] ^= 1;
+                    if (!DevelopmentOrderCalculatorVerifier.Prepare(owner, current.Ledger)["PairCalculator.cs"]
+                        .SequenceEqual(owner.RequireOrderCandidate(candidate)))
+                        throw new InvalidOperationException("Verifier preparation changed protected bytes.");
+                }
+                else
+                {
+                    Reject(() => DevelopmentOrderCalculatorVerifier.Prepare(owner, current.Ledger));
+                }
+
                 if (expected == OrderModelRecoveryStatus.PendingBlocked)
                 {
                     Reject(() => owner.ConsumeOrderModelDispatch(current.Ledger, observation.Reservation));
@@ -1441,7 +1461,11 @@ internal static class PersistenceBridgeProbe
                     string evidence = database + ".evidence-1";
                     byte[] original = File.ReadAllBytes(evidence);
                     File.WriteAllBytes(evidence, [.. original, 0x20]);
-                    try { Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger)); }
+                    try
+                    {
+                        Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger));
+                        Reject(() => DevelopmentOrderCalculatorVerifier.Prepare(owner, current.Ledger));
+                    }
                     finally { File.WriteAllBytes(evidence, original); }
                     _ = DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger);
                 }

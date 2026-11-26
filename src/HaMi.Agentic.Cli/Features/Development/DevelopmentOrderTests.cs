@@ -9,6 +9,7 @@ internal static class DevelopmentOrderTests
     internal static void SelfTest(string repo)
     {
         DevelopmentOrderSchemaTests.SelfTest();
+        DevelopmentOrderCalculatorVerifier.SelfTest();
         string plan = File.ReadAllText(Path.Combine(repo, "samples/DevelopmentOrder/pair-order.json"))
             .Replace("\r\n", "\n", StringComparison.Ordinal);
         if (!plan.EndsWith('\n'))
