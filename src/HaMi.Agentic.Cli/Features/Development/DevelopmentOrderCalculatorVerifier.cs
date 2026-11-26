@@ -116,6 +116,25 @@ internal static class DevelopmentOrderCalculatorVerifier
         long now)
     {
         var candidate = RequireCompletedGuest(owner, completedModel, completedGuest, independentlyObserved);
+        RequirePairScope(owner, candidate, baseCommit, scopeBytes, calculatorBaseline, formatterBaseline, stagedPair);
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var binding = claim.Binding;
+        var guest = completedGuest.LatestGuestOutcome
+            ?? throw new InvalidOperationException("ORDER_CALCULATOR_VERIFIER_OUTCOME");
+        var proposal = new OrderS01Accepted(1, claim.ArchiveHash, candidate, guest.Reservation.OperationId,
+            guest.ReportHash, binding.ScopeHash, binding.FormatterBaselineHash, now);
+        OrderCheck.Require(independentlyObserved is not null && now >= independentlyObserved.ObservedUtcTicks,
+            "ORDER_CALCULATOR_ACCEPTANCE_CLOCK");
+        _ = completedGuest.AcceptS01(claim, proposal);
+        return proposal;
+    }
+
+    // Reusable read-only scope check, including after an already accepted
+    // step has outlived its original execution window. No new acceptance.
+    internal static void RequirePairScope(DevelopmentJobStateStore.Lease owner, OrderCandidateCheckpoint candidate,
+        string baseCommit, byte[] scopeBytes, byte[] calculatorBaseline, byte[] formatterBaseline,
+        IReadOnlyDictionary<string, byte[]> stagedPair)
+    {
         var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
         var binding = claim.Binding;
         OrderCheck.Require(baseCommit == binding.BaseCommit
@@ -138,14 +157,6 @@ internal static class DevelopmentOrderCalculatorVerifier
             && stagedPair[DevelopmentAgentContract.PairFirst].AsSpan().SequenceEqual(accepted)
             && stagedPair[DevelopmentAgentContract.PairSecond].AsSpan().SequenceEqual(formatterBaseline),
             "ORDER_CALCULATOR_ACCEPTANCE_BYTES");
-        var guest = completedGuest.LatestGuestOutcome
-            ?? throw new InvalidOperationException("ORDER_CALCULATOR_VERIFIER_OUTCOME");
-        var proposal = new OrderS01Accepted(1, claim.ArchiveHash, candidate, guest.Reservation.OperationId,
-            guest.ReportHash, binding.ScopeHash, binding.FormatterBaselineHash, now);
-        OrderCheck.Require(independentlyObserved is not null && now >= independentlyObserved.ObservedUtcTicks,
-            "ORDER_CALCULATOR_ACCEPTANCE_CLOCK");
-        _ = completedGuest.AcceptS01(claim, proposal);
-        return proposal;
     }
 
     // Linux guest writes one exact line. Accept CRLF for transport portability,

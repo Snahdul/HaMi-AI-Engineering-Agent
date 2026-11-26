@@ -97,7 +97,7 @@ internal static class Program
             or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
             or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan"
             or "bridge-model-resume-blocked" or "bridge-model-resume-generated" or "bridge-model-resume-rejected"
-            or "bridge-soft-stop" or "bridge-soft-resume")
+            or "bridge-soft-stop" or "bridge-soft-resume" or "bridge-model-accepted" or "bridge-model-resume-accepted")
         {
             string root = args[1];
             string name = Path.GetFileName(root);
@@ -127,8 +127,9 @@ internal static class Program
                         or "bridge-guest-unknown" or "bridge-guest-orphan"
                         or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
                         or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan"
-                        or "bridge-soft-stop")
-                        owner.ClaimOrder(Guid.NewGuid().ToString("N"), PersistenceBridgeProbe.FixtureApproval());
+                        or "bridge-soft-stop" or "bridge-model-accepted")
+                        owner.ClaimOrder(Guid.NewGuid().ToString("N"), args[0] == "bridge-model-accepted"
+                            ? PersistenceBridgeProbe.CalculatorRecoveryApproval() : PersistenceBridgeProbe.FixtureApproval());
                     _ = owner.RequireArchivedOrder();
                     return await PersistenceBridgeProbe.RunChildAsync(args[0], root, owner);
                 }

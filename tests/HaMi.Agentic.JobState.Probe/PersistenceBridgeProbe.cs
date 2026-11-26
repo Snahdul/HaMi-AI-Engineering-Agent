@@ -35,6 +35,27 @@ internal static class PersistenceBridgeProbe
         {"schemaVersion":1,"taskId":"sandbox-pair","description":"Reviewed offline pair fixture","targetFramework":"net11.0","allowedWritePaths":["src/HaMi.Agentic.Cli/Features/Development/PairCalculator.cs","src/HaMi.Agentic.Cli/Features/Development/PairFormatter.cs"],"acceptanceCriteria":["Exact fixture scope"]}
         """);
 
+    internal static DevelopmentOrderApproval CalculatorRecoveryApproval() =>
+        FixtureApproval(scopeHash: DevelopmentJobState.Hash(CalculatorScope));
+
+    // Fixed offline pair observation, not a production checkout reader.
+    // The source is intentionally the fixture's reviewed model response.
+    private static Dictionary<string, byte[]> CalculatorRecoveryPair() => new(StringComparer.Ordinal)
+    {
+        [DevelopmentAgentContract.PairFirst] = Encoding.UTF8.GetBytes(ModelCandidate),
+        [DevelopmentAgentContract.PairSecond] = ModelBaseline.ToArray()
+    };
+
+    private static OrderGuestOutcome ObserveCalculatorFixture(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderClaim claim, OrderGuestOutcome outcome)
+    {
+        byte[] report = owner.RequireOrderGuestReport(outcome, outcome.Reservation);
+        if (!DevelopmentOrderGuestReconciliation.IsCalculatorReport(outcome.Reservation, report))
+            throw new InvalidOperationException("Calculator fixture report required.");
+        return ObserveFixtureGuest(claim, outcome.Reservation, report)
+            ?? throw new InvalidOperationException("Calculator fixture observation missing.");
+    }
+
     private static OrderAssignment ModelFixtureAssignment(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive)
     {
         using var fake = new DevelopmentAiGenerator.ScriptedChatClient("{}");
@@ -1017,7 +1038,7 @@ internal static class PersistenceBridgeProbe
         await TestModelDispatchAsync(prefix);
         await TestLiveGuestCaptureAsync(prefix);
         foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan",
-            "model-receipt", "model-orphan", "model-checkpoint", "model-generated", "model-rejected", "model-rejected-orphan", "soft-stop" })
+            "model-receipt", "model-orphan", "model-checkpoint", "model-generated", "model-rejected", "model-rejected-orphan", "model-accepted", "soft-stop" })
         {
             bool unknown = scenario == "unknown";
             bool failed = scenario == "failed";
@@ -1027,9 +1048,10 @@ internal static class PersistenceBridgeProbe
             bool guestScenario = guest || guestUnknown || guestOrphan;
             bool modelScenario = scenario.StartsWith("model-", StringComparison.Ordinal);
             bool softScenario = scenario == "soft-stop";
+            bool calculatorScenario = scenario == "model-accepted";
             bool modelGenerated = scenario == "model-generated";
             bool modelRejected = scenario == "model-rejected";
-            bool modelCandidate = scenario is "model-orphan" or "model-checkpoint" or "model-generated";
+            bool modelCandidate = scenario is "model-orphan" or "model-checkpoint" or "model-generated" or "model-accepted";
             bool modelEvidence = modelCandidate || modelRejected || scenario == "model-rejected-orphan";
             (string firstMode, string firstMarker, string resumeMode, string resumeMarker) = scenario switch
             {
@@ -1040,6 +1062,8 @@ internal static class PersistenceBridgeProbe
                 "guest" => ("bridge-guest", "BRIDGE_GUEST", "bridge-guest-resume", "BRIDGE_GUEST_RECOVERED"),
                 "guest-unknown" => ("bridge-guest-unknown", "BRIDGE_GUEST_UNKNOWN", "bridge-guest-blocked", "BRIDGE_GUEST_BLOCKED"),
                 "guest-orphan" => ("bridge-guest-orphan", "BRIDGE_GUEST_ORPHAN", "bridge-guest-orphan-resume", "BRIDGE_GUEST_ORPHAN_RECOVERED"),
+                "model-accepted" => ("bridge-model-accepted", "BRIDGE_CALCULATOR_ACCEPTED",
+                    "bridge-model-resume-accepted", "BRIDGE_CALCULATOR_RECOVERED"),
                 _ when modelScenario => ("bridge-" + scenario, "BRIDGE_MODEL_CRASH_READY",
                     modelGenerated ? "bridge-model-resume-generated" : modelRejected ? "bridge-model-resume-rejected"
                         : "bridge-model-resume-blocked", "BRIDGE_MODEL_RECOVERED"),
@@ -1125,6 +1149,11 @@ internal static class PersistenceBridgeProbe
                     }
                 }
                 await expectOwnership(root, "ACQUIRED:order");
+                string[] calculatorSlots = ["candidate-1", "evidence-1", "model-dispatch-1", "snapshot-2", "guest-dispatch-2", "guest-report-2"];
+                string calculatorPrefix = Path.Combine(root, $"issue-{Issue}.order.db.");
+                byte[][] calculatorEvidence = calculatorScenario
+                    ? calculatorSlots.Select(slot => File.ReadAllBytes(calculatorPrefix + slot)).ToArray()
+                    : [];
 
                 using Process resumed = start(resumeMode, root);
                 Task<string> output = resumed.StandardOutput.ReadToEndAsync();
@@ -1164,6 +1193,11 @@ internal static class PersistenceBridgeProbe
                         : !File.ReadAllBytes(artifact).SequenceEqual(AcceptedBytes)
                         || !File.ReadAllBytes(s02).SequenceEqual(AcceptedBytes))
                         throw new InvalidOperationException("Bridge external effect observation differs.");
+                    if (calculatorScenario && (calculatorSlots.Where((slot, i) =>
+                        !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(calculatorEvidence[i])).Any()
+                        || File.Exists(calculatorPrefix + "guest-dispatch-3")
+                        || File.Exists(calculatorPrefix + "model-dispatch-3")))
+                        throw new InvalidOperationException("Accepted calculator recovery changed evidence or dispatched again.");
                 }
                 finally
                 {
@@ -1180,6 +1214,7 @@ internal static class PersistenceBridgeProbe
             }
         }
 
+        Console.WriteLine("PASS: actual calculator acceptance event survives Akka SQL process kill; protected candidate, report, scope and charged budget recovered without redispatch.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -1266,13 +1301,15 @@ internal static class PersistenceBridgeProbe
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
         bool modelScenario = mode.StartsWith("bridge-model-", StringComparison.Ordinal);
         bool softScenario = mode is "bridge-soft-stop" or "bridge-soft-resume";
+        bool calculatorScenario = mode is "bridge-model-accepted" or "bridge-model-resume-accepted";
         bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
             or "bridge-guest-unknown" or "bridge-guest-orphan"
             or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
-            or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan" or "bridge-soft-stop";
+            or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan" or "bridge-soft-stop"
+            or "bridge-model-accepted";
         if (first)
         {
-            var fixtureApproval = FixtureApproval();
+            var fixtureApproval = calculatorScenario ? CalculatorRecoveryApproval() : FixtureApproval();
             if (fixtureApproval.Binding != claim.Binding || fixtureApproval.ObservedAt != archive.ObservedAt)
                 throw new InvalidOperationException("Fixture assignment approval mismatch.");
             var assignments = new[] { FixtureAssignment(claim, archive, "S01"), FixtureAssignment(claim, archive, "S02") };
@@ -1329,7 +1366,7 @@ internal static class PersistenceBridgeProbe
         try
         {
             var system = host.Services.GetRequiredService<ActorSystem>();
-            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, archive, limits, policy, owner, modelScenario, softScenario)), "bridge");
+            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, archive, limits, policy, owner, modelScenario, softScenario, calculatorScenario)), "bridge");
             async Task<BridgeState> ReadAsync()
             {
                 Task<BridgeState> read = actor.Ask<BridgeState>(new ReadState(), Deadline);
@@ -1415,7 +1452,7 @@ internal static class PersistenceBridgeProbe
                 if (modelScenario)
                 {
                     var assignment = ModelFixtureAssignment(claim, archive);
-                    var approval = FixtureApproval();
+                    var approval = calculatorScenario ? CalculatorRecoveryApproval() : FixtureApproval();
                     OrderAgentProfile[] catalog = [new(assignment.Agent, true, ["csharp"])];
                     var reservation = current.Ledger.Propose(claim.JobId, "S01", "model", 30,
                         DateTime.UtcNow.Ticks, OrderOperationAgentBinding.FromAssignment(assignment));
@@ -1434,14 +1471,56 @@ internal static class PersistenceBridgeProbe
                         if (fake.Calls != 1 || (result.Candidate is null) != reject
                             || result.Completion.Outcome != (reject ? "failed" : "succeeded"))
                             throw new InvalidOperationException("Model crash fixture returned wrong outcome.");
-                        if (mode is "bridge-model-checkpoint" or "bridge-model-generated")
+                        if (mode is "bridge-model-checkpoint" or "bridge-model-generated" or "bridge-model-accepted")
                         {
                             var candidate = result.Candidate ?? throw new InvalidOperationException("Candidate missing.");
                             current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCandidate(candidate), 2);
                         }
 
-                        if (mode is "bridge-model-generated" or "bridge-model-rejected")
+                        if (mode is "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-accepted")
                             current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(result.Completion), 7);
+                    }
+
+                    if (calculatorScenario)
+                    {
+                        var model = current.Ledger;
+                        var guest = DevelopmentOrderCalculatorVerifier.ProposeGuest(owner, model, 30, DateTime.UtcNow.Ticks);
+                        string source = Path.Combine(Path.GetTempPath(), "hami-calculator-recovery-" + Guid.NewGuid().ToString("N"));
+                        Directory.CreateDirectory(source);
+                        try
+                        {
+                            foreach (var file in DevelopmentOrderCalculatorVerifier.Prepare(owner, model))
+                                File.WriteAllBytes(Path.Combine(source, file.Key), file.Value);
+                            DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, model, guest, source);
+                        }
+                        finally { Directory.Delete(source, recursive: true); }
+                        current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(guest), 2);
+                        owner.ConsumeOrderGuestDispatch(current.Ledger, guest);
+                        // Controlled transport observation, not a real sandbox run.
+                        var report = new DevelopmentSandboxRunner.SandboxRunReport(5,
+                            DevelopmentOrderGuestReconciliation.RunId(guest), "Demo.csproj", "run",
+                            0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null,
+                            guest.SnapshotHash, DevelopmentOrderCalculatorVerifier.Id);
+                        byte[] bytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(report,
+                            new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web) { WriteIndented = true });
+                        var outcome = ObserveFixtureGuest(claim, guest, bytes)
+                            ?? throw new InvalidOperationException("Calculator fixture guest outcome missing.");
+                        owner.StoreOrderGuestReport(outcome, guest, bytes);
+                        current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeGuestOutcome(outcome), 6);
+                        if (current.Ledger.AcceptedS01 is not null)
+                            throw new InvalidOperationException("Guest completion accepted calculator prematurely.");
+                        Task<BridgeState> acceptance = actor.Ask<BridgeState>(new AcceptCalculator(), Deadline);
+                        await guard.AwaitAsync(acceptance);
+                        current = await acceptance;
+                        if (current.Stage != 8 || current.Ledger.AcceptedS01 is null
+                            || current.Ledger.Models != 1 || current.Ledger.Guests != 1
+                            || current.Ledger.ReservedSeconds != 60 || current.Ledger.Pending is not null)
+                            throw new InvalidOperationException("Calculator acceptance was not acknowledged.");
+                        owner.ValidateOrderJournalFiles();
+                        Console.WriteLine("BRIDGE_CALCULATOR_ACCEPTED");
+                        Console.Out.Flush();
+                        await Task.Delay(Timeout.InfiniteTimeSpan);
+                        return 1;
                     }
 
                     if (current.Ledger.Models != 1 || current.Ledger.ReservedSeconds != 30
@@ -1644,6 +1723,47 @@ internal static class PersistenceBridgeProbe
                     throw new InvalidOperationException("Fresh admitted reservation differs.");
                 // Stop at the fresh reservation; no transport or S02 acceptance.
                 Console.WriteLine("BRIDGE_SOFT_RESUMED");
+                return 0;
+            }
+
+            if (calculatorScenario)
+            {
+                var accepted = current.Ledger.AcceptedS01
+                    ?? throw new InvalidOperationException("Calculator acceptance missing after replay.");
+                var model = current.CalculatorModel ?? throw new InvalidOperationException("Model history missing.");
+                var guest = current.CalculatorGuest ?? throw new InvalidOperationException("Guest history missing.");
+                var outcome = guest.LatestGuestOutcome ?? throw new InvalidOperationException("Guest outcome missing.");
+                void VerifyAccepted()
+                {
+                    var candidate = DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner, model, guest,
+                        ObserveCalculatorFixture(owner, claim, outcome));
+                    DevelopmentOrderCalculatorVerifier.RequirePairScope(owner, candidate, claim.Binding.BaseCommit,
+                        CalculatorScope, ModelBaseline, ModelBaseline, CalculatorRecoveryPair());
+                    if (candidate != accepted.Candidate || current.Ledger != guest.AcceptS01(claim, accepted))
+                        throw new InvalidOperationException("Replayed calculator acceptance differs.");
+                }
+
+                if (current.Stage != 8 || current.Ledger.Sequence != 2 || current.Ledger.ReservedSeconds != 60
+                    || current.Ledger.Pending is not null || current.Ledger.StartedUtcTicks >= processStart)
+                    throw new InvalidOperationException("Replayed calculator budget differs.");
+                VerifyAccepted();
+                string path = database + ".guest-report-2";
+                byte[] original = File.ReadAllBytes(path);
+                File.WriteAllBytes(path, [.. original, 0x20]);
+                try { Reject(VerifyAccepted); }
+                finally { File.WriteAllBytes(path, original); }
+                VerifyAccepted();
+                Reject(() => current.Ledger.Reserve(claim.JobId, limits,
+                    ProposeModel(current.Ledger, "S01", 1, DateTime.UtcNow.Ticks)));
+                try
+                {
+                    _ = await actor.Ask<BridgeState>(new AcceptCalculator(), Deadline);
+                    throw new InvalidOperationException("Duplicate acceptance was acknowledged.");
+                }
+                catch (InvalidOperationException ex) when (ex.Message == "Calculator acceptance blocked.") { }
+                if (await ReadAsync() != current)
+                    throw new InvalidOperationException("Calculator reentry mutated journal state.");
+                Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
                 return 0;
             }
 
@@ -2126,6 +2246,7 @@ internal static class PersistenceBridgeProbe
     private sealed record ReadState;
     private sealed record Advance(string Event);
     private sealed record Admit(OrderOperationReservation Request);
+    private sealed record AcceptCalculator;
 
     // Reviewed disposable fixture only: the existing synthetic S01/S02
     // completion already represents accepted work. No dynamic estimator or
@@ -2139,7 +2260,8 @@ internal static class PersistenceBridgeProbe
         };
     private sealed record RecordedOperation(OrderOperationReservation Reservation, OrderOperationCompletion Completion);
     private sealed record BridgeState(int Stage, string? ArtifactHash, DevelopmentOrderOperationLedger Ledger,
-        RecordedOperation? S01 = null, RecordedOperation? S02 = null, RecordedOperation? FailedS01 = null);
+        RecordedOperation? S01 = null, RecordedOperation? S02 = null, RecordedOperation? FailedS01 = null,
+        DevelopmentOrderOperationLedger? CalculatorModel = null, DevelopmentOrderOperationLedger? CalculatorGuest = null);
 
     private sealed class BridgeActor : ReceivePersistentActor
     {
@@ -2151,13 +2273,15 @@ internal static class PersistenceBridgeProbe
         private readonly DevelopmentOrderBudgetPolicy policy;
         private readonly bool modelScenario;
         private readonly bool softScenario;
+        private readonly bool calculatorScenario;
 
         public override string PersistenceId { get; }
 
         public BridgeActor(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive,
             OrderOperationLimits limits, DevelopmentOrderBudgetPolicy policy, DevelopmentJobStateStore.Lease owner,
-            bool modelScenario, bool softScenario)
+            bool modelScenario, bool softScenario, bool calculatorScenario)
         {
+            this.calculatorScenario = calculatorScenario;
             this.modelScenario = modelScenario;
             this.softScenario = softScenario;
             PersistenceId = claim.PersistenceId;
@@ -2203,10 +2327,46 @@ internal static class PersistenceBridgeProbe
                     reply.Tell(state);
                 });
             });
+            Command<AcceptCalculator>(command =>
+            {
+                if (!recovered || !calculatorScenario || state.Stage != 6 || state.Ledger.AcceptedS01 is not null)
+                {
+                    Sender.Tell(new Status.Failure(new InvalidOperationException("Calculator acceptance blocked.")));
+                    return;
+                }
+
+                try
+                {
+                    var model = state.CalculatorModel ?? throw new InvalidOperationException("Model history missing.");
+                    var outcome = state.Ledger.LatestGuestOutcome ?? throw new InvalidOperationException("Guest outcome missing.");
+                    var observed = ObserveCalculatorFixture(owner, claim, outcome);
+                    var proposal = DevelopmentOrderCalculatorVerifier.ProposeAcceptance(owner, model, state.Ledger,
+                        observed, claim.Binding.BaseCommit, CalculatorScope, ModelBaseline, ModelBaseline,
+                        CalculatorRecoveryPair(), DateTime.UtcNow.Ticks);
+                    string evt = DevelopmentOrderOperationLedger.EncodeS01Accepted(proposal);
+                    BridgeState next = Next(state, evt);
+                    IActorRef reply = Sender;
+                    Persist(evt, _ =>
+                    {
+                        state = next;
+                        reply.Tell(state);
+                    });
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException or System.Text.Json.JsonException)
+                {
+                    Sender.Tell(new Status.Failure(ex));
+                }
+            });
             Command<Advance>(command =>
             {
                 if (!recovered)
                     throw new InvalidOperationException("Recovery incomplete.");
+                if (command.Event.StartsWith("s01-accepted-v1:", StringComparison.Ordinal))
+                {
+                    Sender.Tell(new Status.Failure(new InvalidOperationException("Use calculator acceptance command.")));
+                    return;
+                }
+
                 if (softScenario && (command.Event.StartsWith("reserve-v4:", StringComparison.Ordinal)
                     || command.Event.StartsWith("soft-stop-v1:", StringComparison.Ordinal)
                     || command.Event.StartsWith("budget-stop-v1:", StringComparison.Ordinal)))
@@ -2248,10 +2408,28 @@ internal static class PersistenceBridgeProbe
                 }
                 if (command.Event.StartsWith("reserve-v4:", StringComparison.Ordinal)
                     && next.Ledger.Pending is { Kind: "guest" } reservedGuest)
-                    VerifyFixtureSnapshot(owner, reservedGuest);
+                {
+                    if (calculatorScenario)
+                    {
+                        byte[] manifest = DevelopmentOrderSnapshot.CaptureBytes(
+                            DevelopmentOrderCalculatorVerifier.Prepare(owner, state.Ledger), "Demo.csproj");
+                        if (!owner.RequireOrderSnapshotManifest(reservedGuest).SequenceEqual(manifest))
+                            throw new InvalidOperationException("Calculator snapshot differs.");
+                    }
+                    else
+                        VerifyFixtureSnapshot(owner, reservedGuest);
+                }
                 if (command.Event.StartsWith("guest-outcome-v1:", StringComparison.Ordinal))
-                    VerifyFixtureGuest(owner, claim, next.Ledger.LatestGuestOutcome
-                        ?? throw new InvalidOperationException("Guest outcome missing."));
+                {
+                    var outcome = next.Ledger.LatestGuestOutcome
+                        ?? throw new InvalidOperationException("Guest outcome missing.");
+                    if (calculatorScenario)
+                        _ = DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner,
+                            next.CalculatorModel ?? throw new InvalidOperationException("Model history missing."),
+                            next.Ledger, ObserveCalculatorFixture(owner, claim, outcome));
+                    else
+                        VerifyFixtureGuest(owner, claim, outcome);
+                }
                 IActorRef reply = Sender;
                 Persist(command.Event, _ =>
                 {
@@ -2268,6 +2446,25 @@ internal static class PersistenceBridgeProbe
                 {
                     Stage = 1,
                     Ledger = previous.Ledger.Start(DevelopmentOrderOperationLedger.DecodeStart(evt), claim.ArchiveHash, limits, policy)
+                };
+            if (calculatorScenario && previous.Stage == 7)
+            {
+                var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
+                if (reservation is not { Step: "S01", Kind: "guest" })
+                    throw new InvalidOperationException("Calculator guest reservation required.");
+                return previous with
+                {
+                    Stage = 2,
+                    CalculatorModel = previous.Ledger,
+                    Ledger = previous.Ledger.Reserve(claim.JobId, limits, reservation)
+                };
+            }
+            if (calculatorScenario && previous.Stage == 6)
+                return previous with
+                {
+                    Stage = 8,
+                    CalculatorGuest = previous.Ledger,
+                    Ledger = previous.Ledger.AcceptS01(claim, DevelopmentOrderOperationLedger.DecodeS01Accepted(evt))
                 };
             if (previous.Stage is 1 or 3)
             {
