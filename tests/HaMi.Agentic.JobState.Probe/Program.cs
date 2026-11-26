@@ -98,7 +98,10 @@ internal static class Program
             or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan"
             or "bridge-model-resume-blocked" or "bridge-model-resume-generated" or "bridge-model-resume-rejected"
             or "bridge-soft-stop" or "bridge-soft-resume" or "bridge-model-accepted" or "bridge-model-resume-accepted"
-            or "bridge-model-verified" or "bridge-model-resume-verified")
+            or "bridge-model-verified" or "bridge-model-resume-verified"
+            or "bridge-model-resume-formatter-receipt" or "bridge-model-resume-formatter-orphan"
+            or "bridge-model-resume-formatter-checkpoint" or "bridge-model-resume-formatter-rejected"
+            or "bridge-model-resume-formatter-rejected-orphan")
         {
             string root = args[1];
             string name = Path.GetFileName(root);

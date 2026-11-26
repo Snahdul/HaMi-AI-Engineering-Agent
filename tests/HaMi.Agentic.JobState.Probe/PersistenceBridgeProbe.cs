@@ -1097,7 +1097,9 @@ internal static class PersistenceBridgeProbe
         await TestModelDispatchAsync(prefix);
         await TestLiveGuestCaptureAsync(prefix);
         foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan",
-            "model-receipt", "model-orphan", "model-checkpoint", "model-generated", "model-rejected", "model-rejected-orphan", "model-accepted", "model-verified", "soft-stop" })
+            "model-receipt", "model-orphan", "model-checkpoint", "model-generated", "model-rejected", "model-rejected-orphan", "model-accepted", "model-verified", "soft-stop",
+            "model-formatter-receipt", "model-formatter-orphan", "model-formatter-checkpoint",
+            "model-formatter-rejected", "model-formatter-rejected-orphan" })
         {
             bool unknown = scenario == "unknown";
             bool failed = scenario == "failed";
@@ -1107,10 +1109,13 @@ internal static class PersistenceBridgeProbe
             bool guestScenario = guest || guestUnknown || guestOrphan;
             bool modelScenario = scenario.StartsWith("model-", StringComparison.Ordinal);
             bool softScenario = scenario == "soft-stop";
-            bool calculatorScenario = scenario is "model-accepted" or "model-verified";
+            bool formatterScenario = scenario.StartsWith("model-formatter-", StringComparison.Ordinal);
+            bool calculatorScenario = formatterScenario || scenario is "model-accepted" or "model-verified";
+            bool formatterHasCandidate = scenario is not ("model-formatter-receipt" or "model-formatter-rejected" or "model-formatter-rejected-orphan");
+            bool formatterHasEvidence = scenario != "model-formatter-receipt";
             bool modelGenerated = scenario == "model-generated";
             bool modelRejected = scenario == "model-rejected";
-            bool modelCandidate = scenario is "model-orphan" or "model-checkpoint" or "model-generated" or "model-accepted" or "model-verified";
+            bool modelCandidate = calculatorScenario || scenario is "model-orphan" or "model-checkpoint" or "model-generated";
             bool modelEvidence = modelCandidate || modelRejected || scenario == "model-rejected-orphan";
             (string firstMode, string firstMarker, string resumeMode, string resumeMarker) = scenario switch
             {
@@ -1125,6 +1130,8 @@ internal static class PersistenceBridgeProbe
                     "bridge-model-resume-accepted", "BRIDGE_CALCULATOR_RECOVERED"),
                 "model-verified" => ("bridge-model-verified", "BRIDGE_CALCULATOR_VERIFIED",
                     "bridge-model-resume-verified", "BRIDGE_CALCULATOR_RECOVERED"),
+                _ when formatterScenario => ("bridge-model-accepted", "BRIDGE_CALCULATOR_ACCEPTED",
+                    "bridge-model-resume-formatter-" + scenario["model-formatter-".Length..], "BRIDGE_CALCULATOR_RECOVERED"),
                 _ when modelScenario => ("bridge-" + scenario, "BRIDGE_MODEL_CRASH_READY",
                     modelGenerated ? "bridge-model-resume-generated" : modelRejected ? "bridge-model-resume-rejected"
                         : "bridge-model-resume-blocked", "BRIDGE_MODEL_RECOVERED"),
@@ -1219,6 +1226,7 @@ internal static class PersistenceBridgeProbe
                     : [];
 
                 string[] formatterSlots = ["model-dispatch-3", "candidate-3", "evidence-3"];
+                bool[] expectedFormatterSlots = [true, formatterHasCandidate, formatterHasEvidence];
                 byte[][] formatterEvidence = [];
                 if (calculatorScenario)
                 {
@@ -1230,7 +1238,11 @@ internal static class PersistenceBridgeProbe
                         if (formatterChild.HasExited)
                             throw new InvalidOperationException("Formatter owner stopped before process kill.");
                         await expectOwnership(root, "BUSY");
-                        formatterEvidence = formatterSlots.Select(slot => File.ReadAllBytes(calculatorPrefix + slot)).ToArray();
+                        if (formatterSlots.Where((slot, i) =>
+                            File.Exists(calculatorPrefix + slot) != expectedFormatterSlots[i]).Any())
+                            throw new InvalidOperationException("Formatter crash slots differ.");
+                        formatterEvidence = formatterSlots.Select((slot, i) =>
+                            expectedFormatterSlots[i] ? File.ReadAllBytes(calculatorPrefix + slot) : []).ToArray();
                     }
                     finally
                     {
@@ -1288,12 +1300,11 @@ internal static class PersistenceBridgeProbe
                     if (calculatorScenario && (calculatorSlots.Where((slot, i) =>
                         !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(calculatorEvidence[i])).Any()
                         || File.Exists(calculatorPrefix + "guest-dispatch-3")
-                        || !File.Exists(calculatorPrefix + "model-dispatch-3")
-                        || !File.Exists(calculatorPrefix + "evidence-3")
-                        || !File.ReadAllBytes(calculatorPrefix + "candidate-3").SequenceEqual(Encoding.UTF8.GetBytes("class PairFormatter {}"))
                         || File.Exists(calculatorPrefix + "model-dispatch-4")
-                        || formatterSlots.Where((slot, i) =>
-                            !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(formatterEvidence[i])).Any()))
+                        || formatterSlots.Where((slot, i) => File.Exists(calculatorPrefix + slot) != expectedFormatterSlots[i]
+                            || expectedFormatterSlots[i] && !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(formatterEvidence[i])).Any()
+                        || formatterHasCandidate && !File.ReadAllBytes(calculatorPrefix + "candidate-3")
+                            .SequenceEqual(Encoding.UTF8.GetBytes("class PairFormatter {}"))))
                         throw new InvalidOperationException("Calculator evidence changed or formatter capture differs.");
                 }
                 finally
@@ -1318,6 +1329,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: S02 versioned candidate fold from recovered S01 acceptance; exact predecessor input hash and source scope enforced.");
         Console.WriteLine("PASS: S02 private model dispatch from recovered S01 acceptance, exact receipt and evidence readback, duplicate dispatch and tampering blocked.");
         Console.WriteLine("PASS: S02 admitted reservation, checkpoint and completion persisted before ack; real process kill recovers generated formatter without redispatch or budget reset.");
+        Console.WriteLine("PASS: S02 receipt-only, orphan, checkpoint-only, terminal rejected and rejected-orphan crash windows replay without redispatch, evidence adoption or budget reset.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -1409,8 +1421,11 @@ internal static class PersistenceBridgeProbe
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
         bool modelScenario = mode.StartsWith("bridge-model-", StringComparison.Ordinal);
         bool softScenario = mode is "bridge-soft-stop" or "bridge-soft-resume";
+        const string formatterModePrefix = "bridge-model-resume-formatter-";
+        string formatterCrash = mode.StartsWith(formatterModePrefix, StringComparison.Ordinal)
+            ? mode[formatterModePrefix.Length..] : "generated";
         bool calculatorScenario = mode is "bridge-model-accepted" or "bridge-model-resume-accepted"
-            or "bridge-model-verified" or "bridge-model-resume-verified";
+            or "bridge-model-verified" or "bridge-model-resume-verified" || mode.StartsWith(formatterModePrefix, StringComparison.Ordinal);
         bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
             or "bridge-guest-unknown" or "bridge-guest-orphan"
             or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
@@ -1916,35 +1931,65 @@ internal static class PersistenceBridgeProbe
                     DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state,
                         ObserveCalculatorFixture(owner, claim, outcome), baseline, pair);
 
-                if (current.Stage == 10)
+                if (current.Stage is 9 or 10)
                 {
                     var beforeFormatter = current.FormatterInputState
                         ?? throw new InvalidOperationException("Accepted input history missing.");
                     var recoveredInputs = ReadFormatterInputs(beforeFormatter,
                         ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root));
                     var recovered = DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger);
-                    var candidate = recovered.Candidate ?? throw new InvalidOperationException("Recovered formatter missing.");
-                    if (recovered.Status != OrderModelRecoveryStatus.Generated || candidate.Step != "S02"
-                        || candidate.InputHash != DevelopmentOrderFormatterVerifier.RequireInputHash(claim, accepted, recoveredInputs)
-                        || !owner.RequireOrderCandidate(candidate).SequenceEqual(Encoding.UTF8.GetBytes("class PairFormatter {}"))
-                        || beforeFormatter.AcceptedS01 != accepted || current.Ledger.Pending is not null
-                        || current.Ledger.Sequence != 3 || current.Ledger.Models != 2 || current.Ledger.Guests != 1
-                        || current.Ledger.ReservedSeconds != 70 || current.Ledger.StartedUtcTicks != beforeFormatter.StartedUtcTicks)
-                        throw new InvalidOperationException("Recovered formatter journal differs.");
-
-                    foreach (string suffix in new[] { ".model-dispatch-3", ".candidate-3", ".evidence-3" })
+                    var expectedStatus = formatterCrash switch
                     {
-                        string evidenceFile = database + suffix;
-                        byte[] bytes = File.ReadAllBytes(evidenceFile);
-                        File.WriteAllBytes(evidenceFile, [.. bytes, 0x20]);
-                        try { Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger)); }
-                        finally { File.WriteAllBytes(evidenceFile, bytes); }
+                        "generated" => OrderModelRecoveryStatus.Generated,
+                        "rejected" => OrderModelRecoveryStatus.Rejected,
+                        "receipt" or "orphan" or "checkpoint" or "rejected-orphan" => OrderModelRecoveryStatus.PendingBlocked,
+                        _ => throw new InvalidOperationException("Unknown formatter crash mode.")
+                    };
+                    bool blocked = expectedStatus == OrderModelRecoveryStatus.PendingBlocked;
+                    bool hasCandidate = formatterCrash is "generated" or "orphan" or "checkpoint";
+                    bool hasEvidence = formatterCrash != "receipt";
+                    var candidate = recovered.Candidate;
+                    if (recovered.Status != expectedStatus || (candidate is not null) != (expectedStatus == OrderModelRecoveryStatus.Generated)
+                        || (recovered.Completion is null) != blocked || (current.Ledger.Pending is not null) != blocked
+                        || current.Stage != (blocked ? 9 : 10) || recovered.Reservation.Step != "S02"
+                        || (current.Ledger.LatestCandidate?.Step == "S02") != (formatterCrash is "checkpoint" or "generated")
+                        || beforeFormatter.AcceptedS01 != accepted || current.Ledger.Sequence != 3
+                        || current.Ledger.Models != 2 || current.Ledger.Guests != 1 || current.Ledger.ReservedSeconds != 70
+                        || current.Ledger.StartedUtcTicks != beforeFormatter.StartedUtcTicks
+                        || File.Exists(database + ".candidate-3") != hasCandidate
+                        || File.Exists(database + ".evidence-3") != hasEvidence)
+                        throw new InvalidOperationException("Recovered formatter journal differs.");
+                    if (candidate is not null && (candidate.Step != "S02"
+                        || candidate.InputHash != DevelopmentOrderFormatterVerifier.RequireInputHash(claim, accepted, recoveredInputs)
+                        || !owner.RequireOrderCandidate(candidate).SequenceEqual(Encoding.UTF8.GetBytes("class PairFormatter {}"))))
+                        throw new InvalidOperationException("Recovered formatter input differs.");
+
+                    owner.RequireOrderModelDispatch(recovered.Reservation, accepted);
+                    if (blocked)
+                    {
+                        Reject(() => owner.ConsumeOrderModelDispatch(current.Ledger, recovered.Reservation));
+                        var retry = current.Ledger.Propose(claim.JobId, "S02", "model", 1, DateTime.UtcNow.Ticks,
+                            recovered.Reservation.Assignment);
+                        Reject(() => current.Ledger.Reserve(claim.JobId, limits, retry));
+                    }
+                    else
+                    {
+                        string[] suffixes = candidate is null ? [".model-dispatch-3", ".evidence-3"]
+                            : [".model-dispatch-3", ".candidate-3", ".evidence-3"];
+                        foreach (string suffix in suffixes)
+                        {
+                            string evidenceFile = database + suffix;
+                            byte[] bytes = File.ReadAllBytes(evidenceFile);
+                            File.WriteAllBytes(evidenceFile, [.. bytes, 0x20]);
+                            try { Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger)); }
+                            finally { File.WriteAllBytes(evidenceFile, bytes); }
+                        }
                     }
 
                     if (DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger) != recovered
                         || await ReadAsync() != current || File.Exists(database + ".model-dispatch-4"))
                         throw new InvalidOperationException("Formatter recovery changed history.");
-                    Console.WriteLine("BRIDGE_PHASE: persisted S02 completion recovered after process kill; exact predecessor and private evidence rechecked.");
+                    Console.WriteLine("BRIDGE_PHASE: S02 " + formatterCrash + " recovered after process kill; exact predecessor, journal status and private slots rechecked.");
                     Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
                     return 0;
                 }
@@ -2041,8 +2086,25 @@ internal static class PersistenceBridgeProbe
                     await guard.AwaitAsync(ack);
                     return await ack;
                 }
+                async Task<int> HoldFormatterAsync()
+                {
+                    owner.ValidateOrderJournalFiles();
+                    Console.WriteLine("BRIDGE_FORMATTER_CAPTURED");
+                    Console.Out.Flush();
+                    await Task.Delay(Timeout.InfiniteTimeSpan);
+                    return 1;
+                }
+
+                if (formatterCrash == "receipt")
+                {
+                    owner.ConsumeOrderModelDispatch(actualPending, actualRequest);
+                    return await HoldFormatterAsync();
+                }
+
+                bool rejectedFormatter = formatterCrash is "rejected" or "rejected-orphan";
                 using var formatterClient = new DevelopmentAiGenerator.ScriptedChatClient(
-                    System.Text.Json.JsonSerializer.Serialize(new { source = "class PairFormatter {}" }));
+                    rejectedFormatter ? """{"source":""}"""
+                        : System.Text.Json.JsonSerializer.Serialize(new { source = "class PairFormatter {}" }));
                 var formatterGenerator = new DevelopmentAiGenerator(formatterClient, ModelName);
                 Task<OrderModelDispatchResult> DispatchFormatter(OrderFormatterInputs inputs) =>
                     DevelopmentOrderModelDispatch.RunS02CoreAsync(owner, actualPending, actualRequest,
@@ -2053,11 +2115,28 @@ internal static class PersistenceBridgeProbe
                 if (!invalidInput || formatterClient.Calls != 0)
                     throw new InvalidOperationException("Changed formatter input reached provider.");
                 var result = await DispatchFormatter(unchangedInputs);
+                if (formatterClient.Calls != 1 || (result.Candidate is null) != rejectedFormatter
+                    || result.Completion.Outcome != (rejectedFormatter ? "failed" : "succeeded"))
+                    throw new InvalidOperationException("Formatter crash fixture outcome differs.");
+                if (formatterCrash is "orphan" or "rejected-orphan")
+                    return await HoldFormatterAsync();
+                if (rejectedFormatter)
+                {
+                    current = await RecordFormatterAsync(DevelopmentOrderOperationLedger.EncodeCompletion(result.Completion));
+                    if (current.Stage != 10 || current.Ledger != actualPending.Complete(result.Completion)
+                        || DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger).Status != OrderModelRecoveryStatus.Rejected)
+                        throw new InvalidOperationException("Rejected formatter completion differs.");
+                    return await HoldFormatterAsync();
+                }
+
                 var generated = result.Candidate ?? throw new InvalidOperationException("Formatter candidate missing.");
                 var generatedState = actualPending.Checkpoint(claim, generated);
                 current = await RecordFormatterAsync(DevelopmentOrderOperationLedger.EncodeCandidate(generated));
                 if (current.Stage != 9 || current.Ledger != generatedState)
                     throw new InvalidOperationException("Formatter checkpoint acknowledgement differs.");
+                if (formatterCrash == "checkpoint")
+                    return await HoldFormatterAsync();
+
                 var completedState = generatedState.Complete(result.Completion);
                 current = await RecordFormatterAsync(DevelopmentOrderOperationLedger.EncodeCompletion(result.Completion));
                 if (current.Stage != 10 || current.Ledger != completedState)
@@ -2106,11 +2185,7 @@ internal static class PersistenceBridgeProbe
                 catch (InvalidOperationException ex) when (ex.Message == "Calculator acceptance blocked.") { }
                 if (await ReadAsync() != current)
                     throw new InvalidOperationException("Calculator reentry mutated journal state.");
-                owner.ValidateOrderJournalFiles();
-                Console.WriteLine("BRIDGE_FORMATTER_CAPTURED");
-                Console.Out.Flush();
-                await Task.Delay(Timeout.InfiniteTimeSpan);
-                return 1;
+                return await HoldFormatterAsync();
             }
 
             if (modelScenario)
