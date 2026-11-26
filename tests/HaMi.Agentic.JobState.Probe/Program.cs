@@ -36,6 +36,27 @@ internal static class Program
             return 0;
         }
 
+        if (args.Length == 2 && args[0] is "backend-hold" or "backend-probe")
+        {
+            var backendStore = DevelopmentJobStateRoot.OpenOrderProbeFixture(args[1], create: false);
+            FileStream backend;
+            try { backend = backendStore.AcquireSandboxBackend(); }
+            catch (IOException) when (args[0] == "backend-probe")
+            {
+                Console.WriteLine("BUSY");
+                return 0;
+            }
+            using (backend)
+            {
+                Console.WriteLine("BACKEND_ACQUIRED");
+                Console.Out.Flush();
+                if (args[0] == "backend-probe")
+                    return 0;
+                await Task.Delay(Timeout.InfiniteTimeSpan);
+                return 1;
+            }
+        }
+
         if (args.Length == 2 && args[0] is "hold" or "probe" or "bridge-hold" or "bridge-unknown" or "bridge-resume" or "bridge-blocked" or "bridge-failed" or "bridge-retry" or "bridge-guest" or "bridge-guest-resume" or "bridge-guest-unknown" or "bridge-guest-blocked" or "bridge-guest-orphan" or "bridge-guest-orphan-resume" or "bridge-probe")
         {
             string root = args[1];
@@ -133,6 +154,7 @@ internal static class Program
             }
             await ExpectProbeAsync(fixture, "ACQUIRED:recovery-blocked");
             Console.WriteLine("PASS: cross-process exclusive ownership and abrupt termination retain claim.");
+            await RunBackendLeaseProbeAsync();
             await PersistenceBridgeProbe.RunAsync(Prefix, Start,
                 (root, expected) => ExpectProbeAsync(root, expected, "bridge-probe"));
             return 0;
@@ -140,6 +162,55 @@ internal static class Program
         finally
         {
             Directory.Delete(fixture, recursive: true);
+        }
+    }
+
+    private static async Task RunBackendLeaseProbeAsync()
+    {
+        string root = Path.Combine(Path.GetTempPath(), Prefix + Guid.NewGuid().ToString("N"));
+        var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
+        try
+        {
+            string path = Path.Combine(root, "sandbox-backend.lock");
+            using (var child = Start("backend-hold", root))
+            {
+                try
+                {
+                    if (await child.StandardOutput.ReadLineAsync().WaitAsync(Deadline) != "BACKEND_ACQUIRED"
+                        || child.HasExited)
+                        throw new InvalidOperationException("Backend owner did not acquire.");
+                    await ExpectProbeAsync(root, "BUSY", "backend-probe");
+                    Reject(() => store.AcquireSandboxBackend().Dispose());
+                    if (!File.Exists(path))
+                        throw new InvalidOperationException("Backend lock missing.");
+                }
+                finally
+                {
+                    if (!child.HasExited)
+                        child.Kill(entireProcessTree: true);
+                    await child.WaitForExitAsync().WaitAsync(Deadline);
+                }
+                if (child.ExitCode == 0)
+                    throw new InvalidOperationException("Backend owner did not terminate abnormally.");
+            }
+
+            // Do not unlink the lock to recover. The OS releases the handle.
+            if (!File.Exists(path))
+                throw new InvalidOperationException("Backend lock lost after crash.");
+            await ExpectProbeAsync(root, "BACKEND_ACQUIRED", "backend-probe");
+            using (var backend = store.AcquireSandboxBackend())
+            {
+                await ExpectProbeAsync(root, "BUSY", "backend-probe");
+            }
+            await ExpectProbeAsync(root, "BACKEND_ACQUIRED", "backend-probe");
+            File.WriteAllText(path, "unexpected");
+            Reject(() => store.AcquireSandboxBackend().Dispose());
+            Reject(() => new DevelopmentJobStateStore(root).AcquireSandboxBackend().Dispose());
+            Console.WriteLine("PASS: private account-wide sandbox backend lease excludes cooperating processes and releases on process kill without unlink.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
         }
     }
 

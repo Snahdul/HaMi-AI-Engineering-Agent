@@ -16,6 +16,56 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
 
     internal Lease AcquireOrder(int issue) => AcquireCore(issue, orderClaim: true);
 
+    // One account-scoped coordinator for cooperating reserved runners, not
+    // a daemon-wide security boundary. Do not select a lock by job or path.
+    internal FileStream AcquireSandboxBackend() =>
+        AcquireSandboxBackendCore(root, validatePrivateEntry);
+
+    private static FileStream AcquireSandboxBackendCore(string root, Action<string, bool>? validatePrivateEntry)
+    {
+        if (validatePrivateEntry is null)
+            throw new InvalidOperationException("Private sandbox backend lease required.");
+        _ = ValidateRoot(root);
+        validatePrivateEntry(root, true);
+        string path = Path.Combine(root, "sandbox-backend.lock");
+        bool exists = RegularFileExists(path);
+        if (exists)
+            validatePrivateEntry(path, false);
+
+        FileStream handle;
+        if (!exists && OperatingSystem.IsWindows())
+            handle = DevelopmentJobStateRoot.CreateWindowsPrivateFile(path, FileOptions.None);
+        else
+        {
+            var options = new FileStreamOptions
+            {
+                Mode = exists ? FileMode.Open : FileMode.CreateNew,
+                Access = FileAccess.ReadWrite,
+                Share = FileShare.None
+            };
+            if (!exists && !OperatingSystem.IsWindows())
+                options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            handle = new FileStream(path, options);
+        }
+
+        try
+        {
+            _ = RegularFileExists(path);
+            if (!OperatingSystem.IsWindows())
+                validatePrivateEntry(path, false);
+            if (handle.Length != 0)
+                throw new InvalidOperationException("Sandbox backend lock contents rejected.");
+            // Keep the lock file permanently. Dispose releases the handle;
+            // it is never evidence of successful guest cleanup.
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
     private Lease AcquireCore(int issue, bool orderClaim)
     {
         if (issue <= 0)
@@ -540,6 +590,12 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(path, DevelopmentOrderGuestReconciliation.MaxReportBytes);
             ValidateGuestReportBytes(outcome, bytes);
             return bytes;
+        }
+
+        internal FileStream AcquireOrderSandboxBackend()
+        {
+            RequireOrderStorage();
+            return AcquireSandboxBackendCore(Path.GetDirectoryName(journalPath)!, validatePrivateEntry);
         }
 
         private void RequireOrderStorage()

@@ -72,14 +72,17 @@ internal static class DevelopmentSandboxRunner
     // current authorization and budget admission. Never call during replay.
     // The caller supplies an existing private, exclusively controlled
     // results root and a reviewed immutable source snapshot.
-    internal static Task<int> RunReservedAsync(string repo, string source, string resultsDirectory,
+    internal static async Task<int> RunReservedAsync(string repo, string source, string resultsDirectory,
         DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
         OrderOperationReservation reservation, Action<string, string, long, int>? phaseObserver = null)
     {
+        // Lock order: issue lease first, account-wide backend lease second.
+        // Fail before dispatch consumption if another owner is active.
+        using var backend = owner.AcquireOrderSandboxBackend();
         // Consume once in the private job root, independently of any chosen
         // output directory. Failure after this point must never redispatch.
         owner.ConsumeOrderGuestDispatch(acknowledged, reservation);
-        return RunCoreAsync(repo, source, "Demo.csproj", "run", resultsDirectory, phaseObserver, reservation, SbxAsync);
+        return await RunCoreAsync(repo, source, "Demo.csproj", "run", resultsDirectory, phaseObserver, reservation, SbxAsync);
     }
 
     private static async Task<int> RunCoreAsync(
@@ -593,6 +596,7 @@ internal static class DevelopmentSandboxRunner
         DevelopmentJobStateStore.Lease owner, OrderGuestOutcome recorded,
         Func<TimeSpan, string[], Task<SandboxProcess>> transport)
     {
+        using var backend = owner.AcquireOrderSandboxBackend();
         byte[] bytes = owner.RequireOrderGuestReport(recorded, recorded.Reservation);
         string runId = DevelopmentOrderGuestReconciliation.RunId(recorded.Reservation);
         SandboxProcess result = await transport(TimeSpan.FromSeconds(30), ["inspect", RecoverySandboxName(runId)]);
