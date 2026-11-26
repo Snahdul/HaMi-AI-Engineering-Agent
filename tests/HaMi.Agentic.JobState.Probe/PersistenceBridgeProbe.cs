@@ -2028,6 +2028,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: FINAL pre-dispatch, wrong-output and orphan-report process kills recover pending blocked without redispatch, adoption or budget reset.");
         Console.WriteLine("PASS: journal-derived workflow obligations select pair reentry routes, block pending effects and distinguish rejected models, budget stops and terminal inspection.");
         Console.WriteLine("PASS: bounded workflow admission checks mandatory work and actual journal acknowledgements for S02 model, S02 guest and FINAL; stale and repeated admissions rejected.");
+        Console.WriteLine("PASS: common pair admission and completion checks S01 through FINAL; model recovery is read-only and invalid, stale or duplicate completions rejected.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2284,7 +2285,18 @@ internal static class PersistenceBridgeProbe
                     OrderAgentProfile[] catalog = [new(assignment.Agent, true, ["csharp"])];
                     var reservation = current.Ledger.Propose(claim.JobId, "S01", "model", 30,
                         DateTime.UtcNow.Ticks, OrderOperationAgentBinding.FromAssignment(assignment));
-                    current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(reservation), 2);
+                    async Task<DevelopmentOrderOperationLedger> PersistCalculatorModel(OrderOperationReservation request)
+                    {
+                        current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(request), 2);
+                        return current.Ledger;
+                    }
+
+                    if (calculatorScenario)
+                        _ = await DevelopmentOrderAdmission.AdmitAsync(claim, current.Ledger, reservation,
+                            [new("S01", "guest", 30), new("S02", "model", 10), new("S02", "guest", 10),
+                                new("FINAL", "guest", current.Ledger.FinalReserveSeconds)], PersistCalculatorModel);
+                    else
+                        _ = await PersistCalculatorModel(reservation);
                     if (mode == "bridge-model-receipt")
                         owner.ConsumeOrderModelDispatch(current.Ledger, reservation);
                     else
@@ -2307,7 +2319,16 @@ internal static class PersistenceBridgeProbe
                         }
 
                         if (mode is "bridge-model-generated" or "bridge-model-rejected" || calculatorScenario)
-                            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(result.Completion), 7);
+                        {
+                            async Task<DevelopmentOrderOperationLedger> PersistCalculatorCompletion(OrderOperationCompletion completion)
+                            {
+                                current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(completion), 7);
+                                return current.Ledger;
+                            }
+
+                            _ = await DevelopmentOrderCompletion.RecordModelAsync(owner, current.Ledger,
+                                result.Completion, PersistCalculatorCompletion);
+                        }
                     }
 
                     if (calculatorScenario)
@@ -2326,7 +2347,15 @@ internal static class PersistenceBridgeProbe
                             DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, model, guest, source);
                         }
                         finally { Directory.Delete(source, recursive: true); }
-                        current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(guest), 2);
+                        async Task<DevelopmentOrderOperationLedger> PersistCalculatorGuest(OrderOperationReservation request)
+                        {
+                            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(request), 2);
+                            return current.Ledger;
+                        }
+
+                        _ = await DevelopmentOrderAdmission.AdmitAsync(claim, model, guest,
+                            [new("S02", "model", 10), new("S02", "guest", 10),
+                                new("FINAL", "guest", model.FinalReserveSeconds)], PersistCalculatorGuest);
                         owner.ConsumeOrderGuestDispatch(current.Ledger, guest);
                         // Controlled transport observation, not a real sandbox run.
                         var report = new DevelopmentSandboxRunner.SandboxRunReport(5,
@@ -2338,7 +2367,14 @@ internal static class PersistenceBridgeProbe
                         var outcome = ObserveFixtureGuest(claim, guest, bytes)
                             ?? throw new InvalidOperationException("Calculator fixture guest outcome missing.");
                         owner.StoreOrderGuestReport(outcome, guest, bytes);
-                        current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeGuestOutcome(outcome), 6);
+                        async Task<DevelopmentOrderOperationLedger> PersistCalculatorOutcome(OrderGuestOutcome guestOutcome)
+                        {
+                            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeGuestOutcome(guestOutcome), 6);
+                            return current.Ledger;
+                        }
+
+                        _ = await DevelopmentOrderCompletion.RecordGuestAsync(claim, current.Ledger, outcome,
+                            PersistCalculatorOutcome);
                         if (current.Ledger.AcceptedS01 is not null
                             || DevelopmentOrderWorkflow.Select(claim, current.Ledger) != OrderWorkflowAction.AcceptCalculator)
                             throw new InvalidOperationException("Guest completion accepted calculator prematurely.");
@@ -2888,7 +2924,7 @@ internal static class PersistenceBridgeProbe
 
                     await TestIntegrationSnapshotAsync(owner, pairHistory, pairObservation, root, database, finalCrash,
                         request => DevelopmentOrderAdmission.AdmitAsync(claim, current.Ledger, request, [], PersistIntegration),
-                        CompleteIntegration);
+                        outcome => DevelopmentOrderCompletion.RecordGuestAsync(claim, current.Ledger, outcome, CompleteIntegration));
                     bool completedIntegration = finalCrash == "completed";
                     if (await ReadAsync() != current || current.Stage != (completedIntegration ? 15 : 14)
                         || File.Exists(database + ".guest-dispatch-6"))
@@ -3014,7 +3050,7 @@ internal static class PersistenceBridgeProbe
                         ?? throw new InvalidOperationException("Accepted input history missing.");
                     var recoveredInputs = ReadFormatterInputs(beforeFormatter,
                         ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root));
-                    var recovered = DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger);
+                    var recovered = DevelopmentOrderCompletion.ObserveModel(owner, current.Ledger);
                     var expectedStatus = formatterCrash switch
                     {
                         "generated" => OrderModelRecoveryStatus.Generated,
@@ -3103,7 +3139,7 @@ internal static class PersistenceBridgeProbe
                             root, database, successfulFormatter,
                             request => DevelopmentOrderAdmission.AdmitAsync(claim, current.Ledger, request,
                                 [new("FINAL", "guest", current.Ledger.FinalReserveSeconds)], PersistGuest),
-                            CompleteGuest);
+                            outcome => DevelopmentOrderCompletion.RecordGuestAsync(claim, current.Ledger, outcome, CompleteGuest));
                         if (await ReadAsync() != current || current.Stage != (successfulFormatter ? 12 : 11))
                             throw new InvalidOperationException("Formatter guest journal differs before kill.");
                         owner.ValidateOrderJournalFiles();
@@ -3284,9 +3320,16 @@ internal static class PersistenceBridgeProbe
                     throw new InvalidOperationException("Formatter crash fixture outcome differs.");
                 if (formatterCrash is "orphan" or "rejected-orphan")
                     return await HoldFormatterAsync();
+                async Task<DevelopmentOrderOperationLedger> PersistFormatterCompletion(OrderOperationCompletion completion)
+                {
+                    current = await RecordFormatterAsync(DevelopmentOrderOperationLedger.EncodeCompletion(completion));
+                    return current.Ledger;
+                }
+
                 if (rejectedFormatter)
                 {
-                    current = await RecordFormatterAsync(DevelopmentOrderOperationLedger.EncodeCompletion(result.Completion));
+                    _ = await DevelopmentOrderCompletion.RecordModelAsync(owner, current.Ledger, result.Completion,
+                        PersistFormatterCompletion);
                     if (current.Stage != 10 || current.Ledger != actualPending.Complete(result.Completion)
                         || DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger).Status != OrderModelRecoveryStatus.Rejected)
                         throw new InvalidOperationException("Rejected formatter completion differs.");
@@ -3301,9 +3344,32 @@ internal static class PersistenceBridgeProbe
                 if (formatterCrash == "checkpoint")
                     return await HoldFormatterAsync();
 
-                var completedState = generatedState.Complete(result.Completion);
-                current = await RecordFormatterAsync(DevelopmentOrderOperationLedger.EncodeCompletion(result.Completion));
-                if (current.Stage != 10 || current.Ledger != completedState)
+                int completionCalls = 0;
+                Task<DevelopmentOrderOperationLedger> StaleCompletionAck(OrderOperationCompletion completion)
+                {
+                    completionCalls++;
+                    return Task.FromResult(generatedState);
+                }
+
+                async Task RejectCompletionAsync(DevelopmentOrderOperationLedger before, OrderOperationCompletion completion)
+                {
+                    bool rejected = false;
+                    try { _ = await DevelopmentOrderCompletion.RecordModelAsync(owner, before, completion, StaleCompletionAck); }
+                    catch (InvalidOperationException) { rejected = true; }
+                    if (!rejected)
+                        throw new InvalidOperationException("Invalid completion acknowledged.");
+                }
+
+                await RejectCompletionAsync(generatedState, result.Completion with { EvidenceHash = new string('A', 64) });
+                if (completionCalls != 0)
+                    throw new InvalidOperationException("Invalid completion reached persistence.");
+                await RejectCompletionAsync(generatedState, result.Completion);
+                if (completionCalls != 1 || await ReadAsync() != current)
+                    throw new InvalidOperationException("Stale completion changed journal.");
+                var completedState = await DevelopmentOrderCompletion.RecordModelAsync(owner, generatedState,
+                    result.Completion, PersistFormatterCompletion);
+                await RejectCompletionAsync(completedState, result.Completion);
+                if (completionCalls != 1 || current.Stage != 10 || current.Ledger != completedState)
                     throw new InvalidOperationException("Formatter completion acknowledgement differs.");
                 var recoveredModel = DevelopmentOrderModelReconciliation.Observe(owner, completedState);
                 if (formatterClient.Calls != 1 || generated.InputHash != inputHash
@@ -3354,7 +3420,7 @@ internal static class PersistenceBridgeProbe
 
             if (modelScenario)
             {
-                var observation = DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger);
+                var observation = DevelopmentOrderCompletion.ObserveModel(owner, current.Ledger);
                 var expected = mode switch
                 {
                     "bridge-model-resume-blocked" => OrderModelRecoveryStatus.PendingBlocked,
