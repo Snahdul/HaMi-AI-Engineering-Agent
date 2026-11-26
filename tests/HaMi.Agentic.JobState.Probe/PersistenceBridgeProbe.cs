@@ -2706,8 +2706,8 @@ internal static class PersistenceBridgeProbe
                     {
                         new("S02", "guest", 10), new("FINAL", "guest", beforeStop.FinalReserveSeconds)
                     };
-                    var decision = DevelopmentOrderAdmission.Decide(claim, beforeStop, stoppedRequest, required);
-                    DevelopmentOrderAdmission.RequireAcknowledged(claim, decision, current.Ledger);
+                    var recoveredStopDecision = DevelopmentOrderAdmission.Decide(claim, beforeStop, stoppedRequest, required);
+                    DevelopmentOrderAdmission.RequireAcknowledged(claim, recoveredStopDecision, current.Ledger);
                     _ = ReadFormatterInputs(beforeStop, ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root));
                     if ((formatterCrash == "budget-hard") != (current.Ledger.BudgetStop is not null)
                         || (formatterCrash == "budget-soft") != (current.Ledger.SoftStop is not null)
