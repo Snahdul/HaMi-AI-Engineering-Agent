@@ -2845,8 +2845,10 @@ internal static class PersistenceBridgeProbe
                         [replayedBudgetEvents[0], replayedBudgetEvents[2], replayedBudgetEvents[1]]));
                     Reject(() => VerifyBudgetHandover(extendedPair with { ReservedSeconds = extendedPair.ReservedSeconds - 1 },
                         replayedBudgetEvents));
-                    var changedExtension = DevelopmentOrderOperationLedger.DecodeBudgetExtension(replayedBudgetEvents[2])
-                        with { ApprovalHash = new string('A', 64) };
+                    var changedExtension = DevelopmentOrderOperationLedger.DecodeBudgetExtension(replayedBudgetEvents[2]) with
+                    {
+                        ApprovalHash = new string('A', 64)
+                    };
                     Reject(() => VerifyBudgetHandover(extendedPair,
                         [replayedBudgetEvents[0], replayedBudgetEvents[1],
                             DevelopmentOrderOperationLedger.EncodeBudgetExtension(changedExtension)]));
