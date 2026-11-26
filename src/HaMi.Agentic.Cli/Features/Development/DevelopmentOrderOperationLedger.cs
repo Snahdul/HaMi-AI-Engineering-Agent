@@ -47,6 +47,11 @@ internal sealed record OrderOperationCompletion(
 
 internal sealed record OrderBudgetExhausted(int Version, OrderOperationReservation Request, string Reason);
 
+internal sealed record OrderRequiredOperation(string Step, string Kind, int Seconds);
+
+internal sealed record OrderSoftStop(int Version, OrderOperationReservation Request,
+    OrderRequiredOperation[] RequiredAfter, string Reason);
+
 internal sealed record OrderBudgetExtensionApproved(
     int Version, string JobId, string ArchiveHash, int PreviousRevision,
     OrderOperationLimits Limits, string ApprovalHash, long ObservedUtcTicks);
@@ -60,7 +65,8 @@ internal sealed record DevelopmentOrderOperationLedger(
     string? ArchiveHash = null, string? PolicyHash = null, int FinalReserveSeconds = 0,
     int BudgetRevision = 0, OrderBudgetExhausted? BudgetStop = null, string ExtensionHashes = "",
     OrderCandidateCheckpoint? LatestCandidate = null, OrderGuestOutcome? LatestGuestOutcome = null,
-    OrderOperationReservation? LatestModelReservation = null, OrderOperationCompletion? LatestModelCompletion = null)
+    OrderOperationReservation? LatestModelReservation = null, OrderOperationCompletion? LatestModelCompletion = null,
+    OrderSoftStop? SoftStop = null)
 {
     internal int Models => S01Models + S02Models;
     internal int Guests => S01Guests + S02Guests + FinalGuests;
@@ -165,6 +171,7 @@ internal sealed record DevelopmentOrderOperationLedger(
         OrderOperationReservation reservation)
     {
         OrderCheck.Require(BudgetStop is null, "ORDER_BUDGET_EXHAUSTED");
+        OrderCheck.Require(SoftStop is null, "ORDER_SOFT_STOPPED");
         OrderCheck.Require(BudgetDenial(jobId, limits, reservation) is null, "ORDER_OPERATION_BUDGET");
         var charged = (reservation.Step, reservation.Kind) switch
         {
@@ -184,10 +191,82 @@ internal sealed record DevelopmentOrderOperationLedger(
         };
     }
 
+    // Supervisor supplies the reviewed, still mandatory operations after the
+    // requested next operation. These are cost estimates, not reservations or
+    // authority to execute. The last FINAL guest must be accounted for once.
+    internal string? SoftStopDenial(string jobId, OrderOperationLimits limits,
+        OrderOperationReservation request, IReadOnlyList<OrderRequiredOperation> requiredAfter)
+    {
+        string? hardDenial = BudgetDenial(jobId, limits, request);
+        OrderCheck.Require(requiredAfter is not null && requiredAfter.Count <= OrderCandidateCheckpoint.MaxSequence - 1,
+            "ORDER_SOFT_STOP_PLAN");
+        var plan = new[] { new OrderRequiredOperation(request.Step, request.Kind, request.ReservedSeconds) }
+            .Concat(requiredAfter!).ToArray();
+        int lastRank = -1;
+        foreach (var item in plan)
+        {
+            OrderCheck.Require(item is not null, "ORDER_SOFT_STOP_PLAN");
+            int rank = (item!.Step, item.Kind) switch
+            {
+                ("S01", "model" or "guest") => 0,
+                ("S02", "model" or "guest") => 1,
+                ("FINAL", "guest") => 2,
+                _ => -1
+            };
+            OrderCheck.Require(rank >= 0 && rank >= lastRank && item.Seconds > 0
+                && item.Seconds <= 1800, "ORDER_SOFT_STOP_PLAN");
+            lastRank = rank;
+        }
+        OrderCheck.Require(plan.Count(x => x.Step == "FINAL") == 1
+            && plan[^1].Step == "FINAL" && plan[^1].Seconds >= FinalReserveSeconds,
+            "ORDER_SOFT_STOP_FINAL");
+        if (hardDenial is not null)
+            return hardDenial;
+        long seconds = plan.Sum(x => (long)x.Seconds);
+        if (seconds > limits.Seconds - ReservedSeconds
+            || seconds * TimeSpan.TicksPerSecond > Remaining(limits, request.ObservedUtcTicks).Ticks)
+            return "time";
+        int Count(string step, string kind) => plan.Count(x => x.Step == step && x.Kind == kind);
+        if (S01Models + Count("S01", "model") > limits.S01Models
+            || S02Models + Count("S02", "model") > limits.S02Models
+            || S01Guests + Count("S01", "guest") > limits.S01Guests
+            || S02Guests + Count("S02", "guest") > limits.S02Guests
+            || FinalGuests + Count("FINAL", "guest") > limits.FinalGuests
+            || Models + plan.Count(x => x.Kind == "model") > limits.Models
+            || Guests + plan.Count(x => x.Kind == "guest") > limits.Guests)
+            return "count";
+        return null;
+    }
+
+    // One checked supervisor admission boundary. Direct Reserve is the
+    // historical reducer primitive; the execution host must use this gate
+    // for every new bounded effect, and persist the selected event first.
+    internal DevelopmentOrderOperationLedger ReserveWithRequiredWork(string jobId, OrderOperationLimits limits,
+        OrderOperationReservation request, IReadOnlyList<OrderRequiredOperation> requiredAfter)
+    {
+        OrderCheck.Require(SoftStopDenial(jobId, limits, request, requiredAfter) is null, "ORDER_SOFT_STOP_REQUIRED_WORK");
+        return Reserve(jobId, limits, request);
+    }
+
+    internal DevelopmentOrderOperationLedger StopSoft(string jobId, OrderOperationLimits limits, OrderSoftStop stop)
+    {
+        OrderCheck.Require(SoftStop is null && BudgetStop is null && stop.Version == 1
+            && stop.Reason is "time" or "count"
+            && BudgetDenial(jobId, limits, stop.Request) is null
+            && SoftStopDenial(jobId, limits, stop.Request, stop.RequiredAfter) == stop.Reason,
+            "ORDER_SOFT_STOP");
+        // Copy caller-owned collection before retaining the event.
+        return this with
+        {
+            SoftStop = stop with { RequiredAfter = stop.RequiredAfter.ToArray() },
+            LastUtcTicks = stop.Request.ObservedUtcTicks
+        };
+    }
+
     internal DevelopmentOrderOperationLedger StopForBudget(string jobId, OrderOperationLimits limits,
         OrderBudgetExhausted stop)
     {
-        OrderCheck.Require(BudgetStop is null && stop.Version == 1
+        OrderCheck.Require(BudgetStop is null && SoftStop is null && stop.Version == 1
             && stop.Reason is "time" or "count"
             && BudgetDenial(jobId, limits, stop.Request) == stop.Reason, "ORDER_BUDGET_STOP");
         return this with { BudgetStop = stop, LastUtcTicks = stop.Request.ObservedUtcTicks };
@@ -199,10 +278,11 @@ internal sealed record DevelopmentOrderOperationLedger(
     internal DevelopmentOrderOperationLedger Extend(string jobId, DevelopmentOrderBudgetPolicy policy,
         OrderBudgetExtensionApproved extension)
     {
-        var stop = BudgetStop ?? throw new InvalidOperationException("ORDER_BUDGET_NOT_STOPPED");
+        var requestAtStop = BudgetStop?.Request ?? SoftStop?.Request
+            ?? throw new InvalidOperationException("ORDER_BUDGET_NOT_STOPPED");
         var old = CurrentLimits ?? throw new InvalidOperationException("ORDER_BUDGET_REVISION");
         OrderCheck.Require(Pending is null && extension.Version == 1 && extension.JobId == jobId
-            && stop.Request.OperationId == OperationId(jobId, checked(Sequence + 1))
+            && requestAtStop.OperationId == OperationId(jobId, checked(Sequence + 1))
             && extension.ArchiveHash == ArchiveHash && policy.Sha256 == PolicyHash
             && extension.PreviousRevision == BudgetRevision && OrderCheck.Hash(extension.ApprovalHash)
             && !ExtensionHashes.Contains(extension.ApprovalHash, StringComparison.Ordinal), "ORDER_BUDGET_EXTENSION_BINDING");
@@ -221,10 +301,20 @@ internal sealed record DevelopmentOrderOperationLedger(
             BudgetRevision = checked(BudgetRevision + 1),
             LastUtcTicks = extension.ObservedUtcTicks,
             BudgetStop = null,
+            SoftStop = null,
             ExtensionHashes = ExtensionHashes + extension.ApprovalHash + ";"
         };
-        var request = stop.Request with { ObservedUtcTicks = extension.ObservedUtcTicks };
+        var request = requestAtStop with { ObservedUtcTicks = extension.ObservedUtcTicks };
         string? denial = extended.BudgetDenial(jobId, next, request);
+        if (SoftStop is { } soft)
+        {
+            // Keep the entire required-work estimate even if the immediate
+            // request has meanwhile become hard-denied. No loss of the gate.
+            string? requiredDenial = extended.SoftStopDenial(jobId, next, request, soft.RequiredAfter);
+            return requiredDenial is null ? extended : extended with
+            { SoftStop = new(1, request, soft.RequiredAfter.ToArray(), requiredDenial) };
+        }
+
         return denial is null ? extended : extended with { BudgetStop = new(1, request, denial) };
     }
 
@@ -317,6 +407,12 @@ internal sealed record DevelopmentOrderOperationLedger(
 
     internal static OrderBudgetExhausted DecodeBudgetStop(string evt) =>
         OrderStorageJson.Decode<OrderBudgetExhausted>(EventBytes(evt, "budget-stop-v1:"), EventMaxBytes);
+
+    internal static string EncodeSoftStop(OrderSoftStop stop) =>
+        "soft-stop-v1:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(stop, EventMaxBytes));
+
+    internal static OrderSoftStop DecodeSoftStop(string evt) =>
+        OrderStorageJson.Decode<OrderSoftStop>(EventBytes(evt, "soft-stop-v1:"), EventMaxBytes);
 
     internal static string EncodeBudgetExtension(OrderBudgetExtensionApproved extension) =>
         "budget-extension-v1:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(extension, EventMaxBytes));

@@ -155,6 +155,62 @@ internal static class DevelopmentOrderOperationLedgerTests
             throw new InvalidOperationException("Expired extension created new time window.");
         Console.WriteLine("PASS: hard budget stop, final time reserve and cumulative approved-extension reducer.");
 
+        // The immediate optional model call fits, but remaining mandatory
+        // work would exceed the original cumulative time budget.
+        var softRequest = Propose(first, "S02", "model", 30, now);
+        OrderRequiredOperation[] required =
+        [
+            new("S02", "guest", 60),
+            new("FINAL", "guest", policy.FinalVerificationSeconds)
+        ];
+        if (first.BudgetDenial(job, small, softRequest) is not null
+            || first.SoftStopDenial(job, small, softRequest, required) != "time")
+            throw new InvalidOperationException("Soft stop did not protect mandatory work.");
+        Reject(() => first.ReserveWithRequiredWork(job, small, softRequest, required));
+        var softEvent = new OrderSoftStop(1, softRequest, required, "time");
+        string encodedSoft = DevelopmentOrderOperationLedger.EncodeSoftStop(softEvent);
+        var softStopped = first.StopSoft(job, small, DevelopmentOrderOperationLedger.DecodeSoftStop(encodedSoft));
+        if (softStopped.SoftStop?.Reason != "time" || softStopped.BudgetStop is not null
+            || softStopped.Sequence != first.Sequence || softStopped.Models != first.Models
+            || softStopped.ReservedSeconds != first.ReservedSeconds || softStopped.Pending is not null)
+            throw new InvalidOperationException("Soft stop charged, settled or reset work.");
+        Reject(() => softStopped.Reserve(job, small, softRequest));
+        Reject(() => softStopped.StopSoft(job, small, softEvent));
+        Reject(() => softStopped.StopForBudget(job, small, stop));
+        Reject(() => reserved.StopSoft(job, limits, softEvent));
+        Reject(() => first.StopSoft(job, small, softEvent with { Reason = "count" }));
+        Reject(() => first.StopSoft(job, small, softEvent with { RequiredAfter = [] }));
+        Reject(() => first.SoftStopDenial(job, small, softRequest, [new("S01", "guest", 1), required[1]]));
+        Reject(() => first.SoftStopDenial(job, small, softRequest, [required[1], required[1]]));
+        Reject(() => DevelopmentOrderOperationLedger.DecodeSoftStop(encodedSoft + " "));
+        // Exact fit is allowed; the safety-only reserve is not added.
+        var exact = softRequest with { ReservedSeconds = small.Seconds - first.ReservedSeconds - policy.FinalVerificationSeconds };
+        if (first.SoftStopDenial(job, small, exact, [required[1]]) is not null
+            || first.ReserveWithRequiredWork(job, small, exact, [required[1]]).Pending != exact)
+            throw new InvalidOperationException("Exact mandatory work fit rejected.");
+        var final = Propose(first, "FINAL", "guest", policy.FinalVerificationSeconds, now);
+        if (first.SoftStopDenial(job, small, final, []) is not null)
+            throw new InvalidOperationException("Final operation counted its own reserve twice.");
+        var softExtended = softStopped.Extend(job, policy, extension);
+        if (softExtended.SoftStop is not null || softExtended.BudgetRevision != 1
+            || softExtended.StartedUtcTicks != now || softExtended.ReservedSeconds != 30
+            || softExtended.Sequence != 1 || softExtended.Models != 1 || softExtended.LastEvidenceHash != hash)
+            throw new InvalidOperationException("Valid soft-stop extension did not preserve state.");
+        var softInsufficient = softStopped.Extend(job, policy, extension with { Limits = small with { Seconds = 130 } });
+        if (softInsufficient.SoftStop is null || softInsufficient.BudgetRevision != 1)
+            throw new InvalidOperationException("Insufficient soft-stop extension resumed work.");
+        var softLate = softStopped.Extend(job, policy, extension with { ObservedUtcTicks = expired });
+        if (softLate.SoftStop is null || softLate.BudgetRevision != 1)
+            throw new InvalidOperationException("Expired soft-stop extension lost required work.");
+        var countRequest = Propose(first, "S02", "model", 1, now);
+        OrderRequiredOperation[] countRequired = [new("S02", "model", 1), new("S02", "model", 1), required[1]];
+        if (first.SoftStopDenial(job, small, countRequest, countRequired) != "count")
+            throw new InvalidOperationException("Mandatory call count not protected.");
+        var countStopped = first.StopSoft(job, small, new(1, countRequest, countRequired, "count"));
+        if (countStopped.SoftStop?.Reason != "count" || countStopped.Sequence != first.Sequence)
+            throw new InvalidOperationException("Soft count stop differs.");
+        Console.WriteLine("PASS: soft stop protects mandatory work, exact fit, pending precedence and cumulative extension.");
+
         var claim = DevelopmentOrderClaim.Create(job, approval.Binding, hash);
         var candidate = new OrderCandidateCheckpoint(1, hash, reserve.OperationId, "S01",
             DevelopmentAgentContract.PairFirst, claim.Binding.CalculatorBaselineHash,
