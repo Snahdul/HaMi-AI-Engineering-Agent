@@ -5,6 +5,8 @@
   <ItemGroup>
     <ProjectReference Include="../../src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj" />
     <EmbeddedResource Include="../../samples/DevelopmentOrder/pair-order.json" LogicalName="HaMi.Probe.Order" />
+    <EmbeddedResource Include="../../contracts/development/agent-pair.json" LogicalName="HaMi.Probe.PairContract" />
+    <EmbeddedResource Include="../../contracts/development/sandbox-pair.json" LogicalName="HaMi.Probe.PairScope" />
     <EmbeddedResource Include="../../policies/development/pair-budget.fixture.policy.json" LogicalName="HaMi.Probe.BudgetPolicy" />
     <PackageReference Include="Akka.Persistence" />
     <PackageReference Include="Akka.Persistence.Hosting" />

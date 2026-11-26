@@ -130,7 +130,7 @@ internal static class Program
                         or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan"
                         or "bridge-soft-stop" or "bridge-model-accepted" or "bridge-model-verified")
                         owner.ClaimOrder(Guid.NewGuid().ToString("N"), args[0] is "bridge-model-accepted" or "bridge-model-verified"
-                            ? PersistenceBridgeProbe.CalculatorRecoveryApproval() : PersistenceBridgeProbe.FixtureApproval());
+                            ? await PersistenceBridgeProbe.CalculatorRecoveryApprovalAsync(root) : PersistenceBridgeProbe.FixtureApproval());
                     _ = owner.RequireArchivedOrder();
                     return await PersistenceBridgeProbe.RunChildAsync(args[0], root, owner);
                 }

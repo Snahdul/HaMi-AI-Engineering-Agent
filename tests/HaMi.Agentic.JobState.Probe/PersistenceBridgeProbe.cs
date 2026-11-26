@@ -35,8 +35,53 @@ internal static class PersistenceBridgeProbe
         {"schemaVersion":1,"taskId":"sandbox-pair","description":"Reviewed offline pair fixture","targetFramework":"net11.0","allowedWritePaths":["src/HaMi.Agentic.Cli/Features/Development/PairCalculator.cs","src/HaMi.Agentic.Cli/Features/Development/PairFormatter.cs"],"acceptanceCriteria":["Exact fixture scope"]}
         """);
 
-    internal static DevelopmentOrderApproval CalculatorRecoveryApproval() =>
-        FixtureApproval(scopeHash: DevelopmentJobState.Hash(CalculatorScope));
+    private static string CalculatorRepository(string root) => Path.Combine(root, "calculator-repo");
+
+    private static byte[] ReadCalculatorResource(string name)
+    {
+        using Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(name)
+            ?? throw new InvalidOperationException("Calculator Git fixture resource missing.");
+        using var buffer = new MemoryStream();
+        stream.CopyTo(buffer);
+        return buffer.ToArray();
+    }
+
+    // The only Git writes are to this disposable fixture repository. The
+    // actual project checkout is neither modified nor used as mutable input.
+    private static async Task CreateCalculatorRepositoryAsync(string root)
+    {
+        string repo = CalculatorRepository(root);
+        Directory.CreateDirectory(repo);
+        _ = await DevelopmentWorktreeGuard.GitAsync(repo, "init", "--initial-branch=main", "--template=");
+        _ = await DevelopmentWorktreeGuard.GitAsync(repo, "config", "core.autocrlf", "false");
+        var files = new Dictionary<string, byte[]>(StringComparer.Ordinal)
+        {
+            [DevelopmentAgentContract.PairPath] = ReadCalculatorResource("HaMi.Probe.PairContract"),
+            [DevelopmentAgentContract.PairScopePath] = ReadCalculatorResource("HaMi.Probe.PairScope"),
+            [DevelopmentAgentContract.PairFirst] = ModelBaseline,
+            [DevelopmentAgentContract.PairSecond] = ModelBaseline
+        };
+        foreach (var file in files)
+        {
+            string path = Path.Combine(repo, file.Key);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllBytes(path, file.Value);
+        }
+        _ = await DevelopmentWorktreeGuard.GitAsync(repo, ["add", "-f", "--", .. files.Keys]);
+        _ = await DevelopmentWorktreeGuard.GitAsync(repo, "-c", "user.name=HaMi Offline Fixture",
+            "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+            "-c", "core.hooksPath=" + Path.Combine(repo, ".git", "disabled-hooks"),
+            "commit", "-m", "Reviewed calculator recovery fixture");
+        _ = await DevelopmentWorktreeGuard.ObserveOrderBaselineAsync(repo);
+    }
+
+    internal static async Task<DevelopmentOrderApproval> CalculatorRecoveryApprovalAsync(string root) =>
+        FixtureApproval(gitBaseline: await DevelopmentWorktreeGuard.ObserveOrderBaselineAsync(CalculatorRepository(root)));
+
+    // The existing fixture actor is synchronous at its evidence boundary.
+    // Production supervision must own cancellation and the execution deadline.
+    private static OrderGitBaseline ObserveCalculatorBaseline(string root, OrderBinding binding) =>
+        DevelopmentWorktreeGuard.ObserveOrderBaselineAsync(CalculatorRepository(root), binding).GetAwaiter().GetResult();
 
     // Disposable host-controlled stage, not a production checkout reader.
     // Materialize the exact protected candidate, not an expected model string.
@@ -51,7 +96,8 @@ internal static class PersistenceBridgeProbe
         Directory.CreateDirectory(stage);
         var candidate = model.LatestCandidate ?? throw new InvalidOperationException("Candidate missing.");
         File.WriteAllBytes(Path.Combine(stage, "PairCalculator.cs"), owner.RequireOrderCandidate(candidate));
-        File.WriteAllBytes(Path.Combine(stage, "PairFormatter.cs"), ModelBaseline);
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Claim missing.");
+        File.WriteAllBytes(Path.Combine(stage, "PairFormatter.cs"), ObserveCalculatorBaseline(root, claim.Binding).Formatter);
     }
 
     private static Dictionary<string, byte[]> CalculatorRecoveryPair(string root) =>
@@ -1086,6 +1132,8 @@ internal static class PersistenceBridgeProbe
             var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
             try
             {
+                if (calculatorScenario)
+                    await CreateCalculatorRepositoryAsync(root);
                 using (Process child = start(firstMode, root))
                 {
                     Task<string> stderr = child.StandardError.ReadToEndAsync();
@@ -1229,6 +1277,7 @@ internal static class PersistenceBridgeProbe
 
         Console.WriteLine("PASS: actual calculator acceptance event survives Akka SQL process kill; protected candidate, report, scope and charged budget recovered without redispatch.");
         Console.WriteLine("PASS: calculator guest-complete crash before acceptance replays unaccepted; filesystem stage and evidence rechecked, one acceptance appended without redispatch.");
+        Console.WriteLine("PASS: calculator recovery binds real Git commit and four exact tracked objects; dirty checkout, untracked entry, skip-worktree and binding drift rejected.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -1262,7 +1311,7 @@ internal static class PersistenceBridgeProbe
     }
 
     internal static DevelopmentOrderApproval FixtureApproval(int? safetyReserveSeconds = null, string? baselineHash = null,
-        string? scopeHash = null)
+        string? scopeHash = null, OrderGitBaseline? gitBaseline = null)
     {
         using Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("HaMi.Probe.Order")
             ?? throw new InvalidOperationException("Order fixture missing.");
@@ -1270,6 +1319,8 @@ internal static class PersistenceBridgeProbe
         // Exercise the no-explicit-budget path across actual process kill.
         JsonObject node = JsonNode.Parse(reader.ReadToEnd())!.AsObject();
         node.Remove("limits");
+        if (gitBaseline is not null)
+            node["baseCommit"] = gitBaseline.Commit;
         foreach (JsonNode? step in node["steps"]!.AsArray())
         {
             step!.AsObject().Remove("maxModelCalls");
@@ -1293,8 +1344,11 @@ internal static class PersistenceBridgeProbe
         string repository = document.GetProperty("repository").GetString()!;
         string commit = document.GetProperty("baseCommit").GetString()!;
         string hash = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic review"));
-        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", commit, hash, scopeHash ?? hash, policy.Sha256,
-            baselineHash ?? hash, hash);
+        var profile = new OrderReviewedProfile(repository, 42, "fixture-owner", commit,
+            gitBaseline is null ? hash : DevelopmentJobState.Hash(gitBaseline.Contract),
+            gitBaseline is null ? scopeHash ?? hash : DevelopmentJobState.Hash(gitBaseline.Scope), policy.Sha256,
+            gitBaseline is null ? baselineHash ?? hash : DevelopmentJobState.Hash(gitBaseline.Calculator),
+            gitBaseline is null ? hash : DevelopmentJobState.Hash(gitBaseline.Formatter));
         DateTimeOffset time = new(2026, 11, 25, 10, 0, 0, TimeSpan.Zero);
         var comment = new OrderCommentObservation(1, 42, "fixture-owner",
             $"HaMi-Order-Approval: v1 1 {order.Sha256} {commit}", time, time);
@@ -1324,7 +1378,7 @@ internal static class PersistenceBridgeProbe
             or "bridge-model-accepted" or "bridge-model-verified";
         if (first)
         {
-            var fixtureApproval = calculatorScenario ? CalculatorRecoveryApproval() : FixtureApproval();
+            var fixtureApproval = calculatorScenario ? await CalculatorRecoveryApprovalAsync(root) : FixtureApproval();
             if (fixtureApproval.Binding != claim.Binding || fixtureApproval.ObservedAt != archive.ObservedAt)
                 throw new InvalidOperationException("Fixture assignment approval mismatch.");
             var assignments = new[] { FixtureAssignment(claim, archive, "S01"), FixtureAssignment(claim, archive, "S02") };
@@ -1467,7 +1521,7 @@ internal static class PersistenceBridgeProbe
                 if (modelScenario)
                 {
                     var assignment = ModelFixtureAssignment(claim, archive);
-                    var approval = calculatorScenario ? CalculatorRecoveryApproval() : FixtureApproval();
+                    var approval = calculatorScenario ? await CalculatorRecoveryApprovalAsync(root) : FixtureApproval();
                     OrderAgentProfile[] catalog = [new(assignment.Agent, true, ["csharp"])];
                     var reservation = current.Ledger.Propose(claim.JobId, "S01", "model", 30,
                         DateTime.UtcNow.Ticks, OrderOperationAgentBinding.FromAssignment(assignment));
@@ -1482,7 +1536,8 @@ internal static class PersistenceBridgeProbe
                         using var fake = new DevelopmentAiGenerator.ScriptedChatClient(response);
                         var generator = new DevelopmentAiGenerator(fake, ModelName);
                         var result = await DevelopmentOrderModelDispatch.RunS01CoreAsync(owner, current.Ledger,
-                            reservation, approval, assignment, catalog, ModelBaseline, generator);
+                            reservation, approval, assignment, catalog,
+                            calculatorScenario ? ObserveCalculatorBaseline(root, claim.Binding).Calculator : ModelBaseline, generator);
                         if (fake.Calls != 1 || (result.Candidate is null) != reject
                             || result.Completion.Outcome != (reject ? "failed" : "succeeded"))
                             throw new InvalidOperationException("Model crash fixture returned wrong outcome.");
@@ -1781,6 +1836,28 @@ internal static class PersistenceBridgeProbe
                     File.Move(formatter, formatter + ".saved");
                     try { await RejectAcceptanceAsync(); }
                     finally { File.Move(formatter + ".saved", formatter); }
+
+                    string repo = CalculatorRepository(root);
+                    string baselinePath = Path.Combine(repo, DevelopmentAgentContract.PairFirst);
+                    byte[] baselineBytes = File.ReadAllBytes(baselinePath);
+                    File.WriteAllBytes(baselinePath, [.. baselineBytes, 0x20]);
+                    try { await RejectAcceptanceAsync(); }
+                    finally { File.WriteAllBytes(baselinePath, baselineBytes); }
+                    string untracked = Path.Combine(repo, "unexpected.txt");
+                    File.WriteAllText(untracked, "unexpected");
+                    try { await RejectAcceptanceAsync(); }
+                    finally { File.Delete(untracked); }
+                    _ = await DevelopmentWorktreeGuard.GitAsync(repo, "update-index", "--skip-worktree",
+                        "--", DevelopmentAgentContract.PairSecond);
+                    try { await RejectAcceptanceAsync(); }
+                    finally
+                    {
+                        _ = await DevelopmentWorktreeGuard.GitAsync(repo, "update-index", "--no-skip-worktree",
+                            "--", DevelopmentAgentContract.PairSecond);
+                    }
+                    Reject(() => ObserveCalculatorBaseline(root, claim.Binding with { BaseCommit = new string('0', 40) }));
+                    Reject(() => ObserveCalculatorBaseline(root, claim.Binding with { ScopeHash = new string('0', 64) }));
+                    Reject(() => ObserveCalculatorBaseline(root, claim.Binding with { ContractHash = new string('0', 64) }));
                     Task<BridgeState> acceptance = actor.Ask<BridgeState>(new AcceptCalculator(), Deadline);
                     await guard.AwaitAsync(acceptance);
                     current = await acceptance;
@@ -1798,8 +1875,9 @@ internal static class PersistenceBridgeProbe
                 {
                     var candidate = DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner, model, guest,
                         ObserveCalculatorFixture(owner, claim, outcome));
-                    DevelopmentOrderCalculatorVerifier.RequirePairScope(owner, candidate, claim.Binding.BaseCommit,
-                        CalculatorScope, ModelBaseline, ModelBaseline, CalculatorRecoveryPair(root));
+                    var baseline = ObserveCalculatorBaseline(root, claim.Binding);
+                    DevelopmentOrderCalculatorVerifier.RequirePairScope(owner, candidate, baseline.Commit,
+                        baseline.Scope, baseline.Calculator, baseline.Formatter, CalculatorRecoveryPair(root));
                     if (candidate != accepted.Candidate || current.Ledger != guest.AcceptS01(claim, accepted))
                         throw new InvalidOperationException("Replayed calculator acceptance differs.");
                 }
@@ -2401,8 +2479,9 @@ internal static class PersistenceBridgeProbe
                     var model = state.CalculatorModel ?? throw new InvalidOperationException("Model history missing.");
                     var outcome = state.Ledger.LatestGuestOutcome ?? throw new InvalidOperationException("Guest outcome missing.");
                     var observed = ObserveCalculatorFixture(owner, claim, outcome);
+                    var baseline = ObserveCalculatorBaseline(root, claim.Binding);
                     var proposal = DevelopmentOrderCalculatorVerifier.ProposeAcceptance(owner, model, state.Ledger,
-                        observed, claim.Binding.BaseCommit, CalculatorScope, ModelBaseline, ModelBaseline,
+                        observed, baseline.Commit, baseline.Scope, baseline.Calculator, baseline.Formatter,
                         CalculatorRecoveryPair(root), DateTime.UtcNow.Ticks);
                     string evt = DevelopmentOrderOperationLedger.EncodeS01Accepted(proposal);
                     BridgeState next = Next(state, evt);
