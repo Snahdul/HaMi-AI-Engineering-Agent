@@ -12,7 +12,7 @@ internal enum OrderModelRecoveryStatus
 internal sealed record OrderModelRecoveryObservation(OrderModelRecoveryStatus Status,
     OrderOperationReservation Reservation, OrderCandidateCheckpoint? Candidate, OrderOperationCompletion? Completion);
 
-// Read-only last S01 model-operation recovery. The caller must supply a
+// Read-only last model-operation recovery. The caller must supply a
 // genuinely replayed journal ledger under the exclusive issue lease. No
 // local file can supply a missing journal event or authorize another call.
 internal static class DevelopmentOrderModelReconciliation
@@ -30,7 +30,15 @@ internal static class DevelopmentOrderModelReconciliation
         var reservation = recovered.Pending ?? recovered.LatestModelReservation
             ?? throw new InvalidOperationException("ORDER_MODEL_RECOVERY_RESERVATION");
         OrderCheck.Require(reservation.OperationId == operationId && reservation.Kind == "model"
-            && reservation.Step == "S01", "ORDER_MODEL_RECOVERY_RESERVATION");
+            && reservation.Step is "S01" or "S02", "ORDER_MODEL_RECOVERY_RESERVATION");
+        OrderS01Accepted? accepted = reservation.Step == "S02"
+            ? recovered.AcceptedS01 ?? throw new InvalidOperationException("ORDER_FORMATTER_PREDECESSOR")
+            : null;
+        if (accepted is not null)
+        {
+            _ = OrderCandidateCheckpoint.FormatterInputHash(claim, accepted);
+            _ = owner.RequireOrderCandidate(accepted.Candidate);
+        }
 
         // A previous attempt's candidate must never become this attempt's
         // candidate. A matching journal checkpoint is integrity-checked,
@@ -40,7 +48,9 @@ internal static class DevelopmentOrderModelReconciliation
         {
             if (candidate is not null)
             {
-                owner.RequireOrderModelDispatch(reservation);
+                owner.RequireOrderModelDispatch(reservation, accepted);
+                if (accepted is not null)
+                    candidate.RequireFormatterInput(claim, accepted);
                 _ = owner.RequireOrderCandidate(candidate);
             }
 
@@ -56,11 +66,13 @@ internal static class DevelopmentOrderModelReconciliation
             && completion.EvidenceHash == recovered.LastEvidenceHash
             && completion.ObservedUtcTicks <= recovered.LastUtcTicks,
             "ORDER_MODEL_RECOVERY_COMPLETION");
-        OrderOperationEvidence evidence = owner.RequireOrderOperationEvidence(reservation, completion, candidate);
+        OrderOperationEvidence evidence = owner.RequireOrderOperationEvidence(reservation, completion, candidate, accepted);
         OrderModelRecoveryStatus status = (evidence.Observer, completion.Outcome) switch
         {
             (OrderOperationEvidence.GeneratedObserver, "succeeded") when candidate is not null => OrderModelRecoveryStatus.Generated,
             (OrderOperationEvidence.RejectedResponseObserver, "failed") when candidate is null => OrderModelRecoveryStatus.Rejected,
+            (OrderOperationEvidence.FormatterGeneratedObserver, "succeeded") when candidate is not null => OrderModelRecoveryStatus.Generated,
+            (OrderOperationEvidence.FormatterRejectedObserver, "failed") when candidate is null => OrderModelRecoveryStatus.Rejected,
             _ => throw new InvalidOperationException("ORDER_MODEL_RECOVERY_OBSERVER")
         };
         return new(status, reservation, candidate, completion);

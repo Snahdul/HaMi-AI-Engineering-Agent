@@ -4,7 +4,7 @@ namespace HaMi.Agentic.Cli.Features.Development;
 
 internal sealed record OrderModelDispatchResult(OrderCandidateCheckpoint? Candidate, OrderOperationCompletion Completion);
 
-// S01 only: a trusted host supplies a verified assignment and a single
+// A trusted host supplies a verified assignment and a single
 // tool-free source-extraction transport. This is not a provider factory,
 // a retry policy, a verifier or a journal writer. Never invoke during replay.
 internal static class DevelopmentOrderModelDispatch
@@ -40,17 +40,69 @@ internal static class DevelopmentOrderModelDispatch
             baseline, generator.GenerateS01Async, cancellationToken);
     }
 
-    internal static async Task<OrderModelDispatchResult> RunAsync(
+    internal static async Task<OrderModelDispatchResult> RunS02Async(
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
+        OrderOperationReservation reservation, DevelopmentOrderApproval approval,
+        OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, OrderFormatterInputs inputs,
+        string apiKey, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var client = DevelopmentAiGenerator.CreateReservedClient(apiKey);
+        var generator = new DevelopmentAiGenerator(client, assignment.Agent.Model);
+        return await RunS02CoreAsync(owner, acknowledged, reservation, approval, assignment, catalog,
+            inputs, generator, cancellationToken);
+    }
+
+    internal static Task<OrderModelDispatchResult> RunS02CoreAsync(
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
+        OrderOperationReservation reservation, DevelopmentOrderApproval approval,
+        OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, OrderFormatterInputs inputs,
+        DevelopmentAiGenerator generator, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        OrderCheck.Require(reservation.Step == "S02" && assignment.Agent.Provider == "openai"
+            && assignment.Agent.Model == generator.ModelId
+            && assignment.Agent.ConfigurationHash == generator.S02ConfigurationHash,
+            "ORDER_MODEL_CONFIGURATION");
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var accepted = acknowledged.AcceptedS01 ?? throw new InvalidOperationException("ORDER_FORMATTER_PREDECESSOR");
+        var copied = new OrderFormatterInputs(inputs.CalculatorAcceptance, inputs.Calculator.ToArray(),
+            inputs.FormatterBaseline.ToArray());
+        string inputHash = DevelopmentOrderFormatterVerifier.RequireInputHash(claim, accepted, copied);
+        OrderCheck.Require(owner.RequireOrderCandidate(accepted.Candidate).AsSpan().SequenceEqual(copied.Calculator),
+            "ORDER_FORMATTER_PREDECESSOR");
+        string calculator = DecodeSource(copied.Calculator);
+        return RunCoreAsync(owner, acknowledged, reservation, approval, assignment, catalog,
+            copied.FormatterBaseline, (source, token) => generator.GenerateS02Async(source, calculator, token),
+            accepted, inputHash, cancellationToken);
+    }
+
+    internal static Task<OrderModelDispatchResult> RunAsync(
         DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
         OrderOperationReservation reservation, DevelopmentOrderApproval approval,
         OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, byte[] baseline,
         Func<string, CancellationToken, Task<string>> generate,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        RunCoreAsync(owner, acknowledged, reservation, approval, assignment, catalog, baseline, generate,
+            null, null, cancellationToken);
+
+    private static async Task<OrderModelDispatchResult> RunCoreAsync(
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
+        OrderOperationReservation reservation, DevelopmentOrderApproval approval,
+        OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, byte[] baseline,
+        Func<string, CancellationToken, Task<string>> generate, OrderS01Accepted? accepted,
+        string? formatterInputHash, CancellationToken cancellationToken)
     {
         using var deadline = DevelopmentOrderDispatchDeadline.Start(acknowledged, reservation, cancellationToken);
         var archive = owner.RequireArchivedOrder();
         DevelopmentOrderClaim claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
-        OrderCheck.Require(reservation.Step == "S01" && reservation.Kind == "model"
+        bool formatter = accepted is not null;
+        string step = formatter ? "S02" : "S01";
+        string baselineHash = formatter ? claim.Binding.FormatterBaselineHash : claim.Binding.CalculatorBaselineHash;
+        string inputHash = formatterInputHash ?? baselineHash;
+        OrderCheck.Require(reservation.Step == step && reservation.Kind == "model"
+            && (!formatter || (acknowledged.AcceptedS01 == accepted
+                && inputHash == OrderCandidateCheckpoint.FormatterInputHash(claim, accepted!)))
             && reservation.SnapshotHash is null && acknowledged.ArchiveHash == claim.ArchiveHash
             && acknowledged.PolicyHash == claim.Binding.PolicyHash
             && approval.Binding == claim.Binding && approval.Order.Plan == archive.Plan,
@@ -64,7 +116,7 @@ internal static class DevelopmentOrderModelDispatch
         OrderCheck.Require(baseline.Length is > 0 and <= OrderCandidateCheckpoint.MaxBytes,
             "ORDER_MODEL_BASELINE_SIZE");
         byte[] input = baseline.ToArray();
-        OrderCheck.Require(DevelopmentJobState.Hash(input) == claim.Binding.CalculatorBaselineHash,
+        OrderCheck.Require(DevelopmentJobState.Hash(input) == baselineHash,
             "ORDER_MODEL_BASELINE_HASH");
         string source = DecodeSource(input);
         _ = deadline.Limit(TimeSpan.FromSeconds(1));
@@ -84,12 +136,12 @@ internal static class DevelopmentOrderModelDispatch
             // This catch covers only the trusted response adapter, not
             // preflight, storage, generic transport or verifier failures.
             _ = deadline.Limit(TimeSpan.FromSeconds(1));
-            var failed = new OrderOperationEvidence(2, claim.ArchiveHash, reservation,
-                OrderOperationEvidence.RejectedResponseObserver, "failed", claim.Binding.CalculatorBaselineHash,
-                claim.Binding.CalculatorBaselineHash, null, DateTime.UtcNow.Ticks);
+            var failed = new OrderOperationEvidence(formatter ? 3 : 2, claim.ArchiveHash, reservation,
+                formatter ? OrderOperationEvidence.FormatterRejectedObserver : OrderOperationEvidence.RejectedResponseObserver,
+                "failed", baselineHash, inputHash, null, DateTime.UtcNow.Ticks);
             var failedCompletion = failed.Completion();
             _ = acknowledged.Complete(failedCompletion);
-            OrderCheck.Require(owner.StoreOrderOperationEvidence(failed) == failedCompletion,
+            OrderCheck.Require(owner.StoreOrderOperationEvidence(failed, accepted: accepted) == failedCompletion,
                 "ORDER_MODEL_EVIDENCE_COMPLETION");
             _ = deadline.Limit(TimeSpan.FromSeconds(1));
             return new(null, failedCompletion);
@@ -100,22 +152,23 @@ internal static class DevelopmentOrderModelDispatch
             "ORDER_MODEL_SOURCE_SIZE");
         byte[] bytes = Utf8.GetBytes(generated);
         _ = DecodeSource(bytes);
-        var checkpoint = new OrderCandidateCheckpoint(1, claim.ArchiveHash, reservation.OperationId, "S01",
-            DevelopmentAgentContract.PairFirst, claim.Binding.CalculatorBaselineHash,
-            claim.Binding.CalculatorBaselineHash, bytes.Length, DevelopmentJobState.Hash(bytes), "Generated",
+        var checkpoint = new OrderCandidateCheckpoint(formatter ? 2 : 1, claim.ArchiveHash, reservation.OperationId, step,
+            formatter ? DevelopmentAgentContract.PairSecond : DevelopmentAgentContract.PairFirst, baselineHash,
+            inputHash, bytes.Length, DevelopmentJobState.Hash(bytes), "Generated",
             DateTime.UtcNow.Ticks);
         var checkpointed = acknowledged.Checkpoint(claim, checkpoint);
-        owner.RequireOrderModelDispatch(reservation);
+        owner.RequireOrderModelDispatch(reservation, accepted);
         _ = deadline.Limit(TimeSpan.FromSeconds(1));
         owner.StoreOrderCandidate(checkpoint, bytes);
         _ = deadline.Limit(TimeSpan.FromSeconds(1));
-        var evidence = new OrderOperationEvidence(2, claim.ArchiveHash, reservation,
-            OrderOperationEvidence.GeneratedObserver, "succeeded", checkpoint.BaselineHash,
+        var evidence = new OrderOperationEvidence(formatter ? 3 : 2, claim.ArchiveHash, reservation,
+            formatter ? OrderOperationEvidence.FormatterGeneratedObserver : OrderOperationEvidence.GeneratedObserver,
+            "succeeded", checkpoint.BaselineHash,
             checkpoint.InputHash, checkpoint.ArtifactHash, DateTime.UtcNow.Ticks);
         var completion = evidence.Completion();
         _ = checkpointed.Complete(completion);
         _ = deadline.Limit(TimeSpan.FromSeconds(1));
-        OrderCheck.Require(owner.StoreOrderOperationEvidence(evidence, checkpoint) == completion,
+        OrderCheck.Require(owner.StoreOrderOperationEvidence(evidence, checkpoint, accepted) == completion,
             "ORDER_MODEL_EVIDENCE_COMPLETION");
         _ = deadline.Limit(TimeSpan.FromSeconds(1));
         // Caller must persist checkpoint then completion under the same

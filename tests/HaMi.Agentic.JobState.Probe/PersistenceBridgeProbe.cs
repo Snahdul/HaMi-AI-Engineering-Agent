@@ -113,18 +113,19 @@ internal static class PersistenceBridgeProbe
             ?? throw new InvalidOperationException("Calculator fixture observation missing.");
     }
 
-    private static OrderAssignment ModelFixtureAssignment(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive)
+    private static OrderAssignment ModelFixtureAssignment(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive,
+        string step = "S01")
     {
         using var fake = new DevelopmentAiGenerator.ScriptedChatClient("{}");
         var generator = new DevelopmentAiGenerator(fake, ModelName);
-        var original = FixtureAssignment(claim, archive, "S01");
+        var original = FixtureAssignment(claim, archive, step);
         return original with
         {
             Agent = original.Agent with
             {
                 Provider = "openai",
                 Model = generator.ModelId,
-                ConfigurationHash = generator.S01ConfigurationHash
+                ConfigurationHash = step == "S01" ? generator.S01ConfigurationHash : generator.S02ConfigurationHash
             }
         };
     }
@@ -1258,8 +1259,11 @@ internal static class PersistenceBridgeProbe
                     if (calculatorScenario && (calculatorSlots.Where((slot, i) =>
                         !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(calculatorEvidence[i])).Any()
                         || File.Exists(calculatorPrefix + "guest-dispatch-3")
-                        || File.Exists(calculatorPrefix + "model-dispatch-3")))
-                        throw new InvalidOperationException("Accepted calculator recovery changed evidence or dispatched again.");
+                        || !File.Exists(calculatorPrefix + "model-dispatch-3")
+                        || !File.Exists(calculatorPrefix + "evidence-3")
+                        || !File.ReadAllBytes(calculatorPrefix + "candidate-3").SequenceEqual(Encoding.UTF8.GetBytes("class PairFormatter {}"))
+                        || File.Exists(calculatorPrefix + "model-dispatch-4")))
+                        throw new InvalidOperationException("Calculator evidence changed or formatter capture differs.");
                 }
                 finally
                 {
@@ -1281,6 +1285,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: calculator recovery binds real Git commit and four exact tracked objects; dirty checkout, untracked entry, skip-worktree and binding drift rejected.");
         Console.WriteLine("PASS: S02 input handover from actual recovered S01 acceptance; unaccepted or tampered history and input bytes rejected.");
         Console.WriteLine("PASS: S02 versioned candidate fold from recovered S01 acceptance; exact predecessor input hash and source scope enforced.");
+        Console.WriteLine("PASS: S02 private model dispatch from recovered S01 acceptance, exact receipt and evidence readback, duplicate dispatch and tampering blocked.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -1949,6 +1954,64 @@ internal static class PersistenceBridgeProbe
                     throw new InvalidOperationException("Historical S01 candidate encoding changed.");
                 Console.WriteLine("BRIDGE_PHASE: S02 versioned checkpoint binds accepted predecessor; changed input, path, version and missing acceptance rejected.");
                 Console.WriteLine("BRIDGE_PHASE: accepted S01 bytes handed to S02 read-only input gate; missing or changed acceptance, budget, baseline and predecessor rejected.");
+
+                // Exercise the real private S02 dispatch boundary against the
+                // recovered accepted state. The S02 fold is local in this slice.
+                var formatterAssignment = ModelFixtureAssignment(claim, archive, "S02");
+                OrderAgentProfile[] formatterCatalog = [new(formatterAssignment.Agent, true, ["csharp"])];
+                var formatterApproval = await CalculatorRecoveryApprovalAsync(root);
+                var actualRequest = current.Ledger.Propose(claim.JobId, "S02", "model", 10,
+                    DateTime.UtcNow.Ticks, OrderOperationAgentBinding.FromAssignment(formatterAssignment));
+                var actualPending = current.Ledger.Reserve(claim.JobId, limits, actualRequest);
+                using var formatterClient = new DevelopmentAiGenerator.ScriptedChatClient(
+                    System.Text.Json.JsonSerializer.Serialize(new { source = "class PairFormatter {}" }));
+                var formatterGenerator = new DevelopmentAiGenerator(formatterClient, ModelName);
+                Task<OrderModelDispatchResult> DispatchFormatter(OrderFormatterInputs inputs) =>
+                    DevelopmentOrderModelDispatch.RunS02CoreAsync(owner, actualPending, actualRequest,
+                        formatterApproval, formatterAssignment, formatterCatalog, inputs, formatterGenerator);
+                bool invalidInput = false;
+                try { _ = await DispatchFormatter(handover); }
+                catch (InvalidOperationException) { invalidInput = true; }
+                if (!invalidInput || formatterClient.Calls != 0)
+                    throw new InvalidOperationException("Changed formatter input reached provider.");
+                var result = await DispatchFormatter(unchangedInputs);
+                var generated = result.Candidate ?? throw new InvalidOperationException("Formatter candidate missing.");
+                var generatedState = actualPending.Checkpoint(claim, generated);
+                var completedState = generatedState.Complete(result.Completion);
+                var recoveredModel = DevelopmentOrderModelReconciliation.Observe(owner, completedState);
+                if (formatterClient.Calls != 1 || generated.InputHash != inputHash
+                    || recoveredModel.Status != OrderModelRecoveryStatus.Generated || recoveredModel.Candidate != generated
+                    || completedState.AcceptedS01 != accepted
+                    || DevelopmentOrderModelReconciliation.Observe(owner, generatedState).Status != OrderModelRecoveryStatus.PendingBlocked)
+                    throw new InvalidOperationException("Formatter dispatch or reconciliation differs.");
+                bool duplicate = false;
+                try { _ = await DispatchFormatter(unchangedInputs); }
+                catch (InvalidOperationException) { duplicate = true; }
+                if (!duplicate || formatterClient.Calls != 1)
+                    throw new InvalidOperationException("Formatter dispatch repeated.");
+                Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, completedState with { AcceptedS01 = null }));
+                Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, completedState with
+                {
+                    AcceptedS01 = accepted with { ObservedUtcTicks = accepted.ObservedUtcTicks + 1 }
+                }));
+                string formatterReceipt = database + ".model-dispatch-3";
+                byte[] receiptBytes = File.ReadAllBytes(formatterReceipt);
+                File.WriteAllBytes(formatterReceipt, [.. receiptBytes, 0x20]);
+                try { Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, completedState)); }
+                finally { File.WriteAllBytes(formatterReceipt, receiptBytes); }
+                string formatterEvidence = database + ".evidence-3";
+                byte[] evidenceBytes = File.ReadAllBytes(formatterEvidence);
+                File.WriteAllBytes(formatterEvidence, [.. evidenceBytes, 0x20]);
+                try { Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, completedState)); }
+                finally { File.WriteAllBytes(formatterEvidence, evidenceBytes); }
+                string formatterPath = database + ".candidate-3";
+                byte[] candidateBytes = File.ReadAllBytes(formatterPath);
+                File.WriteAllBytes(formatterPath, [.. candidateBytes, 0x20]);
+                try { Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, completedState)); }
+                finally { File.WriteAllBytes(formatterPath, candidateBytes); }
+                if (DevelopmentOrderModelReconciliation.Observe(owner, completedState).Candidate != generated)
+                    throw new InvalidOperationException("Formatter evidence readback differs.");
+                Console.WriteLine("BRIDGE_PHASE: S02 private dispatch, receipt, candidate and completion evidence bound; duplicate call and tampering rejected.");
                 Reject(() => current.Ledger.Reserve(claim.JobId, limits,
                     ProposeModel(current.Ledger, "S01", 1, DateTime.UtcNow.Ticks)));
                 try

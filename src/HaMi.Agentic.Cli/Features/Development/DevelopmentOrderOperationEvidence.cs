@@ -15,16 +15,22 @@ internal sealed record OrderOperationEvidence(
     internal const string GeneratedObserver = "hami-s01-generated-host-v1";
     internal const string RejectedResponseObserver = "hami-s01-terminal-response-rejected-v1";
 
+    internal const string FormatterGeneratedObserver = "hami-s02-generated-host-v1";
+    internal const string FormatterRejectedObserver = "hami-s02-terminal-response-rejected-v1";
+
     internal int ValidateBinding(DevelopmentOrderClaim claim)
     {
         var operation = Reservation ?? throw new InvalidOperationException("ORDER_EVIDENCE_RESERVATION");
         string prefix = claim.JobId + ":";
         string baseline = operation.Step == "S01" ? claim.Binding.CalculatorBaselineHash : claim.Binding.FormatterBaselineHash;
         (operation.Assignment ?? throw new InvalidOperationException("ORDER_EVIDENCE_ASSIGNMENT")).Validate();
-        OrderCheck.Require(Version == 2 && ArchiveHash == claim.ArchiveHash
-            && (Observer == FixtureObserver || (operation.Step == "S01"
-                && ((Observer == GeneratedObserver && Outcome == "succeeded")
-                    || (Observer == RejectedResponseObserver && Outcome == "failed"))))
+        bool legacy = Version == 2 && (Observer == FixtureObserver || (operation.Step == "S01"
+            && ((Observer == GeneratedObserver && Outcome == "succeeded")
+                || (Observer == RejectedResponseObserver && Outcome == "failed"))));
+        bool formatter = Version == 3 && operation.Step == "S02"
+            && ((Observer == FormatterGeneratedObserver && Outcome == "succeeded")
+                || (Observer == FormatterRejectedObserver && Outcome == "failed"));
+        OrderCheck.Require((legacy || formatter) && ArchiveHash == claim.ArchiveHash
             && operation.Version == 4 && operation.Kind == "model" && operation.SnapshotHash is null
             && operation.Step is "S01" or "S02"
             && operation.ReservedSeconds > 0 && operation.ObservedUtcTicks > 0

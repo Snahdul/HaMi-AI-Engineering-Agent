@@ -426,23 +426,23 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         // Immutable exact host-observation bytes; never a second mutable
         // workflow authority. Persist completion only after readback.
         internal OrderOperationCompletion StoreOrderOperationEvidence(OrderOperationEvidence evidence,
-            OrderCandidateCheckpoint? generated = null)
+            OrderCandidateCheckpoint? generated = null, OrderS01Accepted? accepted = null)
         {
             RequireOrderStorage();
             DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
             string path = OperationEvidencePath(evidence.ValidateBinding(claim));
-            RequireModelEvidenceCandidate(evidence, generated);
+            RequireModelEvidenceCandidate(evidence, generated, accepted);
             if (RegularFileExists(path))
                 throw new InvalidOperationException("Order operation evidence already exists.");
             byte[] bytes = evidence.Serialize();
             var completion = evidence.Completion();
             WriteNew(path, bytes);
-            _ = RequireOrderOperationEvidence(evidence.Reservation, completion, generated);
+            _ = RequireOrderOperationEvidence(evidence.Reservation, completion, generated, accepted);
             return completion;
         }
 
         internal OrderOperationEvidence RequireOrderOperationEvidence(OrderOperationReservation reservation,
-            OrderOperationCompletion completion, OrderCandidateCheckpoint? generated = null)
+            OrderOperationCompletion completion, OrderCandidateCheckpoint? generated = null, OrderS01Accepted? accepted = null)
         {
             RequireOrderStorage();
             DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
@@ -462,28 +462,41 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             OrderCheck.Require(DevelopmentJobState.Hash(bytes) == completion.EvidenceHash, "ORDER_EVIDENCE_HASH");
             var evidence = OrderStorageJson.Decode<OrderOperationEvidence>(bytes, OrderOperationEvidence.MaxBytes);
             evidence.ValidateCompletion(claim, reservation, completion);
-            RequireModelEvidenceCandidate(evidence, generated);
+            RequireModelEvidenceCandidate(evidence, generated, accepted);
             return evidence;
         }
 
         // Real generated evidence requires the matching journal candidate
         // descriptor and exact protected bytes, never a raw orphan report.
         // Old synthetic test receipts cannot substitute for real evidence.
-        private void RequireModelEvidenceCandidate(OrderOperationEvidence evidence, OrderCandidateCheckpoint? generated)
+        private void RequireModelEvidenceCandidate(OrderOperationEvidence evidence, OrderCandidateCheckpoint? generated,
+            OrderS01Accepted? accepted)
         {
+            if (evidence.Version == 3)
+            {
+                var claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+                var predecessor = accepted ?? throw new InvalidOperationException("ORDER_FORMATTER_PREDECESSOR");
+                OrderCheck.Require(evidence.InputHash == OrderCandidateCheckpoint.FormatterInputHash(claim, predecessor),
+                    "ORDER_FORMATTER_INPUT_BINDING");
+                _ = RequireOrderCandidate(predecessor.Candidate);
+                if (generated is not null)
+                    generated.RequireFormatterInput(claim, predecessor);
+            }
+            else
+                OrderCheck.Require(accepted is null, "ORDER_MODEL_EVIDENCE_OBSERVER");
             if (evidence.Observer == OrderOperationEvidence.FixtureObserver)
             {
                 OrderCheck.Require(generated is null, "ORDER_MODEL_EVIDENCE_OBSERVER");
                 return;
             }
 
-            if (evidence.Observer == OrderOperationEvidence.RejectedResponseObserver)
+            if (evidence.Observer is OrderOperationEvidence.RejectedResponseObserver or OrderOperationEvidence.FormatterRejectedObserver)
             {
                 DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
                 int sequence = evidence.ValidateBinding(claim);
                 OrderCheck.Require(generated is null && !RegularFileExists(CandidatePath(sequence)),
                     "ORDER_MODEL_REJECTED_RESPONSE_CANDIDATE");
-                RequireOrderModelDispatch(evidence.Reservation);
+                RequireOrderModelDispatch(evidence.Reservation, accepted);
                 return;
             }
 
@@ -496,7 +509,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 && candidate.ArtifactHash == evidence.OutputHash
                 && candidate.ObservedUtcTicks >= evidence.Reservation.ObservedUtcTicks
                 && candidate.ObservedUtcTicks <= evidence.ObservedUtcTicks, "ORDER_MODEL_EVIDENCE_CANDIDATE");
-            RequireOrderModelDispatch(evidence.Reservation);
+            RequireOrderModelDispatch(evidence.Reservation, accepted);
             _ = RequireOrderCandidate(candidate);
         }
 
@@ -506,11 +519,12 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         private sealed record ModelDispatchReceipt(int Version, string ArchiveHash,
             OrderOperationReservation Reservation, string InputHash);
 
-        private (string Path, byte[] Bytes) BoundModelDispatch(OrderOperationReservation reservation)
+        private (string Path, byte[] Bytes) BoundModelDispatch(OrderOperationReservation reservation, OrderS01Accepted? accepted)
         {
             RequireOrderStorage();
             DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
-            OrderCheck.Require(reservation.Version == 4 && reservation.Kind == "model" && reservation.Step == "S01"
+            OrderCheck.Require(reservation.Version == 4 && reservation.Kind == "model"
+                && reservation.Step == (accepted is null ? "S01" : "S02")
                 && reservation.SnapshotHash is null && reservation.ReservedSeconds > 0 && reservation.ObservedUtcTicks > 0,
                 "ORDER_MODEL_DISPATCH_RESERVATION");
             (reservation.Assignment ?? throw new InvalidOperationException("ORDER_OPERATION_ASSIGNMENT")).Validate();
@@ -521,8 +535,10 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 || sequence is < 1 or > OrderCandidateCheckpoint.MaxSequence
                 || id != prefix + sequence.ToString(CultureInfo.InvariantCulture))
                 throw new InvalidOperationException("ORDER_MODEL_DISPATCH_SEQUENCE");
-            byte[] bytes = OrderStorageJson.Encode(new ModelDispatchReceipt(1, claim.ArchiveHash, reservation,
-                claim.Binding.CalculatorBaselineHash), DevelopmentOrderOperationLedger.EventMaxBytes);
+            string inputHash = accepted is null ? claim.Binding.CalculatorBaselineHash
+                : OrderCandidateCheckpoint.FormatterInputHash(claim, accepted);
+            byte[] bytes = OrderStorageJson.Encode(new ModelDispatchReceipt(accepted is null ? 1 : 2,
+                claim.ArchiveHash, reservation, inputHash), DevelopmentOrderOperationLedger.EventMaxBytes);
             return (ModelDispatchPath(sequence), bytes);
         }
 
@@ -531,7 +547,10 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         internal void ConsumeOrderModelDispatch(DevelopmentOrderOperationLedger acknowledged,
             OrderOperationReservation reservation)
         {
-            var (path, bytes) = BoundModelDispatch(reservation);
+            var accepted = reservation.Step == "S02"
+                ? acknowledged.AcceptedS01 ?? throw new InvalidOperationException("ORDER_FORMATTER_PREDECESSOR")
+                : null;
+            var (path, bytes) = BoundModelDispatch(reservation, accepted);
             DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
             OrderCheck.Require(acknowledged.Pending == reservation && acknowledged.ArchiveHash == claim.ArchiveHash,
                 "ORDER_MODEL_DISPATCH_PENDING");
@@ -540,12 +559,12 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             var limits = acknowledged.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
             _ = acknowledged.DispatchAllowance(limits, reservation.OperationId, DateTime.UtcNow.Ticks);
             WriteNew(path, bytes);
-            RequireOrderModelDispatch(reservation);
+            RequireOrderModelDispatch(reservation, accepted);
         }
 
-        internal void RequireOrderModelDispatch(OrderOperationReservation reservation)
+        internal void RequireOrderModelDispatch(OrderOperationReservation reservation, OrderS01Accepted? accepted = null)
         {
-            var (path, expected) = BoundModelDispatch(reservation);
+            var (path, expected) = BoundModelDispatch(reservation, accepted);
             if (!RegularFileExists(path))
                 throw new InvalidOperationException("Order model dispatch receipt missing.");
             validatePrivateEntry!(path, false);
