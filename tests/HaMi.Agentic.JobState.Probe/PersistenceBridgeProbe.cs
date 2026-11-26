@@ -2144,6 +2144,7 @@ internal static class PersistenceBridgeProbe
             }
         }
 
+        await MeasurePairRecoveryAsync(prefix, start, expectOwnership);
         Console.WriteLine("PASS: all other actual pair admission boundaries persist hard stops before effects and recover blocked with unchanged protected evidence.");
         Console.WriteLine("PASS: actual calculator acceptance event survives Akka SQL process kill; protected candidate, report, scope and charged budget recovered without redispatch.");
         Console.WriteLine("PASS: calculator guest-complete crash before acceptance replays unaccepted; filesystem stage and evidence rechecked, one acceptance appended without redispatch.");
@@ -2184,6 +2185,135 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: protected guest dispatch is consumed once across crash/reentry; missing/modified/foreign receipts reject report use.");
         Console.WriteLine("PASS: S01 model dispatch crash windows recover through real Akka SQL replay: receipt-only, orphan, checkpoint-only, generated, rejected and rejected-orphan.");
         Console.WriteLine("PASS: supervisor admission persists soft stop across process kill; insufficient extension remains stopped, sufficient extension permits fresh charged reservation.");
+    }
+
+    // Measure existing trusted offline execution phases, not an artificial
+    // delay or a comparison with reduced acceptance. A separate disposable
+    // job is permitted here only because this is the reference fixture.
+    private static async Task MeasurePairRecoveryAsync(string prefix, Func<string, string, Process> start,
+        Func<string, string, Task> expectOwnership)
+    {
+        string freshRoot = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+        string resumeRoot = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+        _ = DevelopmentJobStateRoot.OpenOrderProbeFixture(freshRoot, create: true);
+        _ = DevelopmentJobStateRoot.OpenOrderProbeFixture(resumeRoot, create: true);
+        try
+        {
+            await CreateCalculatorRepositoryAsync(freshRoot);
+            _ = await DevelopmentWorktreeGuard.GitAsync(resumeRoot, "-c", "core.autocrlf=false",
+                "clone", "--no-local", "--no-tags", "--", CalculatorRepository(freshRoot), CalculatorRepository(resumeRoot));
+            var freshApproval = await CalculatorRecoveryApprovalAsync(freshRoot);
+            var resumeApproval = await CalculatorRecoveryApprovalAsync(resumeRoot);
+            if (freshApproval.Binding != resumeApproval.Binding || freshApproval.Order.Plan != resumeApproval.Order.Plan)
+                throw new InvalidOperationException("Measurement reference orders differ.");
+
+            async Task<(TimeSpan HostReady, TimeSpan Ready, TimeSpan Terminal)> MeasureAsync(string mode, string root)
+            {
+                var timer = Stopwatch.StartNew();
+                using Process child = start(mode, root);
+                Task<string> errors = child.StandardError.ReadToEndAsync();
+                TimeSpan? hostReady = null, ready = null, terminal = null;
+                bool inspected = false;
+                async Task ReadAsync()
+                {
+                    while (await child.StandardOutput.ReadLineAsync() is string line)
+                    {
+                        TimeSpan observed = timer.Elapsed;
+                        Console.WriteLine("[bridge measurement] " + line);
+                        switch (line)
+                        {
+                            case "BRIDGE_MEASURE_HOST_READY" when hostReady is null:
+                                hostReady = observed;
+                                break;
+                            case "BRIDGE_MEASURE_S02_READY" when ready is null:
+                                ready = observed;
+                                break;
+                            case "BRIDGE_MEASURE_TERMINAL" when terminal is null:
+                                terminal = observed;
+                                break;
+                            case "BRIDGE_CALCULATOR_RECOVERED":
+                                inspected = true;
+                                break;
+                        }
+                    }
+                }
+
+                Task output = ReadAsync();
+                try
+                {
+                    await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(freshApproval.EffectiveLimits.Seconds) + Deadline);
+                    await output.WaitAsync(Deadline);
+                    if (child.ExitCode != 0 || !inspected || hostReady is null || ready is null || terminal is null
+                        || hostReady.Value > ready.Value || ready.Value > terminal.Value)
+                        throw new InvalidOperationException("Measurement did not reach equal terminal acceptance: " + await errors);
+                    return (hostReady.Value, ready.Value, terminal.Value);
+                }
+                finally
+                {
+                    if (!child.HasExited)
+                    {
+                        child.Kill(entireProcessTree: true);
+                        await child.WaitForExitAsync().WaitAsync(Deadline);
+                    }
+                }
+            }
+
+            var fresh = await MeasureAsync("bridge-model-continuous", freshRoot);
+            long interruptedAt;
+            using (Process child = start("bridge-model-accepted", resumeRoot))
+            {
+                Task<string> errors = child.StandardError.ReadToEndAsync();
+                try
+                {
+                    await WaitForMarkerAsync(child, "BRIDGE_CALCULATOR_ACCEPTED").WaitAsync(Deadline);
+                    interruptedAt = Stopwatch.GetTimestamp();
+                    if (child.HasExited)
+                        throw new InvalidOperationException("Measurement owner exited before interruption.");
+                    await expectOwnership(resumeRoot, "BUSY");
+                }
+                finally
+                {
+                    if (!child.HasExited)
+                        child.Kill(entireProcessTree: true);
+                    await child.WaitForExitAsync().WaitAsync(Deadline);
+                    string diagnostics = await errors.WaitAsync(Deadline);
+                    if (diagnostics.Length > 0)
+                        Console.Error.WriteLine(diagnostics[^Math.Min(diagnostics.Length, 16 * 1024)..]);
+                }
+
+                if (child.ExitCode == 0)
+                    throw new InvalidOperationException("Measurement did not interrupt the owner.");
+            }
+
+            await expectOwnership(resumeRoot, "ACQUIRED:order");
+            string evidencePrefix = $"issue-{Issue}.order.db.";
+            string[] acceptedSlots = ["candidate-1", "evidence-1", "model-dispatch-1", "snapshot-2", "guest-dispatch-2", "guest-report-2"];
+            byte[][] accepted = acceptedSlots.Select(slot => File.ReadAllBytes(Path.Combine(resumeRoot, evidencePrefix + slot))).ToArray();
+            if (Directory.GetFiles(resumeRoot, evidencePrefix + "*").Length != acceptedSlots.Length)
+                throw new InvalidOperationException("Measurement interruption was not at accepted S01.");
+            TimeSpan interruption = Stopwatch.GetElapsedTime(interruptedAt);
+            var resumed = await MeasureAsync("bridge-model-resume-continuous", resumeRoot);
+            if (acceptedSlots.Where((slot, i) =>
+                    !File.ReadAllBytes(Path.Combine(resumeRoot, evidencePrefix + slot)).SequenceEqual(accepted[i])).Any()
+                || Directory.GetFiles(resumeRoot, evidencePrefix + "*").Length != 15
+                || Directory.GetFiles(freshRoot, evidencePrefix + "*").Length != 15)
+                throw new InvalidOperationException("Measurement changed accepted work or evidence count.");
+            foreach (string slot in new[] { "candidate-1", "candidate-3" })
+                if (!File.ReadAllBytes(Path.Combine(freshRoot, evidencePrefix + slot))
+                    .SequenceEqual(File.ReadAllBytes(Path.Combine(resumeRoot, evidencePrefix + slot))))
+                    throw new InvalidOperationException("Measurement candidate bytes differ.");
+
+            TimeSpan rest = resumed.Terminal - resumed.Ready;
+            TimeSpan saving = fresh.Terminal - resumed.Terminal;
+            Console.WriteLine(FormattableString.Invariant(
+                $"BRIDGE_RECOVERY_METRICS: profile=offline-controlled; process=fresh; hostCache=notReset; baseline={freshApproval.Binding.BaseCommit}; freshMs={fresh.Terminal.TotalMilliseconds:F3}; freshHostReadyMs={fresh.HostReady.TotalMilliseconds:F3}; recoveryHostReadyMs={resumed.HostReady.TotalMilliseconds:F3}; recoveryMs={resumed.Ready.TotalMilliseconds:F3}; remainingMs={rest.TotalMilliseconds:F3}; recoveryTotalMs={resumed.Terminal.TotalMilliseconds:F3}; interruptionMs={interruption.TotalMilliseconds:F3}; savedMs={saving.TotalMilliseconds:F3}; economic={saving > TimeSpan.Zero}; savedControlledModelCalls=1; savedGuestOperations=1; actualProviderCalls=0; actualSandboxRuns=0"));
+            Console.WriteLine("PASS: fresh and recovered pair reference runs reach the same independently verified terminal acceptance with identical candidate bytes.");
+        }
+        finally
+        {
+            Directory.Delete(freshRoot, recursive: true);
+            Directory.Delete(resumeRoot, recursive: true);
+        }
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -2258,6 +2388,7 @@ internal static class PersistenceBridgeProbe
         OrderOperationLimits limits = archive.EffectiveLimits;
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
         bool modelScenario = mode.StartsWith("bridge-model-", StringComparison.Ordinal);
+        bool continuous = mode is "bridge-model-continuous" or "bridge-model-resume-continuous";
         const string pairStopPrefix = "bridge-model-pair-stop-";
         const string pairStopResumePrefix = "bridge-model-resume-pair-stop-";
         string pairStop = mode.StartsWith(pairStopPrefix, StringComparison.Ordinal) ? mode[pairStopPrefix.Length..]
@@ -2281,13 +2412,14 @@ internal static class PersistenceBridgeProbe
         const string finalModePrefix = "bridge-model-resume-final-";
         string finalCrash = mode.StartsWith(finalModePrefix, StringComparison.Ordinal)
             ? mode[finalModePrefix.Length..] : "completed";
-        bool successfulFormatter = mode == "bridge-model-resume-accepted" || finalCrash != "completed" || generateAfterExtension
-            || pairStopStage is 10 or 13;
+        bool successfulFormatter = continuous || mode == "bridge-model-resume-accepted" || finalCrash != "completed"
+            || generateAfterExtension || pairStopStage is 10 or 13;
         int expectedFormatterModelCharges = generateAfterExtension ? 160 : 70;
         int expectedPairCharges = expectedFormatterModelCharges + 10;
         bool calculatorScenario = pairStopStage != 0 || successfulFormatter || mode is "bridge-model-accepted"
             or "bridge-model-verified" or "bridge-model-resume-verified" || mode.StartsWith(formatterModePrefix, StringComparison.Ordinal);
-        bool first = mode.StartsWith(pairStopPrefix, StringComparison.Ordinal) || mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
+        bool first = mode.StartsWith(pairStopPrefix, StringComparison.Ordinal) || mode is "bridge-model-continuous"
+            or "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
             or "bridge-guest-unknown" or "bridge-guest-orphan"
             or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
             or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan" or "bridge-soft-stop"
@@ -2444,6 +2576,11 @@ internal static class PersistenceBridgeProbe
 
             guard.RequireObserved();
             Console.WriteLine($"BRIDGE_PHASE: replay state {current.Stage}; {recovery.ElapsedMilliseconds} ms.");
+            if (continuous)
+            {
+                Console.WriteLine("BRIDGE_MEASURE_HOST_READY");
+                Console.Out.Flush();
+            }
             string artifact = database + ".s01";
             if (!first)
             {
@@ -2478,8 +2615,12 @@ internal static class PersistenceBridgeProbe
             {
                 if (current.Stage != 0 || File.Exists(artifact))
                     throw new InvalidOperationException("New journal is not empty.");
+                long startAck = Stopwatch.GetTimestamp();
                 current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeStart(
                     new(1, claim.ArchiveHash, processStart)), 1);
+                if (continuous)
+                    Console.WriteLine(FormattableString.Invariant(
+                        $"BRIDGE_MEASURE_START_ACK_MS: {Stopwatch.GetElapsedTime(startAck).TotalMilliseconds:F3}"));
                 Console.WriteLine("BRIDGE_PHASE: order accepted.");
                 if (modelScenario)
                 {
@@ -2598,6 +2739,8 @@ internal static class PersistenceBridgeProbe
                         owner.ValidateOrderJournalFiles();
                         Console.WriteLine("BRIDGE_CALCULATOR_ACCEPTED");
                         Console.Out.Flush();
+                        if (continuous)
+                            return await RunPairAsync();
                         await Task.Delay(Timeout.InfiniteTimeSpan);
                         return 1;
                     }
@@ -2830,7 +2973,7 @@ internal static class PersistenceBridgeProbe
                 return 0;
             }
 
-            if (calculatorScenario)
+            async Task<int?> RunPairPhaseAsync()
             {
                 var nextAction = DevelopmentOrderWorkflow.Select(claim, current.Ledger);
                 Console.WriteLine("BRIDGE_PHASE: journal workflow action " + nextAction + ".");
@@ -3251,9 +3394,17 @@ internal static class PersistenceBridgeProbe
                     catch (InvalidOperationException) { terminalRejected = true; }
                     if (!terminalRejected || await ReadAsync() != current || File.Exists(database + ".guest-dispatch-6"))
                         throw new InvalidOperationException("Terminal recovery mutated journal.");
-                    Console.WriteLine("BRIDGE_PHASE: terminal order acceptance recovered after process kill; all evidence retained and new effects blocked.");
+                    Console.WriteLine(continuous
+                        ? "BRIDGE_PHASE: terminal order acceptance inspected in same owner; all evidence retained and new effects blocked."
+                        : "BRIDGE_PHASE: terminal order acceptance recovered after process kill; all evidence retained and new effects blocked.");
                     if (generateAfterExtension)
                         Console.WriteLine("BRIDGE_PHASE: extended budget pair recovered terminal; original S01, S02 and FINAL evidence and cumulative charges verified.");
+                    if (continuous)
+                    {
+                        owner.ValidateOrderJournalFiles();
+                        Console.WriteLine("BRIDGE_MEASURE_TERMINAL");
+                    }
+
                     Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
                     return 0;
                 }
@@ -3291,7 +3442,9 @@ internal static class PersistenceBridgeProbe
                     catch (InvalidOperationException) { rejectedFinal = true; }
                     if (!rejectedFinal || await ReadAsync() != current || File.Exists(database + ".guest-dispatch-6"))
                         throw new InvalidOperationException("Integration recovery mutated journal.");
-                    Console.WriteLine("BRIDGE_PHASE: FINAL guest completion recovered after process kill; both acceptances, exact protected evidence and original budget retained.");
+                    Console.WriteLine(continuous
+                        ? "BRIDGE_PHASE: FINAL guest completion independently checked in same owner."
+                        : "BRIDGE_PHASE: FINAL guest completion recovered after process kill; both acceptances, exact protected evidence and original budget retained.");
                     var finalBeforeAcceptance = current;
                     var proposedTerminal = DevelopmentOrderIntegrationVerifier.ProposeAcceptance(owner, history, observations,
                         current.Ledger, finalObservation, DateTime.UtcNow.Ticks);
@@ -3337,6 +3490,8 @@ internal static class PersistenceBridgeProbe
                     owner.ValidateOrderJournalFiles();
                     Console.WriteLine("BRIDGE_ORDER_ACCEPTED");
                     Console.Out.Flush();
+                    if (continuous)
+                        return null;
                     await Task.Delay(Timeout.InfiniteTimeSpan);
                     return 1;
                 }
@@ -3417,9 +3572,13 @@ internal static class PersistenceBridgeProbe
                         || File.Exists(database + ".guest-dispatch-6"))
                         throw new InvalidOperationException("Integration completion changed history.");
                     owner.ValidateOrderJournalFiles();
-                    Console.WriteLine("BRIDGE_PHASE: persisted S02 acceptance recovered after process kill; exact predecessor, candidate, guest evidence and budget unchanged.");
+                    Console.WriteLine(continuous
+                        ? "BRIDGE_PHASE: persisted S02 acceptance independently checked in same owner."
+                        : "BRIDGE_PHASE: persisted S02 acceptance recovered after process kill; exact predecessor, candidate, guest evidence and budget unchanged.");
                     Console.WriteLine(completedIntegration ? "BRIDGE_FINAL_COMPLETED" : "BRIDGE_FINAL_PENDING");
                     Console.Out.Flush();
+                    if (continuous)
+                        return null;
                     await Task.Delay(Timeout.InfiniteTimeSpan);
                     return 1;
                 }
@@ -3517,6 +3676,8 @@ internal static class PersistenceBridgeProbe
                         owner.ValidateOrderJournalFiles();
                         Console.WriteLine("BRIDGE_FORMATTER_ACCEPTED");
                         Console.Out.Flush();
+                        if (continuous)
+                            return null;
                         await Task.Delay(Timeout.InfiniteTimeSpan);
                         return 1;
                     }
@@ -3643,6 +3804,8 @@ internal static class PersistenceBridgeProbe
                         owner.ValidateOrderJournalFiles();
                         Console.WriteLine("BRIDGE_FORMATTER_GUEST_CAPTURED");
                         Console.Out.Flush();
+                        if (continuous)
+                            return null;
                         await Task.Delay(Timeout.InfiniteTimeSpan);
                         return 1;
                     }
@@ -3855,6 +4018,18 @@ internal static class PersistenceBridgeProbe
                 catch (InvalidOperationException) { invalidInput = true; }
                 if (!invalidInput || formatterClient.Calls != 0)
                     throw new InvalidOperationException("Changed formatter input reached provider.");
+                if (continuous)
+                {
+                    if (formatterApproval.Binding != claim.Binding || formatterApproval.Order.Plan != archive.Plan)
+                        throw new InvalidOperationException("Measurement approval differs.");
+                    DevelopmentOrderHandover.ValidateAssignment(formatterApproval, Guid.ParseExact(claim.JobId, "N"),
+                        formatterAssignment, formatterCatalog);
+                    (actualRequest.Assignment ?? throw new InvalidOperationException("Measurement assignment missing."))
+                        .RequireAssignment(formatterAssignment);
+                    Console.WriteLine("BRIDGE_MEASURE_S02_READY");
+                    Console.Out.Flush();
+                }
+
                 var result = await DispatchFormatter(unchangedInputs);
                 if (formatterClient.Calls != 1 || (result.Candidate is null) != rejectedFormatter
                     || result.Completion.Outcome != (rejectedFormatter ? "failed" : "succeeded"))
@@ -3956,8 +4131,32 @@ internal static class PersistenceBridgeProbe
                 catch (InvalidOperationException ex) when (ex.Message == "Calculator acceptance blocked.") { }
                 if (await ReadAsync() != current)
                     throw new InvalidOperationException("Calculator reentry mutated journal state.");
+                if (continuous)
+                {
+                    owner.ValidateOrderJournalFiles();
+                    return null;
+                }
+
                 return await HoldFormatterAsync();
             }
+
+            async Task<int> RunPairAsync()
+            {
+                // Same bounded phase implementation in both modes. Normal
+                // crash probes exit/hold at the existing markers; the reference
+                // run proceeds on the same actor without restarting the host.
+                for (int phase = 0; phase < 6; phase++)
+                {
+                    int? result = await RunPairPhaseAsync();
+                    if (result.HasValue)
+                        return result.Value;
+                }
+
+                throw new InvalidOperationException("Continuous pair exceeded its reviewed phase count.");
+            }
+
+            if (calculatorScenario)
+                return await RunPairAsync();
 
             if (modelScenario)
             {
