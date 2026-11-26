@@ -93,7 +93,10 @@ internal static class Program
             }
         }
 
-        if (args.Length == 2 && args[0] is "hold" or "probe" or "bridge-hold" or "bridge-unknown" or "bridge-resume" or "bridge-blocked" or "bridge-failed" or "bridge-retry" or "bridge-guest" or "bridge-guest-resume" or "bridge-guest-unknown" or "bridge-guest-blocked" or "bridge-guest-orphan" or "bridge-guest-orphan-resume" or "bridge-probe")
+        if (args.Length == 2 && args[0] is "hold" or "probe" or "bridge-hold" or "bridge-unknown" or "bridge-resume" or "bridge-blocked" or "bridge-failed" or "bridge-retry" or "bridge-guest" or "bridge-guest-resume" or "bridge-guest-unknown" or "bridge-guest-blocked" or "bridge-guest-orphan" or "bridge-guest-orphan-resume" or "bridge-probe"
+            or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
+            or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan"
+            or "bridge-model-resume-blocked" or "bridge-model-resume-generated" or "bridge-model-resume-rejected")
         {
             string root = args[1];
             string name = Path.GetFileName(root);
@@ -120,7 +123,9 @@ internal static class Program
                         return 0;
                     }
                     if (args[0] is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
-                        or "bridge-guest-unknown" or "bridge-guest-orphan")
+                        or "bridge-guest-unknown" or "bridge-guest-orphan"
+                        or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
+                        or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan")
                         owner.ClaimOrder(Guid.NewGuid().ToString("N"), PersistenceBridgeProbe.FixtureApproval());
                     _ = owner.RequireArchivedOrder();
                     return await PersistenceBridgeProbe.RunChildAsync(args[0], root, owner);

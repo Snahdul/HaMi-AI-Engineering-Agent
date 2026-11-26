@@ -27,6 +27,30 @@ internal static class PersistenceBridgeProbe
     private static readonly string AcceptedHash = DevelopmentJobState.Hash(AcceptedBytes);
     private static readonly byte[] PartialBytes = Encoding.UTF8.GetBytes("internal static class PartialCalculator {");
     private static readonly string PartialHash = DevelopmentJobState.Hash(PartialBytes);
+    private static readonly byte[] ModelBaseline = Encoding.UTF8.GetBytes("synthetic review");
+    private const string ModelCandidate = "internal static class PairCalculator { /* generated fixture */ }";
+    private const string ModelName = "fixture-model";
+
+    private static OrderAssignment ModelFixtureAssignment(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive)
+    {
+        using var fake = new DevelopmentAiGenerator.ScriptedChatClient("{}");
+        var generator = new DevelopmentAiGenerator(fake, ModelName);
+        var original = FixtureAssignment(claim, archive, "S01");
+        return original with
+        {
+            Agent = original.Agent with
+            {
+                Provider = "openai",
+                Model = generator.ModelId,
+                ConfigurationHash = generator.S01ConfigurationHash
+            }
+        };
+    }
+
+    private static void VerifyModelFixtureAssignment(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive,
+        OrderOperationReservation reservation) =>
+        (reservation.Assignment ?? throw new InvalidOperationException("Missing model assignment."))
+            .RequireAssignment(ModelFixtureAssignment(claim, archive));
 
     // Fixed reviewed offline catalog; not runtime agent selection. Construct
     // the historical decision from immutable archived inputs, never from a
@@ -758,7 +782,8 @@ internal static class PersistenceBridgeProbe
         await DevelopmentAiGenerator.SelfTestS01Async();
         await TestModelDispatchAsync(prefix);
         await TestLiveGuestCaptureAsync(prefix);
-        foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan" })
+        foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan",
+            "model-receipt", "model-orphan", "model-checkpoint", "model-generated", "model-rejected", "model-rejected-orphan" })
         {
             bool unknown = scenario == "unknown";
             bool failed = scenario == "failed";
@@ -766,6 +791,11 @@ internal static class PersistenceBridgeProbe
             bool guestUnknown = scenario == "guest-unknown";
             bool guestOrphan = scenario == "guest-orphan";
             bool guestScenario = guest || guestUnknown || guestOrphan;
+            bool modelScenario = scenario.StartsWith("model-", StringComparison.Ordinal);
+            bool modelGenerated = scenario == "model-generated";
+            bool modelRejected = scenario == "model-rejected";
+            bool modelCandidate = scenario is "model-orphan" or "model-checkpoint" or "model-generated";
+            bool modelEvidence = modelCandidate || modelRejected || scenario == "model-rejected-orphan";
             (string firstMode, string firstMarker, string resumeMode, string resumeMarker) = scenario switch
             {
                 "accepted" => ("bridge-hold", "BRIDGE_ACCEPTED", "bridge-resume", "BRIDGE_COMPLETED"),
@@ -774,6 +804,9 @@ internal static class PersistenceBridgeProbe
                 "guest" => ("bridge-guest", "BRIDGE_GUEST", "bridge-guest-resume", "BRIDGE_GUEST_RECOVERED"),
                 "guest-unknown" => ("bridge-guest-unknown", "BRIDGE_GUEST_UNKNOWN", "bridge-guest-blocked", "BRIDGE_GUEST_BLOCKED"),
                 "guest-orphan" => ("bridge-guest-orphan", "BRIDGE_GUEST_ORPHAN", "bridge-guest-orphan-resume", "BRIDGE_GUEST_ORPHAN_RECOVERED"),
+                _ when modelScenario => ("bridge-" + scenario, "BRIDGE_MODEL_CRASH_READY",
+                    modelGenerated ? "bridge-model-resume-generated" : modelRejected ? "bridge-model-resume-rejected"
+                        : "bridge-model-resume-blocked", "BRIDGE_MODEL_RECOVERED"),
                 _ => throw new InvalidOperationException("Unknown bridge scenario.")
             };
             string root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
@@ -826,9 +859,9 @@ internal static class PersistenceBridgeProbe
                     }
                     Reject(() => owner.CreateOrderJournal());
                     Reject(() => store.Acquire(Issue).Dispose());
-                    if (!unknown && !failed && !guestScenario && !File.Exists(journal + "-journal"))
+                    if (!unknown && !failed && !guestScenario && !modelScenario && !File.Exists(journal + "-journal"))
                         throw new InvalidOperationException("Crash did not retain the live rollback sidecar.");
-                    if (!unknown && !failed && !guestScenario)
+                    if (!unknown && !failed && !guestScenario && !modelScenario)
                     {
                         byte[] original = owner.RequireOrderArtifact("S01", AcceptedHash);
                         File.WriteAllBytes(artifact, [.. original, 0x20]);
@@ -873,7 +906,13 @@ internal static class PersistenceBridgeProbe
 
                     string s02 = Path.Combine(root, $"issue-{Issue}.order.db.s02");
                     string candidatePath = Path.Combine(root, $"issue-{Issue}.order.db.candidate-1");
-                    if (guestScenario ? File.Exists(artifact) || File.Exists(s02)
+                    if (modelScenario ? File.Exists(artifact) || File.Exists(s02)
+                        || !File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.model-dispatch-1"))
+                        || File.Exists(candidatePath) != modelCandidate
+                        || (modelCandidate && !File.ReadAllBytes(candidatePath).SequenceEqual(Encoding.UTF8.GetBytes(ModelCandidate)))
+                        || File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.evidence-1")) != modelEvidence
+                        || File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.model-dispatch-2"))
+                        : guestScenario ? File.Exists(artifact) || File.Exists(s02)
                         || !File.ReadAllBytes(Path.Combine(root, $"issue-{Issue}.order.db.snapshot-1")).SequenceEqual(FixtureSnapshotManifest.Value)
                         || !File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.guest-dispatch-1"))
                         || File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.guest-report-1")) == guestUnknown
@@ -916,6 +955,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: orphan guest report alone does not settle reservation; explicit fresh fixture observation and journal acknowledgement required.");
         Console.WriteLine("PASS: private canonical snapshot manifests survive guest crash windows; missing/changed/foreign/duplicate manifests rejected.");
         Console.WriteLine("PASS: protected guest dispatch is consumed once across crash/reentry; missing/modified/foreign receipts reject report use.");
+        Console.WriteLine("PASS: S01 model dispatch crash windows recover through real Akka SQL replay: receipt-only, orphan, checkpoint-only, generated, rejected and rejected-orphan.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -983,8 +1023,11 @@ internal static class PersistenceBridgeProbe
         // Recovery uses only the validated immutable archive, not today's policy.
         OrderOperationLimits limits = archive.EffectiveLimits;
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
+        bool modelScenario = mode.StartsWith("bridge-model-", StringComparison.Ordinal);
         bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
-            or "bridge-guest-unknown" or "bridge-guest-orphan";
+            or "bridge-guest-unknown" or "bridge-guest-orphan"
+            or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
+            or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan";
         if (first)
         {
             var fixtureApproval = FixtureApproval();
@@ -1044,7 +1087,7 @@ internal static class PersistenceBridgeProbe
         try
         {
             var system = host.Services.GetRequiredService<ActorSystem>();
-            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, archive, limits, policy, owner)), "bridge");
+            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, archive, limits, policy, owner, modelScenario)), "bridge");
             async Task<BridgeState> ReadAsync()
             {
                 Task<BridgeState> read = actor.Ask<BridgeState>(new ReadState(), Deadline);
@@ -1072,7 +1115,14 @@ internal static class PersistenceBridgeProbe
                 // The exact assignment is part of the historical reservation,
                 // including for unresolved and failed attempts.
                 if (current.Ledger.Pending is { Kind: "model" } recoveredOperation)
-                    VerifyFixtureAssignment(claim, archive, recoveredOperation);
+                {
+                    if (modelScenario)
+                        VerifyModelFixtureAssignment(claim, archive, recoveredOperation);
+                    else
+                        VerifyFixtureAssignment(claim, archive, recoveredOperation);
+                }
+                if (modelScenario && current.Ledger.LatestModelReservation is { } finishedModel)
+                    VerifyModelFixtureAssignment(claim, archive, finishedModel);
                 if (current.S01 is { } recoveredS01)
                     VerifyFixtureAssignment(claim, archive, recoveredS01.Reservation);
                 if (current.FailedS01 is { } recoveredFailure)
@@ -1092,6 +1142,48 @@ internal static class PersistenceBridgeProbe
                 current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeStart(
                     new(1, claim.ArchiveHash, processStart)), 1);
                 Console.WriteLine("BRIDGE_PHASE: order accepted.");
+                if (modelScenario)
+                {
+                    var assignment = ModelFixtureAssignment(claim, archive);
+                    var approval = FixtureApproval();
+                    OrderAgentProfile[] catalog = [new(assignment.Agent, true, ["csharp"])];
+                    var reservation = current.Ledger.Propose(claim.JobId, "S01", "model", 30,
+                        DateTime.UtcNow.Ticks, OrderOperationAgentBinding.FromAssignment(assignment));
+                    current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(reservation), 2);
+                    if (mode == "bridge-model-receipt")
+                        owner.ConsumeOrderModelDispatch(current.Ledger, reservation);
+                    else
+                    {
+                        bool reject = mode is "bridge-model-rejected" or "bridge-model-rejected-orphan";
+                        string response = reject ? """{"source":""}"""
+                            : System.Text.Json.JsonSerializer.Serialize(new { source = ModelCandidate });
+                        using var fake = new DevelopmentAiGenerator.ScriptedChatClient(response);
+                        var generator = new DevelopmentAiGenerator(fake, ModelName);
+                        var result = await DevelopmentOrderModelDispatch.RunS01CoreAsync(owner, current.Ledger,
+                            reservation, approval, assignment, catalog, ModelBaseline, generator);
+                        if (fake.Calls != 1 || (result.Candidate is null) != reject
+                            || result.Completion.Outcome != (reject ? "failed" : "succeeded"))
+                            throw new InvalidOperationException("Model crash fixture returned wrong outcome.");
+                        if (mode is "bridge-model-checkpoint" or "bridge-model-generated")
+                        {
+                            var candidate = result.Candidate ?? throw new InvalidOperationException("Candidate missing.");
+                            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCandidate(candidate), 2);
+                        }
+
+                        if (mode is "bridge-model-generated" or "bridge-model-rejected")
+                            current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(result.Completion), 7);
+                    }
+
+                    if (current.Ledger.Models != 1 || current.Ledger.ReservedSeconds != 30
+                        || current.ArtifactHash is not null || current.S01 is not null || File.Exists(artifact))
+                        throw new InvalidOperationException("Model crash fixture accepted a step or refunded budget.");
+                    owner.ValidateOrderJournalFiles();
+                    Console.WriteLine("BRIDGE_MODEL_CRASH_READY");
+                    Console.Out.Flush();
+                    await Task.Delay(Timeout.InfiniteTimeSpan);
+                    return 1;
+                }
+
                 if (mode is "bridge-guest" or "bridge-guest-unknown" or "bridge-guest-orphan")
                 {
                     var guestReservation = current.Ledger.Propose(claim.JobId, "S01", "guest", 30, DateTime.UtcNow.Ticks, null, FixtureSnapshotHash);
@@ -1222,6 +1314,46 @@ internal static class PersistenceBridgeProbe
                 Console.Out.Flush();
                 await Task.Delay(Timeout.InfiniteTimeSpan);
                 return 1;
+            }
+
+            if (modelScenario)
+            {
+                var observation = DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger);
+                var expected = mode switch
+                {
+                    "bridge-model-resume-blocked" => OrderModelRecoveryStatus.PendingBlocked,
+                    "bridge-model-resume-generated" => OrderModelRecoveryStatus.Generated,
+                    "bridge-model-resume-rejected" => OrderModelRecoveryStatus.Rejected,
+                    _ => throw new InvalidOperationException("Unexpected model reentry mode.")
+                };
+                if (observation.Status != expected || current.Ledger.Models != 1
+                    || current.Ledger.ReservedSeconds != 30 || current.ArtifactHash is not null
+                    || current.S01 is not null || File.Exists(artifact)
+                    || (observation.Candidate is not null) != (expected == OrderModelRecoveryStatus.Generated)
+                    || (observation.Completion is null) != (expected == OrderModelRecoveryStatus.PendingBlocked)
+                    || (current.Ledger.Pending is not null) != (expected == OrderModelRecoveryStatus.PendingBlocked))
+                    throw new InvalidOperationException("Replayed model outcome differs.");
+                owner.RequireOrderModelDispatch(observation.Reservation);
+                if (expected == OrderModelRecoveryStatus.PendingBlocked)
+                {
+                    Reject(() => owner.ConsumeOrderModelDispatch(current.Ledger, observation.Reservation));
+                    var next = ProposeModel(current.Ledger, "S01", 30, DateTime.UtcNow.Ticks);
+                    Reject(() => current.Ledger.Reserve(claim.JobId, limits, next));
+                }
+                else
+                {
+                    string evidence = database + ".evidence-1";
+                    byte[] original = File.ReadAllBytes(evidence);
+                    File.WriteAllBytes(evidence, [.. original, 0x20]);
+                    try { Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger)); }
+                    finally { File.WriteAllBytes(evidence, original); }
+                    _ = DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger);
+                }
+
+                if (await ReadAsync() != current)
+                    throw new InvalidOperationException("Read-only model recovery mutated the actor.");
+                Console.WriteLine("BRIDGE_MODEL_RECOVERED");
+                return 0;
             }
 
             if (mode is "bridge-guest-blocked" or "bridge-guest-orphan-resume")
@@ -1650,12 +1782,15 @@ internal static class PersistenceBridgeProbe
         private readonly DevelopmentOrderArchive archive;
         private readonly OrderOperationLimits limits;
         private readonly DevelopmentOrderBudgetPolicy policy;
+        private readonly bool modelScenario;
 
         public override string PersistenceId { get; }
 
         public BridgeActor(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive,
-            OrderOperationLimits limits, DevelopmentOrderBudgetPolicy policy, DevelopmentJobStateStore.Lease owner)
+            OrderOperationLimits limits, DevelopmentOrderBudgetPolicy policy, DevelopmentJobStateStore.Lease owner,
+            bool modelScenario)
         {
+            this.modelScenario = modelScenario;
             PersistenceId = claim.PersistenceId;
             this.claim = claim;
             this.archive = archive;
@@ -1674,9 +1809,22 @@ internal static class PersistenceBridgeProbe
                 // Only the live command boundary reads protected evidence.
                 // Replay remains a pure fold and the host verifies recovered
                 // receipts again before permitting any further work.
+                if (modelScenario && command.Event.StartsWith("candidate-v1:", StringComparison.Ordinal))
+                {
+                    var reservation = state.Ledger.Pending ?? throw new InvalidOperationException("Missing model reservation.");
+                    owner.RequireOrderModelDispatch(reservation);
+                    _ = owner.RequireOrderCandidate(next.Ledger.LatestCandidate
+                        ?? throw new InvalidOperationException("Missing candidate."));
+                }
                 if (command.Event.StartsWith("complete-v2:", StringComparison.Ordinal))
                 {
-                    if (next.Ledger.LastOutcome == "failed")
+                    if (modelScenario)
+                    {
+                        var observation = DevelopmentOrderModelReconciliation.Observe(owner, next.Ledger);
+                        if (observation.Status == OrderModelRecoveryStatus.PendingBlocked)
+                            throw new InvalidOperationException("Model completion has no verified evidence.");
+                    }
+                    else if (next.Ledger.LastOutcome == "failed")
                     {
                         VerifyFixtureFailure(owner, claim,
                             next.FailedS01 ?? throw new InvalidOperationException("Failure missing."),
@@ -1730,7 +1878,12 @@ internal static class PersistenceBridgeProbe
                     };
                 var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
                 if (reservation.Kind == "model")
-                    VerifyFixtureAssignment(claim, archive, reservation);
+                {
+                    if (modelScenario)
+                        VerifyModelFixtureAssignment(claim, archive, reservation);
+                    else
+                        VerifyFixtureAssignment(claim, archive, reservation);
+                }
                 if (reservation.Step != (previous.Stage == 1 ? "S01" : "S02")
                     || (reservation.Kind != "model" && !(previous.Stage == 1 && reservation.Kind == "guest")))
                     throw new InvalidOperationException("Unexpected synthetic step operation.");
@@ -1759,6 +1912,18 @@ internal static class PersistenceBridgeProbe
                     };
                 var completion = DevelopmentOrderOperationLedger.DecodeCompletion(evt);
                 var reservation = previous.Ledger.Pending ?? throw new InvalidOperationException("Operation missing.");
+                if (modelScenario)
+                {
+                    if (previous.Stage != 2 || reservation.Kind != "model" || reservation.Step != "S01"
+                        || (completion.Outcome == "succeeded") != (previous.Ledger.LatestCandidate?.OperationId == reservation.OperationId))
+                        throw new InvalidOperationException("Unexpected model-only completion.");
+                    return previous with
+                    {
+                        Stage = 7,
+                        Ledger = previous.Ledger.Complete(completion)
+                    };
+                }
+
                 var recorded = new RecordedOperation(reservation, completion);
                 if (completion.Outcome == "failed")
                 {
