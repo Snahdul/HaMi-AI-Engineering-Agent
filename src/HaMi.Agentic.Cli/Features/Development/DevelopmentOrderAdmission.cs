@@ -58,6 +58,37 @@ internal static class DevelopmentOrderAdmission
             before.ReserveWithRequiredWork(jobId, limits, request, requiredAfter));
     }
 
+    // The host independently recomputes the decision under its journal
+    // ownership and persists exactly one event before acknowledging it.
+    internal static async Task<DevelopmentOrderOperationLedger> AdmitDecisionAsync(
+        DevelopmentOrderClaim claim, DevelopmentOrderOperationLedger before,
+        OrderOperationReservation request, IReadOnlyList<OrderRequiredOperation> requiredAfter,
+        Func<OrderOperationReservation, Task<DevelopmentOrderOperationLedger>> persist)
+    {
+        var decision = Decide(claim, before, request, requiredAfter);
+        var acknowledged = await persist(request);
+        RequireAcknowledged(claim, decision, acknowledged);
+        return acknowledged;
+    }
+
+    internal static void RequireAcknowledged(DevelopmentOrderClaim claim, OrderAdmissionDecision decision,
+        DevelopmentOrderOperationLedger acknowledged)
+    {
+        // SoftStop contains an array; compare canonical event bytes rather
+        // than reference equality of independently folded/restored arrays.
+        var expected = decision.Ledger;
+        OrderCheck.Require((expected with { SoftStop = null }) == (acknowledged with { SoftStop = null })
+            && (expected.SoftStop is null ? acknowledged.SoftStop is null
+                : acknowledged.SoftStop is not null
+                    && DevelopmentOrderOperationLedger.EncodeSoftStop(expected.SoftStop)
+                        == DevelopmentOrderOperationLedger.EncodeSoftStop(acknowledged.SoftStop)),
+            "ORDER_ADMISSION_ACK");
+        var expectedAction = expected.Pending is not null
+            ? OrderWorkflowAction.ReconcilePending : OrderWorkflowAction.AwaitBudgetExtension;
+        OrderCheck.Require(DevelopmentOrderWorkflow.Select(claim, acknowledged) == expectedAction,
+            "ORDER_ADMISSION_ACK");
+    }
+
     internal static async Task<DevelopmentOrderOperationLedger> AdmitAsync(
         DevelopmentOrderClaim claim, DevelopmentOrderOperationLedger before,
         OrderOperationReservation request, IReadOnlyList<OrderRequiredOperation> requiredAfter,

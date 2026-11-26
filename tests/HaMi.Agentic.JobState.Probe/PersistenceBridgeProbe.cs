@@ -1647,6 +1647,7 @@ internal static class PersistenceBridgeProbe
             "model-receipt", "model-orphan", "model-checkpoint", "model-generated", "model-rejected", "model-rejected-orphan", "model-accepted", "model-verified", "soft-stop",
             "model-formatter-receipt", "model-formatter-orphan", "model-formatter-checkpoint",
             "model-formatter-rejected", "model-formatter-rejected-orphan",
+            "model-formatter-budget-hard", "model-formatter-budget-soft",
             "model-final-pre-dispatch", "model-final-wrong-output", "model-final-orphan" })
         {
             bool unknown = scenario == "unknown";
@@ -1661,8 +1662,10 @@ internal static class PersistenceBridgeProbe
             bool finalScenario = scenario.StartsWith("model-final-", StringComparison.Ordinal);
             bool successfulFormatter = scenario == "model-accepted" || finalScenario;
             bool calculatorScenario = formatterScenario || successfulFormatter || scenario == "model-verified";
-            bool formatterHasCandidate = scenario is not ("model-formatter-receipt" or "model-formatter-rejected" or "model-formatter-rejected-orphan");
-            bool formatterHasEvidence = scenario != "model-formatter-receipt";
+            bool formatterBudgetStop = scenario is "model-formatter-budget-hard" or "model-formatter-budget-soft";
+            bool formatterHasCandidate = !formatterBudgetStop
+                && scenario is not ("model-formatter-receipt" or "model-formatter-rejected" or "model-formatter-rejected-orphan");
+            bool formatterHasEvidence = !formatterBudgetStop && scenario != "model-formatter-receipt";
             bool modelGenerated = scenario == "model-generated";
             bool modelRejected = scenario == "model-rejected";
             bool modelCandidate = calculatorScenario || scenario is "model-orphan" or "model-checkpoint" or "model-generated";
@@ -1778,7 +1781,7 @@ internal static class PersistenceBridgeProbe
                     : [];
 
                 string[] formatterSlots = ["model-dispatch-3", "candidate-3", "evidence-3"];
-                bool[] expectedFormatterSlots = [true, formatterHasCandidate, formatterHasEvidence];
+                bool[] expectedFormatterSlots = [!formatterBudgetStop, formatterHasCandidate, formatterHasEvidence];
                 byte[][] formatterEvidence = [];
                 if (calculatorScenario)
                 {
@@ -2031,6 +2034,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: common pair admission and completion checks S01 through FINAL; model recovery is read-only and invalid, stale or duplicate completions rejected.");
         Console.WriteLine("PASS: common read-only guest reconciliation correlates journal action, protected pair report and fresh observation; orphan and unknown effects remain blocked.");
         Console.WriteLine("PASS: common budget decision classifies reservation, hard stop and soft stop; denied pair requests never reach reservation callbacks.");
+        Console.WriteLine("PASS: actual pair S02 hard and soft stops persisted before ACK and replayed after process kill; exact predecessor and charges retained, no dispatch.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2690,6 +2694,40 @@ internal static class PersistenceBridgeProbe
                     DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state,
                         ObserveCalculatorFixture(owner, claim, outcome), baseline, pair);
 
+                if (nextAction == OrderWorkflowAction.AwaitBudgetExtension)
+                {
+                    if (current.Stage != 8 || formatterCrash is not ("budget-hard" or "budget-soft"))
+                        throw new InvalidOperationException("Unexpected pair budget stop.");
+                    var beforeStop = current.FormatterInputState
+                        ?? throw new InvalidOperationException("Pre-stop history missing.");
+                    var stoppedRequest = current.Ledger.BudgetStop?.Request ?? current.Ledger.SoftStop?.Request
+                        ?? throw new InvalidOperationException("Stopped request missing.");
+                    var required = new OrderRequiredOperation[]
+                    {
+                        new("S02", "guest", 10), new("FINAL", "guest", beforeStop.FinalReserveSeconds)
+                    };
+                    var decision = DevelopmentOrderAdmission.Decide(claim, beforeStop, stoppedRequest, required);
+                    DevelopmentOrderAdmission.RequireAcknowledged(claim, decision, current.Ledger);
+                    _ = ReadFormatterInputs(beforeStop, ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root));
+                    if ((formatterCrash == "budget-hard") != (current.Ledger.BudgetStop is not null)
+                        || (formatterCrash == "budget-soft") != (current.Ledger.SoftStop is not null)
+                        || current.Ledger.Pending is not null || current.Ledger.Sequence != 2
+                        || current.Ledger.ReservedSeconds != 60 || current.Ledger.StartedUtcTicks != beforeStop.StartedUtcTicks
+                        || current.Ledger.AcceptedS01 != accepted)
+                        throw new InvalidOperationException("Recovered pair budget stop differs.");
+                    Reject(() => DevelopmentOrderAdmission.Decide(claim, current.Ledger,
+                        stoppedRequest with { ObservedUtcTicks = DateTime.UtcNow.Ticks }, required));
+                    bool blocked = false;
+                    try { _ = await actor.Ask<BridgeState>(new AdmitFormatter(stoppedRequest), Deadline); }
+                    catch (InvalidOperationException) { blocked = true; }
+                    if (!blocked || await ReadAsync() != current || File.Exists(database + ".model-dispatch-3")
+                        || File.Exists(database + ".candidate-3") || File.Exists(database + ".evidence-3"))
+                        throw new InvalidOperationException("Stopped pair admitted an effect.");
+                    Console.WriteLine("BRIDGE_PHASE: S02 " + formatterCrash + " recovered; predecessor and original charges retained, no dispatch.");
+                    Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
+                    return 0;
+                }
+
                 if (nextAction == OrderWorkflowAction.ReconcilePending && current.Ledger.Pending is { Step: "FINAL", Kind: "guest" })
                 {
                     if (current.Stage != 14 || finalCrash is not ("pre-dispatch" or "wrong-output" or "orphan"))
@@ -3325,7 +3363,27 @@ internal static class PersistenceBridgeProbe
                     return current.Ledger;
                 }
 
-                var actualPending = await DevelopmentOrderAdmission.AdmitAsync(claim, acceptedState.Ledger,
+                if (formatterCrash is "budget-hard" or "budget-soft")
+                {
+                    int seconds = formatterCrash == "budget-hard" ? 1800
+                        : limits.Seconds - acceptedState.Ledger.ReservedSeconds - acceptedState.Ledger.FinalReserveSeconds - 1;
+                    var stopRequest = actualRequest with { ReservedSeconds = seconds, ObservedUtcTicks = DateTime.UtcNow.Ticks };
+                    var stopped = await DevelopmentOrderAdmission.AdmitDecisionAsync(claim, acceptedState.Ledger,
+                        stopRequest, formatterRequired, PersistFormatter);
+                    if (current.Stage != 8 || current.FormatterInputState != acceptedState.Ledger
+                        || stopped.Pending is not null || stopped.Sequence != 2 || stopped.ReservedSeconds != 60
+                        || (formatterCrash == "budget-hard") != (stopped.BudgetStop is not null)
+                        || (formatterCrash == "budget-soft") != (stopped.SoftStop is not null)
+                        || await ReadAsync() != current || File.Exists(database + ".model-dispatch-3"))
+                        throw new InvalidOperationException("Pair budget stop was not acknowledged.");
+                    owner.ValidateOrderJournalFiles();
+                    Console.WriteLine("BRIDGE_FORMATTER_CAPTURED");
+                    Console.Out.Flush();
+                    await Task.Delay(Timeout.InfiniteTimeSpan);
+                    return 1;
+                }
+
+                var actualPending = await DevelopmentOrderAdmission.AdmitDecisionAsync(claim, acceptedState.Ledger,
                     actualRequest, formatterRequired, PersistFormatter);
                 await RejectWorkflowAdmissionAsync(actualPending, actualRequest, formatterRequired);
                 if (syntheticAdmissionCalls != 1 || await ReadAsync() != current)
@@ -4096,7 +4154,8 @@ internal static class PersistenceBridgeProbe
                 try
                 {
                     if (!recovered || !calculatorScenario || state.Stage != 8
-                        || command.Request is not { Step: "S02", Kind: "model" })
+                        || command.Request is not { Step: "S02", Kind: "model" }
+                        || state.Ledger.BudgetStop is not null || state.Ledger.SoftStop is not null)
                         throw new InvalidOperationException("Formatter admission blocked.");
                     var model = state.CalculatorModel ?? throw new InvalidOperationException("Model history missing.");
                     var guest = state.CalculatorGuest ?? throw new InvalidOperationException("Guest history missing.");
@@ -4104,8 +4163,11 @@ internal static class PersistenceBridgeProbe
                     _ = DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state.Ledger,
                         ObserveCalculatorFixture(owner, claim, outcome), ObserveCalculatorBaseline(root, claim.Binding),
                         CalculatorRecoveryPair(root));
-                    string evt = DevelopmentOrderOperationLedger.EncodeReservation(command.Request);
+                    var decision = DevelopmentOrderAdmission.Decide(claim, state.Ledger, command.Request,
+                        [new("S02", "guest", 10), new("FINAL", "guest", policy.FinalVerificationSeconds)]);
+                    string evt = decision.Event;
                     BridgeState next = Next(state, evt);
+                    DevelopmentOrderAdmission.RequireAcknowledged(claim, decision, next.Ledger);
                     IActorRef reply = Sender;
                     Persist(evt, _ =>
                     {
@@ -4411,6 +4473,20 @@ internal static class PersistenceBridgeProbe
                 };
             if (calculatorScenario && previous.Stage == 8)
             {
+                if (evt.StartsWith("budget-stop-v1:", StringComparison.Ordinal)
+                    || evt.StartsWith("soft-stop-v1:", StringComparison.Ordinal))
+                {
+                    var request = evt.StartsWith("budget-stop-v1:", StringComparison.Ordinal)
+                        ? DevelopmentOrderOperationLedger.DecodeBudgetStop(evt).Request
+                        : DevelopmentOrderOperationLedger.DecodeSoftStop(evt).Request;
+                    VerifyModelFixtureAssignment(claim, archive, request);
+                    var decision = DevelopmentOrderAdmission.Decide(claim, previous.Ledger, request,
+                        [new("S02", "guest", 10), new("FINAL", "guest", policy.FinalVerificationSeconds)]);
+                    if (decision.Event != evt || decision.Ledger.Pending is not null)
+                        throw new InvalidOperationException("Unexpected pair stop event.");
+                    return previous with { FormatterInputState = previous.Ledger, Ledger = decision.Ledger };
+                }
+
                 var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
                 if (reservation is not { Step: "S02", Kind: "model" })
                     throw new InvalidOperationException("Formatter model reservation required.");
