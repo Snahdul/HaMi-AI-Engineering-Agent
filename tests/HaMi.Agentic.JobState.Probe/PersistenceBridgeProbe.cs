@@ -2295,12 +2295,16 @@ internal static class PersistenceBridgeProbe
                 if (current.FailedS01 is { } recoveredFailure)
                     VerifyFixtureAssignment(claim, archive, recoveredFailure.Reservation);
                 long now = DateTime.UtcNow.Ticks;
+                var replayedLimits = current.Ledger.CurrentLimits
+                    ?? throw new InvalidOperationException("Recovered budget missing.");
                 if (current.Ledger.StartedUtcTicks <= 0 || current.Ledger.StartedUtcTicks >= processStart
-                    || current.Ledger.Remaining(limits, now) >= TimeSpan.FromSeconds(limits.Seconds)
+                    || current.Ledger.Remaining(replayedLimits, now) >= TimeSpan.FromSeconds(replayedLimits.Seconds)
                     || current.Ledger.LastUtcTicks < current.Ledger.StartedUtcTicks)
                     throw new InvalidOperationException("Persisted execution window not recovered.");
-                Reject(() => current.Ledger.Remaining(limits, current.Ledger.LastUtcTicks - 1));
-                Console.WriteLine($"BRIDGE_PHASE: remaining order window {current.Ledger.Remaining(limits, now).TotalMilliseconds:F0} ms.");
+                Reject(() => current.Ledger.Remaining(replayedLimits, current.Ledger.LastUtcTicks - 1));
+                if (replayedLimits != limits)
+                    Reject(() => current.Ledger.Remaining(limits, now));
+                Console.WriteLine($"BRIDGE_PHASE: remaining order window {current.Ledger.Remaining(replayedLimits, now).TotalMilliseconds:F0} ms.");
             }
             if (first)
             {
