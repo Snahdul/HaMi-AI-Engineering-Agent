@@ -2386,8 +2386,11 @@ internal static class PersistenceBridgeProbe
                         Reject(() => current.Ledger.AcceptS02(claim, proposedAcceptance with { Version = 2 }));
                         Reject(() => current.Ledger.AcceptS02(claim, proposedAcceptance with { GuestReportHash = new string('A', 64) }));
                         Reject(() => current.Ledger.AcceptS02(claim, proposedAcceptance with { ScopeHash = new string('A', 64) }));
-                        Reject(() => current.Ledger.AcceptS02(claim, proposedAcceptance with { Predecessor = accepted with
-                            { GuestReportHash = new string('A', 64) } }));
+                        Reject(() => current.Ledger.AcceptS02(claim, proposedAcceptance with
+                        {
+                            Predecessor = accepted with
+                            { GuestReportHash = new string('A', 64) }
+                        }));
                         Reject(() => completedFormatter.AcceptS02(claim, proposedAcceptance));
                         Reject(() => expectedAcceptance.AcceptS02(claim, proposedAcceptance));
                         Reject(() => DevelopmentOrderOperationLedger.DecodeS02Accepted(
