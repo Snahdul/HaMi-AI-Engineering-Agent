@@ -2,6 +2,8 @@ using System.Text;
 
 namespace HaMi.Agentic.Cli.Features.Development;
 
+internal sealed record OrderGeneratedModelResult(OrderCandidateCheckpoint Candidate, OrderOperationCompletion Completion);
+
 // S01 only: a trusted host supplies a verified assignment and a single
 // tool-free source-extraction transport. This is not a provider factory,
 // a retry policy, a verifier or a journal writer. Never invoke during replay.
@@ -11,7 +13,7 @@ internal static class DevelopmentOrderModelDispatch
 
     // Real composition fixes the retry-disabled provider factory. The
     // injected core below is used only by the controlled offline probe.
-    internal static async Task<OrderCandidateCheckpoint> RunS01Async(
+    internal static async Task<OrderGeneratedModelResult> RunS01Async(
         DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
         OrderOperationReservation reservation, DevelopmentOrderApproval approval,
         OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, byte[] baseline,
@@ -24,7 +26,7 @@ internal static class DevelopmentOrderModelDispatch
             baseline, generator, cancellationToken);
     }
 
-    internal static Task<OrderCandidateCheckpoint> RunS01CoreAsync(
+    internal static Task<OrderGeneratedModelResult> RunS01CoreAsync(
         DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
         OrderOperationReservation reservation, DevelopmentOrderApproval approval,
         OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, byte[] baseline,
@@ -38,7 +40,7 @@ internal static class DevelopmentOrderModelDispatch
             baseline, generator.GenerateS01Async, cancellationToken);
     }
 
-    internal static async Task<OrderCandidateCheckpoint> RunAsync(
+    internal static async Task<OrderGeneratedModelResult> RunAsync(
         DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
         OrderOperationReservation reservation, DevelopmentOrderApproval approval,
         OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, byte[] baseline,
@@ -82,12 +84,23 @@ internal static class DevelopmentOrderModelDispatch
             DevelopmentAgentContract.PairFirst, claim.Binding.CalculatorBaselineHash,
             claim.Binding.CalculatorBaselineHash, bytes.Length, DevelopmentJobState.Hash(bytes), "Generated",
             DateTime.UtcNow.Ticks);
-        _ = acknowledged.Checkpoint(claim, checkpoint);
+        var checkpointed = acknowledged.Checkpoint(claim, checkpoint);
         owner.RequireOrderModelDispatch(reservation);
         _ = deadline.Limit(TimeSpan.FromSeconds(1));
         owner.StoreOrderCandidate(checkpoint, bytes);
         _ = deadline.Limit(TimeSpan.FromSeconds(1));
-        return checkpoint;
+        var evidence = new OrderOperationEvidence(2, claim.ArchiveHash, reservation,
+            OrderOperationEvidence.GeneratedObserver, "succeeded", checkpoint.BaselineHash,
+            checkpoint.InputHash, checkpoint.ArtifactHash, DateTime.UtcNow.Ticks);
+        var completion = evidence.Completion();
+        _ = checkpointed.Complete(completion);
+        _ = deadline.Limit(TimeSpan.FromSeconds(1));
+        OrderCheck.Require(owner.StoreOrderOperationEvidence(evidence, checkpoint) == completion,
+            "ORDER_MODEL_EVIDENCE_COMPLETION");
+        _ = deadline.Limit(TimeSpan.FromSeconds(1));
+        // Caller must persist checkpoint then completion under the same
+        // lease. A crash before those acknowledgements is still pending.
+        return new(checkpoint, completion);
     }
 
     private static string DecodeSource(byte[] bytes)

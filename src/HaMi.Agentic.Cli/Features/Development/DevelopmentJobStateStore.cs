@@ -425,22 +425,24 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
 
         // Immutable exact host-observation bytes; never a second mutable
         // workflow authority. Persist completion only after readback.
-        internal OrderOperationCompletion StoreOrderOperationEvidence(OrderOperationEvidence evidence)
+        internal OrderOperationCompletion StoreOrderOperationEvidence(OrderOperationEvidence evidence,
+            OrderCandidateCheckpoint? generated = null)
         {
             RequireOrderStorage();
             DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
             string path = OperationEvidencePath(evidence.ValidateBinding(claim));
+            RequireModelEvidenceCandidate(evidence, generated);
             if (RegularFileExists(path))
                 throw new InvalidOperationException("Order operation evidence already exists.");
             byte[] bytes = evidence.Serialize();
             var completion = evidence.Completion();
             WriteNew(path, bytes);
-            _ = RequireOrderOperationEvidence(evidence.Reservation, completion);
+            _ = RequireOrderOperationEvidence(evidence.Reservation, completion, generated);
             return completion;
         }
 
         internal OrderOperationEvidence RequireOrderOperationEvidence(OrderOperationReservation reservation,
-            OrderOperationCompletion completion)
+            OrderOperationCompletion completion, OrderCandidateCheckpoint? generated = null)
         {
             RequireOrderStorage();
             DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
@@ -460,7 +462,32 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             OrderCheck.Require(DevelopmentJobState.Hash(bytes) == completion.EvidenceHash, "ORDER_EVIDENCE_HASH");
             var evidence = OrderStorageJson.Decode<OrderOperationEvidence>(bytes, OrderOperationEvidence.MaxBytes);
             evidence.ValidateCompletion(claim, reservation, completion);
+            RequireModelEvidenceCandidate(evidence, generated);
             return evidence;
+        }
+
+        // Real generated evidence requires the matching journal candidate
+        // descriptor and exact protected bytes, never a raw orphan report.
+        // Old synthetic test receipts cannot substitute for real evidence.
+        private void RequireModelEvidenceCandidate(OrderOperationEvidence evidence, OrderCandidateCheckpoint? generated)
+        {
+            if (evidence.Observer == OrderOperationEvidence.FixtureObserver)
+            {
+                OrderCheck.Require(generated is null, "ORDER_MODEL_EVIDENCE_OBSERVER");
+                return;
+            }
+
+            OrderCheck.Require(generated is not null, "ORDER_MODEL_EVIDENCE_CANDIDATE");
+            var candidate = generated ?? throw new InvalidOperationException("ORDER_MODEL_EVIDENCE_CANDIDATE");
+            OrderCheck.Require(candidate.ArchiveHash == evidence.ArchiveHash
+                && candidate.OperationId == evidence.Reservation.OperationId
+                && candidate.Step == evidence.Reservation.Step && candidate.Quality == "Generated"
+                && candidate.BaselineHash == evidence.BaselineHash && candidate.InputHash == evidence.InputHash
+                && candidate.ArtifactHash == evidence.OutputHash
+                && candidate.ObservedUtcTicks >= evidence.Reservation.ObservedUtcTicks
+                && candidate.ObservedUtcTicks <= evidence.ObservedUtcTicks, "ORDER_MODEL_EVIDENCE_CANDIDATE");
+            RequireOrderModelDispatch(evidence.Reservation);
+            _ = RequireOrderCandidate(candidate);
         }
 
         private string ModelDispatchPath(int sequence) =>

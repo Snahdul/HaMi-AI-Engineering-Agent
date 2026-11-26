@@ -2,9 +2,9 @@ using System.Globalization;
 
 namespace HaMi.Agentic.Cli.Features.Development;
 
-// Bounded synthetic model-operation receipt. This records an observation by
-// the trusted host fixture, not a model's assertion or a real verifier result.
-// The caller must establish the outcome independently before storing it.
+// Bounded host model-operation receipt, never a step-verifier result.
+// The historical offline observer is separate from the S01 live-return
+// observer; neither can confer workflow authority without the journal.
 internal sealed record OrderOperationEvidence(
     int Version, string ArchiveHash, OrderOperationReservation Reservation,
     string Observer, string Outcome, string BaselineHash, string InputHash,
@@ -12,6 +12,7 @@ internal sealed record OrderOperationEvidence(
 {
     internal const int MaxBytes = 4096;
     internal const string FixtureObserver = "hami-offline-host-observer-v1";
+    internal const string GeneratedObserver = "hami-s01-generated-host-v1";
 
     internal int ValidateBinding(DevelopmentOrderClaim claim)
     {
@@ -20,7 +21,9 @@ internal sealed record OrderOperationEvidence(
         string baseline = operation.Step == "S01" ? claim.Binding.CalculatorBaselineHash : claim.Binding.FormatterBaselineHash;
         (operation.Assignment ?? throw new InvalidOperationException("ORDER_EVIDENCE_ASSIGNMENT")).Validate();
         OrderCheck.Require(Version == 2 && ArchiveHash == claim.ArchiveHash
-            && Observer == FixtureObserver && operation.Version == 4 && operation.Kind == "model" && operation.SnapshotHash is null
+            && (Observer == FixtureObserver || (Observer == GeneratedObserver && operation.Step == "S01"
+                && Outcome == "succeeded"))
+            && operation.Version == 4 && operation.Kind == "model" && operation.SnapshotHash is null
             && operation.Step is "S01" or "S02"
             && operation.ReservedSeconds > 0 && operation.ObservedUtcTicks > 0
             && ObservedUtcTicks >= operation.ObservedUtcTicks && ObservedUtcTicks <= DateTime.MaxValue.Ticks

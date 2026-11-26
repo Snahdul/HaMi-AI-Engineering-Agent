@@ -576,15 +576,15 @@ internal static class PersistenceBridgeProbe
                     return Task.FromResult(scenario == "invalid-source" ? "\0" : candidate);
                 }
 
-                OrderCandidateCheckpoint? checkpoint = null;
+                OrderGeneratedModelResult? generated = null;
                 bool rejected = false;
                 try
                 {
                     if (adapter)
-                        checkpoint = await DevelopmentOrderModelDispatch.RunS01CoreAsync(owner, ledger, operation, approval,
+                        generated = await DevelopmentOrderModelDispatch.RunS01CoreAsync(owner, ledger, operation, approval,
                             assignment, catalog, baseline, generator, cancel.Token);
                     else
-                        checkpoint = await DevelopmentOrderModelDispatch.RunAsync(owner, ledger, operation, approval,
+                        generated = await DevelopmentOrderModelDispatch.RunAsync(owner, ledger, operation, approval,
                             scenario == "wrong-assignment" ? assignment with { Revision = 2 } : assignment,
                             catalog, scenario == "wrong-input" ? [1] : baseline, Generate, cancel.Token);
                 }
@@ -597,9 +597,11 @@ internal static class PersistenceBridgeProbe
                 bool success = scenario is "success" or "adapter-success";
                 string receipt = journal + ".model-dispatch-1";
                 string artifact = journal + ".candidate-1";
-                if (rejected == success || (checkpoint is not null) != success
+                string evidencePath = journal + ".evidence-1";
+                if (rejected == success || (generated is not null) != success
                     || calls + scripted.Calls != (dispatched ? 1 : 0) || File.Exists(receipt) != dispatched
-                    || File.Exists(artifact) != success || ledger.Pending != operation || ledger.Models != 1)
+                    || File.Exists(artifact) != success || File.Exists(evidencePath) != success
+                    || ledger.Pending != operation || ledger.Models != 1)
                     throw new InvalidOperationException("Model dispatch outcome differs: " + scenario);
                 if (dispatched)
                 {
@@ -614,10 +616,38 @@ internal static class PersistenceBridgeProbe
                 }
                 if (success)
                 {
-                    var recorded = checkpoint ?? throw new InvalidOperationException("Missing checkpoint.");
+                    var result = generated ?? throw new InvalidOperationException("Missing generated result.");
+                    var recorded = result.Candidate;
+                    var completion = result.Completion;
+                    var evidence = owner.RequireOrderOperationEvidence(operation, completion, recorded);
+                    var checkpointed = ledger.Checkpoint(claim, recorded);
+                    var completed = checkpointed.Complete(completion);
                     if (!owner.RequireOrderCandidate(recorded).SequenceEqual(Encoding.UTF8.GetBytes(candidate))
-                        || ledger.Checkpoint(claim, recorded).Pending != operation)
-                        throw new InvalidOperationException("Candidate capture became operation completion.");
+                        || evidence.Observer != OrderOperationEvidence.GeneratedObserver
+                        || evidence.OutputHash != recorded.ArtifactHash || checkpointed.Pending != operation
+                        || completed.Pending is not null || completed.Models != 1 || completed.ReservedSeconds != 30
+                        || completed.LatestCandidate != recorded || completed.LastOutcome != "succeeded")
+                        throw new InvalidOperationException("Generated model evidence or charge differs.");
+                    Reject(() => owner.RequireOrderOperationEvidence(operation, completion));
+                    Reject(() => owner.RequireOrderOperationEvidence(operation, completion, recorded with { Quality = "Partial" }));
+                    Reject(() => owner.RequireOrderOperationEvidence(operation, completion, recorded with { ArtifactHash = new string('A', 64) }));
+                    Reject(() => owner.StoreOrderOperationEvidence(evidence, recorded));
+                    Reject(() => owner.StoreOrderOperationEvidence(evidence, null));
+                    Reject(() => owner.StoreOrderOperationEvidence(evidence with { Observer = OrderOperationEvidence.FixtureObserver }, recorded));
+                    foreach (string path in new[] { receipt, artifact, evidencePath })
+                    {
+                        byte[] original = File.ReadAllBytes(path);
+                        File.Move(path, path + ".saved");
+                        try { Reject(() => owner.RequireOrderOperationEvidence(operation, completion, recorded)); }
+                        finally { File.Move(path + ".saved", path); }
+                        File.WriteAllBytes(path, [.. original, 0x20]);
+                        try { Reject(() => owner.RequireOrderOperationEvidence(operation, completion, recorded)); }
+                        finally { File.WriteAllBytes(path, original); }
+                    }
+
+                    _ = owner.RequireOrderOperationEvidence(operation, completion, recorded);
+                    if (ledger.Pending != operation || File.Exists(journal + ".s01"))
+                        throw new InvalidOperationException("Private model evidence became journal or step authority.");
                 }
                 owner.ValidateOrderJournalFiles();
             }
@@ -627,7 +657,7 @@ internal static class PersistenceBridgeProbe
             }
         }
 
-        Console.WriteLine("PASS: reserved S01 model dispatch once-only receipt, exact baseline and assignment, generated candidate capture, unknown/cancelled remain pending.");
+        Console.WriteLine("PASS: reserved S01 model dispatch, generated candidate and host outcome, exact replay evidence, unknown/cancelled remain pending.");
     }
 
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
