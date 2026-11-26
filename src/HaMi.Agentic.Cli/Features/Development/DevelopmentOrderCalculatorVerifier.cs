@@ -129,6 +129,32 @@ internal static class DevelopmentOrderCalculatorVerifier
         return proposal;
     }
 
+    // Read a complete bounded, host-owned staging directory. This is not a
+    // Git checkout observer: the caller must establish trusted directory
+    // ownership and separately verify baseline/checkout identity.
+    internal static Dictionary<string, byte[]> ReadStagedPair(string directory)
+    {
+        string root = Path.GetFullPath(directory);
+        var info = new DirectoryInfo(root);
+        OrderCheck.Require(info.Exists && info.LinkTarget is null
+            && (info.Attributes & FileAttributes.ReparsePoint) == 0, "ORDER_CALCULATOR_STAGE_ROOT");
+        string[] names = Directory.EnumerateFileSystemEntries(root).Select(Path.GetFileName)
+            .Select(name => name ?? "").OrderBy(name => name, StringComparer.Ordinal).ToArray();
+        OrderCheck.Require(names.SequenceEqual(["PairCalculator.cs", "PairFormatter.cs"], StringComparer.Ordinal),
+            "ORDER_CALCULATOR_STAGE_SCOPE");
+        var pair = new Dictionary<string, byte[]>(StringComparer.Ordinal)
+        {
+            [DevelopmentAgentContract.PairFirst] = DevelopmentJobEvidence.ReadBoundedFile(
+                Path.Combine(root, "PairCalculator.cs"), OrderCandidateCheckpoint.MaxBytes),
+            [DevelopmentAgentContract.PairSecond] = DevelopmentJobEvidence.ReadBoundedFile(
+                Path.Combine(root, "PairFormatter.cs"), OrderCandidateCheckpoint.MaxBytes)
+        };
+        OrderCheck.Require(Directory.EnumerateFileSystemEntries(root).Select(Path.GetFileName)
+            .Select(name => name ?? "").OrderBy(name => name, StringComparer.Ordinal).SequenceEqual(names),
+            "ORDER_CALCULATOR_STAGE_SCOPE");
+        return pair;
+    }
+
     // Reusable read-only scope check, including after an already accepted
     // step has outlived its original execution window. No new acceptance.
     internal static void RequirePairScope(DevelopmentJobStateStore.Lease owner, OrderCandidateCheckpoint candidate,
