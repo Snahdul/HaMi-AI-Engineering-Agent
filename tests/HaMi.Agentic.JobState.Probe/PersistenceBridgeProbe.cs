@@ -1337,8 +1337,8 @@ internal static class PersistenceBridgeProbe
                 if (expected == OrderModelRecoveryStatus.PendingBlocked)
                 {
                     Reject(() => owner.ConsumeOrderModelDispatch(current.Ledger, observation.Reservation));
-                    var next = ProposeModel(current.Ledger, "S01", 30, DateTime.UtcNow.Ticks);
-                    Reject(() => current.Ledger.Reserve(claim.JobId, limits, next));
+                    var blockedRetry = ProposeModel(current.Ledger, "S01", 30, DateTime.UtcNow.Ticks);
+                    Reject(() => current.Ledger.Reserve(claim.JobId, limits, blockedRetry));
                 }
                 else
                 {
