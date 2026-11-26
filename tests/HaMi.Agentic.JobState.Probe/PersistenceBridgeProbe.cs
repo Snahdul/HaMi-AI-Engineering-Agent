@@ -625,6 +625,13 @@ internal static class PersistenceBridgeProbe
                     Reject(() => owner.RequireOrderModelDispatch(operation with { ReservedSeconds = 31 }));
                     owner.RequireOrderModelDispatch(operation);
                 }
+                // A recovered pending reservation never becomes a
+                // completion through discovery of its private files.
+                var blocked = DevelopmentOrderModelReconciliation.Observe(owner, ledger);
+                if (blocked.Status != OrderModelRecoveryStatus.PendingBlocked || blocked.Reservation != operation
+                    || blocked.Candidate is not null || blocked.Completion is not null)
+                    throw new InvalidOperationException("Unjournaled model effects were adopted.");
+
                 if (success)
                 {
                     var result = generated ?? throw new InvalidOperationException("Missing generated result.");
@@ -633,6 +640,20 @@ internal static class PersistenceBridgeProbe
                     var evidence = owner.RequireOrderOperationEvidence(operation, completion, recorded);
                     var checkpointed = ledger.Checkpoint(claim, recorded);
                     var completed = checkpointed.Complete(completion);
+                    var checkpointRecovery = DevelopmentOrderModelReconciliation.Observe(owner, checkpointed);
+                    var completedRecovery = DevelopmentOrderModelReconciliation.Observe(owner, completed);
+                    if (checkpointRecovery.Status != OrderModelRecoveryStatus.PendingBlocked
+                        || checkpointRecovery.Candidate is not null || checkpointRecovery.Completion is not null
+                        || completedRecovery.Status != OrderModelRecoveryStatus.Generated
+                        || completedRecovery.Candidate != recorded || completedRecovery.Completion != completion
+                        || completedRecovery.Reservation != operation)
+                        throw new InvalidOperationException("Generated model recovery differs from journal.");
+                    Reject(() => DevelopmentOrderModelReconciliation.Observe(owner,
+                        completed with { LastEvidenceHash = new string('A', 64) }));
+                    Reject(() => DevelopmentOrderModelReconciliation.Observe(owner,
+                        completed with { LatestModelCompletion = null }));
+                    Reject(() => DevelopmentOrderModelReconciliation.Observe(owner,
+                        completed with { LatestCandidate = null }));
                     if (!owner.RequireOrderCandidate(recorded).SequenceEqual(Encoding.UTF8.GetBytes(candidate))
                         || evidence.Observer != OrderOperationEvidence.GeneratedObserver
                         || evidence.OutputHash != recorded.ArtifactHash || checkpointed.Pending != operation
@@ -649,10 +670,18 @@ internal static class PersistenceBridgeProbe
                     {
                         byte[] original = File.ReadAllBytes(path);
                         File.Move(path, path + ".saved");
-                        try { Reject(() => owner.RequireOrderOperationEvidence(operation, completion, recorded)); }
+                        try
+                        {
+                            Reject(() => owner.RequireOrderOperationEvidence(operation, completion, recorded));
+                            Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, completed));
+                        }
                         finally { File.Move(path + ".saved", path); }
                         File.WriteAllBytes(path, [.. original, 0x20]);
-                        try { Reject(() => owner.RequireOrderOperationEvidence(operation, completion, recorded)); }
+                        try
+                        {
+                            Reject(() => owner.RequireOrderOperationEvidence(operation, completion, recorded));
+                            Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, completed));
+                        }
                         finally { File.WriteAllBytes(path, original); }
                     }
 
@@ -666,6 +695,10 @@ internal static class PersistenceBridgeProbe
                     var completion = result.Completion;
                     var evidence = owner.RequireOrderOperationEvidence(operation, completion);
                     var completed = ledger.Complete(completion);
+                    var recovered = DevelopmentOrderModelReconciliation.Observe(owner, completed);
+                    if (recovered.Status != OrderModelRecoveryStatus.Rejected || recovered.Candidate is not null
+                        || recovered.Completion != completion || recovered.Reservation != operation)
+                        throw new InvalidOperationException("Rejected model recovery differs from journal.");
                     if (result.Candidate is not null || evidence.Observer != OrderOperationEvidence.RejectedResponseObserver
                         || evidence.OutputHash is not null || completed.Pending is not null || completed.Models != 1
                         || completed.ReservedSeconds != 30 || completed.LatestCandidate is not null
@@ -675,6 +708,10 @@ internal static class PersistenceBridgeProbe
                     var next = completed.Propose(claim.JobId, "S01", "model", 30,
                         DateTime.UtcNow.Ticks, OrderOperationAgentBinding.FromAssignment(assignment));
                     var retry = completed.Reserve(claim.JobId, archive.EffectiveLimits, next);
+                    var retryRecovery = DevelopmentOrderModelReconciliation.Observe(owner, retry);
+                    if (retryRecovery.Status != OrderModelRecoveryStatus.PendingBlocked
+                        || retryRecovery.Reservation != next || retryRecovery.Completion is not null)
+                        throw new InvalidOperationException("Previous completion settled new pending operation.");
                     if (retry.Models != 2 || retry.ReservedSeconds != 60 || retry.Pending != next
                         || next.OperationId == operation.OperationId || scripted.Calls != 1)
                         throw new InvalidOperationException("Known failure retry was not a new charged reservation.");
@@ -687,10 +724,18 @@ internal static class PersistenceBridgeProbe
                     {
                         byte[] original = File.ReadAllBytes(path);
                         File.Move(path, path + ".saved");
-                        try { Reject(() => owner.RequireOrderOperationEvidence(operation, completion)); }
+                        try
+                        {
+                            Reject(() => owner.RequireOrderOperationEvidence(operation, completion));
+                            Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, completed));
+                        }
                         finally { File.Move(path + ".saved", path); }
                         File.WriteAllBytes(path, [.. original, 0x20]);
-                        try { Reject(() => owner.RequireOrderOperationEvidence(operation, completion)); }
+                        try
+                        {
+                            Reject(() => owner.RequireOrderOperationEvidence(operation, completion));
+                            Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, completed));
+                        }
                         finally { File.WriteAllBytes(path, original); }
                     }
 

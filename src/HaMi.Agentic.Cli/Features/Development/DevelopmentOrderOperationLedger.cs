@@ -59,7 +59,8 @@ internal sealed record DevelopmentOrderOperationLedger(
     string? LastEvidenceHash = null, OrderOperationLimits? CurrentLimits = null,
     string? ArchiveHash = null, string? PolicyHash = null, int FinalReserveSeconds = 0,
     int BudgetRevision = 0, OrderBudgetExhausted? BudgetStop = null, string ExtensionHashes = "",
-    OrderCandidateCheckpoint? LatestCandidate = null, OrderGuestOutcome? LatestGuestOutcome = null)
+    OrderCandidateCheckpoint? LatestCandidate = null, OrderGuestOutcome? LatestGuestOutcome = null,
+    OrderOperationReservation? LatestModelReservation = null, OrderOperationCompletion? LatestModelCompletion = null)
 {
     internal int Models => S01Models + S02Models;
     internal int Guests => S01Guests + S02Guests + FinalGuests;
@@ -245,8 +246,13 @@ internal sealed record DevelopmentOrderOperationLedger(
     // before persisting this event. A known failure is also a spent operation.
     internal DevelopmentOrderOperationLedger Complete(OrderOperationCompletion completion)
     {
-        OrderCheck.Require(Pending is { Kind: "model" }, "ORDER_MODEL_COMPLETION_REQUIRED");
-        return Settle(completion);
+        var reservation = Pending ?? throw new InvalidOperationException("ORDER_MODEL_COMPLETION_REQUIRED");
+        OrderCheck.Require(reservation.Kind == "model", "ORDER_MODEL_COMPLETION_REQUIRED");
+        return Settle(completion) with
+        {
+            LatestModelReservation = reservation,
+            LatestModelCompletion = completion
+        };
     }
 
     // Only the typed guest outcome may settle a guest reservation. The
