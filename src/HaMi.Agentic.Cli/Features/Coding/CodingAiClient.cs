@@ -118,7 +118,7 @@ internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy p
             || fake.Options.Tools?.Count != 0
             || fake.Options.AllowBackgroundResponses != false
             || fake.Options.RawRepresentationFactory?.Invoke(fake) is not CreateResponseOptions
-                { StoredOutputEnabled: false })
+            { StoredOutputEnabled: false })
             throw new InvalidOperationException(
                 "AI adapter did not preserve strict JSON format, no-tools, token budget or store=false.");
 #pragma warning restore OPENAI001

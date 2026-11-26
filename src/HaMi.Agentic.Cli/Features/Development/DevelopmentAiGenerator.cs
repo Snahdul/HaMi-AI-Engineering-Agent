@@ -418,7 +418,8 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
             Options = options;
             UserText = prompt.Text;
             return Task.FromResult(new ChatResponse(
-                new ChatMessage(ChatRole.Assistant, answer)) { FinishReason = finishReason ?? ChatFinishReason.Stop });
+                new ChatMessage(ChatRole.Assistant, answer))
+            { FinishReason = finishReason ?? ChatFinishReason.Stop });
         }
 
         public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
