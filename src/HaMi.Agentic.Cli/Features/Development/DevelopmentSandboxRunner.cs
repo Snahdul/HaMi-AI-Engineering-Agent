@@ -94,6 +94,17 @@ internal static class DevelopmentSandboxRunner
         RunReservedCoreAsync(repo, source, resultsDirectory, owner, acknowledged, reservation,
             SbxWithCancellationAsync, phaseObserver, cancellationToken, completedModel);
 
+    // Fixed reviewed S02 entry. The accepted predecessor view and its
+    // validated inputs are required in addition to the completed model view.
+    internal static Task<OrderGuestOutcome?> RunFormatterReservedAsync(string repo, string source, string resultsDirectory,
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acceptedLedger,
+        DevelopmentOrderOperationLedger completedModel, OrderFormatterInputs inputs,
+        DevelopmentOrderOperationLedger acknowledged, OrderOperationReservation reservation,
+        Action<string, string, long, int> phaseObserver, CancellationToken cancellationToken = default) =>
+        RunReservedCoreAsync(repo, source, resultsDirectory, owner, acknowledged, reservation,
+            SbxWithCancellationAsync, phaseObserver, cancellationToken, completedFormatterModel: completedModel,
+            acceptedCalculatorLedger: acceptedLedger, formatterInputs: inputs);
+
     // Offline probe supplies the transport, not a result or report path.
     // The production entry above fixes the executable and command surface.
     internal static async Task<OrderGuestOutcome?> RunReservedCoreAsync(string repo, string source, string resultsDirectory,
@@ -101,9 +112,16 @@ internal static class DevelopmentSandboxRunner
         OrderOperationReservation reservation,
         Func<TimeSpan, CancellationToken, string[], DevelopmentOrderSafetyWindow?, Task<SandboxProcess>> transport,
         Action<string, string, long, int>? phaseObserver = null, CancellationToken cancellationToken = default,
-        DevelopmentOrderOperationLedger? completedCalculatorModel = null)
+        DevelopmentOrderOperationLedger? completedCalculatorModel = null,
+        DevelopmentOrderOperationLedger? completedFormatterModel = null,
+        DevelopmentOrderOperationLedger? acceptedCalculatorLedger = null, OrderFormatterInputs? formatterInputs = null)
     {
+        OrderCheck.Require(completedFormatterModel is null
+            ? acceptedCalculatorLedger is null && formatterInputs is null
+            : completedCalculatorModel is null && acceptedCalculatorLedger is not null && formatterInputs is not null,
+            "ORDER_VERIFIER_CONTEXT");
         using var deadline = DevelopmentOrderDispatchDeadline.Start(acknowledged, reservation, cancellationToken);
+        string? verifier = null;
         if (completedCalculatorModel is not null)
         {
             var modelClaim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
@@ -111,6 +129,17 @@ internal static class DevelopmentSandboxRunner
             OrderCheck.Require(acknowledged == completedCalculatorModel.Reserve(modelClaim.JobId, limits, reservation),
                 "ORDER_CALCULATOR_VERIFIER_ACK");
             DevelopmentOrderCalculatorVerifier.RequireGuestSnapshot(owner, completedCalculatorModel, reservation, source);
+            verifier = DevelopmentOrderCalculatorVerifier.Id;
+        }
+        if (completedFormatterModel is not null)
+        {
+            var modelClaim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            var limits = completedFormatterModel.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+            OrderCheck.Require(acknowledged == completedFormatterModel.Reserve(modelClaim.JobId, limits, reservation),
+                "ORDER_FORMATTER_VERIFIER_ACK");
+            DevelopmentOrderFormatterVerifier.RequireGuestSnapshot(owner, acceptedCalculatorLedger!, completedFormatterModel,
+                formatterInputs!, reservation, source);
+            verifier = DevelopmentOrderFormatterVerifier.Id;
         }
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(owner.RequireArchivedOrder().BudgetPolicy));
         OrderCheck.Require(acknowledged.PolicyHash == policy.Sha256, "ORDER_BUDGET_POLICY_BINDING");
@@ -124,7 +153,7 @@ internal static class DevelopmentSandboxRunner
         owner.ConsumeOrderGuestDispatch(acknowledged, reservation);
         SandboxRunResult result = await RunCoreAsync(repo, source, "Demo.csproj", "run", resultsDirectory, phaseObserver, reservation,
             (limit, token, arguments) => transport(limit, token, arguments, safety), deadline, safety,
-            verifyCalculator: completedCalculatorModel is not null);
+            verifier: verifier);
         if (result.ExitCode != 0)
             return null;
 
@@ -159,11 +188,13 @@ internal static class DevelopmentSandboxRunner
         Action<string, string, long, int>? phaseObserver, OrderOperationReservation? reservation,
         Func<TimeSpan, CancellationToken, string[], Task<SandboxProcess>> transport,
         DevelopmentOrderDispatchDeadline? deadline = null, DevelopmentOrderSafetyWindow? safety = null,
-        bool verifyCalculator = false)
+        string? verifier = null)
     {
         OrderCheck.Require((reservation is null) == (safety is null), "ORDER_SAFETY_WINDOW_REQUIRED");
-        OrderCheck.Require(!verifyCalculator || reservation is { Step: "S01", Kind: "guest" }
-            && mode == "run" && project == "Demo.csproj", "ORDER_CALCULATOR_VERIFIER_MODE");
+        OrderCheck.Require(verifier is null || mode == "run" && project == "Demo.csproj"
+            && (verifier == DevelopmentOrderCalculatorVerifier.Id && reservation is { Step: "S01", Kind: "guest" }
+                || verifier == DevelopmentOrderFormatterVerifier.Id && reservation is { Step: "S02", Kind: "guest" }),
+            "ORDER_VERIFIER_MODE");
         Task<SandboxProcess> InvokeAsync(TimeSpan limit, params string[] arguments) =>
             transport(deadline?.Limit(limit) ?? limit, deadline?.Token ?? CancellationToken.None, arguments);
         // The safety window is independent of the business cancellation,
@@ -385,12 +416,16 @@ internal static class DevelopmentSandboxRunner
                     executionMs = watch.ElapsedMilliseconds;
                 }
                 execution = checkedCode.ExitCode;
-                if (verifyCalculator && execution == 0)
+                if (verifier is not null && execution == 0)
                 {
-                    if (DevelopmentOrderCalculatorVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error))
-                        verifiedBy = DevelopmentOrderCalculatorVerifier.Id;
+                    bool matches = verifier == DevelopmentOrderCalculatorVerifier.Id
+                        ? DevelopmentOrderCalculatorVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error)
+                        : DevelopmentOrderFormatterVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error);
+                    if (matches)
+                        verifiedBy = verifier;
                     else
-                        error = "ORDER_CALCULATOR_VERIFIER_STDOUT";
+                        error = verifier == DevelopmentOrderCalculatorVerifier.Id
+                            ? "ORDER_CALCULATOR_VERIFIER_STDOUT" : "ORDER_FORMATTER_VERIFIER_STDOUT";
                 }
                 await WriteOutputAsync(reportDir, "execution.log", checkedCode);
                 ProgressMessage($"Ausführung beendet: Exitcode {execution} ({executionMs / 1000.0:F2} s).", "EXECUTION_COMPLETED", execution);
@@ -470,7 +505,7 @@ internal static class DevelopmentSandboxRunner
                 sandboxRemovalSucceeded ? 0 : 1);
         }
 
-        var report = new SandboxRunReport(reservation is null ? 1 : verifyCalculator ? 5 : 4, id, guestProject, mode, restore, build,
+        var report = new SandboxRunReport(reservation is null ? 1 : verifier is null ? 4 : 5, id, guestProject, mode, restore, build,
             execution, timedOut, createMs, copyMs, restoreMs, buildMs, executionMs, cleanupMs, lifecycle.ElapsedMilliseconds,
             sandboxRemovalSucceeded, error, verifiedSnapshotHash, verifiedBy);
         string reportPath = Path.Combine(reportDir, "report.json");
@@ -497,7 +532,7 @@ internal static class DevelopmentSandboxRunner
         }
         bool succeeded = error is null && sandboxRemovalSucceeded && restore == 0 && build == 0
             && (mode == "build" || execution == 0)
-            && (!verifyCalculator || verifiedBy == DevelopmentOrderCalculatorVerifier.Id);
+            && (verifier is null || verifiedBy == verifier);
         safety?.Check();
         return new(succeeded ? 0 : 1, succeeded ? reportBytes : null);
     }

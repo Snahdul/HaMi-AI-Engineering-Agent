@@ -1089,9 +1089,9 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: calculator guest proposal binds exactly four trusted input files and protected candidate bytes; substituted, missing, extra and tampered snapshots rejected.");
     }
 
-    private static void TestFormatterSnapshot(DevelopmentJobStateStore.Lease owner,
+    private static async Task TestFormatterSnapshotAsync(DevelopmentJobStateStore.Lease owner,
         DevelopmentOrderOperationLedger accepted, DevelopmentOrderOperationLedger completed,
-        OrderFormatterInputs inputs, string root, string journal)
+        OrderFormatterInputs inputs, string root, string journal, bool expectSuccess)
     {
         var files = DevelopmentOrderFormatterVerifier.Prepare(owner, accepted, completed, inputs);
         var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
@@ -1165,6 +1165,134 @@ internal static class PersistenceBridgeProbe
         if (File.Exists(journal + ".guest-dispatch-4") || File.Exists(journal + ".s02"))
             throw new InvalidOperationException("Formatter snapshot dispatched or accepted work.");
         Console.WriteLine("BRIDGE_PHASE: exact five-file S02 verifier snapshot binds accepted predecessor and generated formatter; substitutions rejected.");
+
+        // Synthetic acknowledged guest view only. Actual S02 guest
+        // admission/Persist and acceptance are separate subsequent slices.
+        string results = Path.Combine(root, "formatter-results");
+        Directory.CreateDirectory(results);
+        string id = DevelopmentOrderGuestReconciliation.RunId(proposal);
+        string name = "hami-code-" + id[..12];
+        string absent = "error: sandbox '" + name + "' not found";
+        string healthy = string.Join('\n', new[]
+        {
+            "Name: " + name, "Agent: shell", "Workspace: -", "Clone source: -",
+            "Configured host mounts: none", "Secrets: none", "MCP mode: static",
+            "MCP servers: none", "Ports: none published", "Network policy: global (local policy)",
+            "Auth mode: not configured", "State: running"
+        });
+        string guestOutput = string.Join('\0', DevelopmentOrderSnapshot.RequireGuestRecords(source, "Demo.csproj", proposal.SnapshotHash))
+            + "\0" + DevelopmentOrderSnapshot.GuestEndMarker + "\0";
+        string raw = Path.Combine(results, "reports", "hami-code-" + id, "report.json");
+        bool created = false, removed = false;
+        int calls = 0, executions = 0, afterReturn = 0;
+        byte[]? originalReport = null;
+        Task<DevelopmentSandboxRunner.SandboxProcess> Transport(TimeSpan limit, CancellationToken token,
+            string[] args, DevelopmentOrderSafetyWindow? safety)
+        {
+            token.ThrowIfCancellationRequested();
+            if (safety is null || limit <= TimeSpan.Zero)
+                throw new InvalidOperationException("Missing reserved transport safety window.");
+            calls++;
+            DevelopmentSandboxRunner.SandboxProcess response = new(0, "", "");
+            switch (args[0])
+            {
+                case "inspect":
+                    if (args.Contains("--json", StringComparer.Ordinal))
+                        response = new(0, System.Text.Json.JsonSerializer.Serialize(new { name, id = "formatter-backend-id" }), "");
+                    else if (!created || removed)
+                    {
+                        response = new(1, "", absent);
+                        if (File.Exists(raw))
+                        {
+                            afterReturn++;
+                            originalReport = File.ReadAllBytes(raw);
+                            File.WriteAllText(raw, "not the captured report");
+                        }
+                    }
+                    else
+                        response = new(0, healthy, "");
+                    break;
+                case "create": created = true; break;
+                case "rm": removed = true; break;
+                case "policy": response = new(1, "Denied: " + args[^1] + " default deny", ""); break;
+                case "exec":
+                    if (args.Any(a => a.Contains("CREDENTIAL_ENV=clean", StringComparison.Ordinal)))
+                        response = new(0, "CREDENTIAL_ENV=clean", "");
+                    else if (args.Contains("--version", StringComparer.Ordinal))
+                        response = new(0, "11.0.100", "");
+                    else if (args.Contains("hami-snapshot", StringComparer.Ordinal))
+                        response = new(0, guestOutput, "");
+                    else if (args.Contains("run", StringComparer.Ordinal))
+                    {
+                        executions++;
+                        response = new(0, (expectSuccess ? DevelopmentOrderFormatterVerifier.ExpectedStdout
+                            : DevelopmentOrderCalculatorVerifier.ExpectedStdout) + "\n", "");
+                    }
+                    break;
+            }
+            return Task.FromResult(response);
+        }
+
+        Task<OrderGuestOutcome?> Run(DevelopmentOrderOperationLedger ack, OrderFormatterInputs handover) =>
+            DevelopmentSandboxRunner.RunReservedCoreAsync(CalculatorRepository(root), source, results, owner,
+                ack, proposal, Transport, (_, _, _, _) => { }, completedFormatterModel: completed,
+                acceptedCalculatorLedger: accepted, formatterInputs: handover);
+
+        async Task RejectRunAsync(DevelopmentOrderOperationLedger ack, OrderFormatterInputs handover)
+        {
+            bool rejected = false;
+            try { _ = await Run(ack, handover); }
+            catch (InvalidOperationException) { rejected = true; }
+            if (!rejected)
+                throw new InvalidOperationException("Invalid formatter runner context accepted.");
+        }
+
+        await RejectRunAsync(admitted with { ReservedSeconds = 0 }, inputs);
+        await RejectRunAsync(admitted, inputs with { Calculator = [.. inputs.Calculator, 0x20] });
+        string program = Path.Combine(source, "Program.cs");
+        byte[] programBytes = File.ReadAllBytes(program);
+        File.WriteAllBytes(program, [.. programBytes, 0x20]);
+        try { await RejectRunAsync(admitted, inputs); }
+        finally { File.WriteAllBytes(program, programBytes); }
+        if (calls != 0 || File.Exists(journal + ".guest-dispatch-4"))
+            throw new InvalidOperationException("Invalid formatter context reached dispatch.");
+
+        var outcome = await Run(admitted, inputs);
+        if ((outcome is not null) != expectSuccess || !created || !removed || executions != 1
+            || afterReturn != (expectSuccess ? 1 : 0) || !File.Exists(raw))
+            throw new InvalidOperationException("Formatter runner outcome differs.");
+        owner.RequireOrderGuestDispatch(proposal);
+        string reportSlot = journal + ".guest-report-4";
+        if (outcome is not null)
+        {
+            byte[] captured = owner.RequireOrderGuestReport(outcome, proposal);
+            if (originalReport is null || !captured.SequenceEqual(originalReport)
+                || captured.SequenceEqual(File.ReadAllBytes(raw))
+                || !DevelopmentOrderGuestReconciliation.IsFormatterReport(proposal, captured)
+                || DevelopmentOrderGuestReconciliation.IsCalculatorReport(proposal, captured))
+                throw new InvalidOperationException("Formatter report provenance differs.");
+            var report = System.Text.Json.JsonSerializer.Deserialize<DevelopmentSandboxRunner.SandboxRunReport>(captured,
+                new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web))
+                ?? throw new InvalidOperationException("Formatter report missing.");
+            byte[] Encode(DevelopmentSandboxRunner.SandboxRunReport value) =>
+                System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(value,
+                    new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web) { WriteIndented = true });
+            if (DevelopmentOrderGuestReconciliation.IsSuccessfulReport(proposal,
+                    Encode(report with { VerifiedBy = DevelopmentOrderCalculatorVerifier.Id }))
+                || DevelopmentOrderGuestReconciliation.IsFormatterReport(proposal,
+                    Encode(report with { SchemaVersion = 4, VerifiedBy = null }))
+                || DevelopmentOrderGuestReconciliation.IsSuccessfulReport(proposal,
+                    Encode(report with { SnapshotHash = new string('A', 64) })))
+                throw new InvalidOperationException("Incorrect formatter report accepted.");
+        }
+        else if (File.Exists(reportSlot))
+            throw new InvalidOperationException("Wrong semantic output produced protected evidence.");
+        int before = calls;
+        await RejectRunAsync(admitted, inputs);
+        if (calls != before || File.Exists(journal + ".s02") || completed.Pending is not null)
+            throw new InvalidOperationException("Formatter guest repeated or accepted a step.");
+        Console.WriteLine("BRIDGE_PHASE: S02 controlled runner " + (expectSuccess ? "success" : "wrong marker")
+            + "; exact input, one-shot dispatch, semantic report and cleanup checked.");
     }
 
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
@@ -1379,7 +1507,8 @@ internal static class PersistenceBridgeProbe
                         !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(calculatorEvidence[i])).Any()
                         || File.Exists(calculatorPrefix + "guest-dispatch-3")
                         || File.Exists(calculatorPrefix + "model-dispatch-4")
-                        || File.Exists(calculatorPrefix + "guest-dispatch-4")
+                        || File.Exists(calculatorPrefix + "guest-dispatch-4") != !formatterScenario
+                        || File.Exists(calculatorPrefix + "guest-report-4") != (scenario == "model-accepted")
                         || File.Exists(calculatorPrefix + "snapshot-4") != !formatterScenario
                         || formatterSlots.Where((slot, i) => File.Exists(calculatorPrefix + slot) != expectedFormatterSlots[i]
                             || expectedFormatterSlots[i] && !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(formatterEvidence[i])).Any()
@@ -2072,7 +2201,8 @@ internal static class PersistenceBridgeProbe
                     }
                     else
                     {
-                        TestFormatterSnapshot(owner, beforeFormatter, current.Ledger, recoveredInputs, root, database);
+                        await TestFormatterSnapshotAsync(owner, beforeFormatter, current.Ledger, recoveredInputs, root, database,
+                            mode == "bridge-model-resume-accepted");
                     }
 
                     if (DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger) != recovered

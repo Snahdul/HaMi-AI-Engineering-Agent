@@ -88,8 +88,9 @@ internal static class DevelopmentOrderGuestReconciliation
         // fields, alternate encodings, and trailing or truncated data.
         if (report is null || !reportBytes.AsSpan().SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(report, ReportOptions))
             || !(report.SchemaVersion == 4 && report.VerifiedBy is null
-                || report.SchemaVersion == 5 && reservation.Step == "S01"
-                    && report.VerifiedBy == DevelopmentOrderCalculatorVerifier.Id)
+                || report.SchemaVersion == 5 && (reservation.Step == "S01"
+                    && report.VerifiedBy == DevelopmentOrderCalculatorVerifier.Id
+                    || reservation.Step == "S02" && report.VerifiedBy == DevelopmentOrderFormatterVerifier.Id))
             || report.RunId != runId || report.Project != "Demo.csproj"
             || report.SnapshotHash != reservation.SnapshotHash
             || report.Mode != "run" || report.TimedOut || !report.SandboxRemovalSucceeded || report.Error is not null
@@ -108,6 +109,11 @@ internal static class DevelopmentOrderGuestReconciliation
         IsSuccessfulReport(reservation, reportBytes)
         && JsonSerializer.Deserialize<DevelopmentSandboxRunner.SandboxRunReport>(reportBytes, ReportOptions)
             is { SchemaVersion: 5, VerifiedBy: DevelopmentOrderCalculatorVerifier.Id };
+
+    internal static bool IsFormatterReport(OrderOperationReservation reservation, byte[] reportBytes) =>
+        IsSuccessfulReport(reservation, reportBytes)
+        && JsonSerializer.Deserialize<DevelopmentSandboxRunner.SandboxRunReport>(reportBytes, ReportOptions)
+            is { SchemaVersion: 5, VerifiedBy: DevelopmentOrderFormatterVerifier.Id };
 
     // Replay can fold an acknowledged outcome descriptor; the host must
     // compare against independently obtained evidence before append or reuse.
