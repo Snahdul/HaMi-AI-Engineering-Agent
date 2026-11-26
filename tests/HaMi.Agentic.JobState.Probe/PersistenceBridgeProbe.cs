@@ -1089,7 +1089,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: calculator guest proposal binds exactly four trusted input files and protected candidate bytes; substituted, missing, extra and tampered snapshots rejected.");
     }
 
-    private static void TestIntegrationSnapshot(DevelopmentJobStateStore.Lease owner,
+    private static async Task TestIntegrationSnapshotAsync(DevelopmentJobStateStore.Lease owner,
         OrderPairHistory history, OrderPairObservation observed, string root, string journal)
     {
         var files = DevelopmentOrderIntegrationVerifier.Prepare(owner, history, observed);
@@ -1184,6 +1184,127 @@ internal static class PersistenceBridgeProbe
             || ledger.Pending is not null || ledger.FinalGuests != 0)
             throw new InvalidOperationException("Integration snapshot preparation dispatched or accepted work.");
         Console.WriteLine("BRIDGE_PHASE: exact four-file FINAL snapshot binds both accepted candidates and original integration harness; substitutions rejected.");
+
+        // Synthetic acknowledged guest view in this slice. Actual FINAL
+        // admission/Persist and process recovery are separate increments.
+        string results = Path.Combine(root, "integration-results");
+        Directory.CreateDirectory(results);
+        string id = DevelopmentOrderGuestReconciliation.RunId(proposal);
+        string name = "hami-code-" + id[..12];
+        string absent = "error: sandbox '" + name + "' not found";
+        string healthy = string.Join('\n', new[]
+        {
+            "Name: " + name, "Agent: shell", "Workspace: -", "Clone source: -",
+            "Configured host mounts: none", "Secrets: none", "MCP mode: static",
+            "MCP servers: none", "Ports: none published", "Network policy: global (local policy)",
+            "Auth mode: not configured", "State: running"
+        });
+        string guestOutput = string.Join('\0', DevelopmentOrderSnapshot.RequireGuestRecords(source, "Demo.csproj", proposal.SnapshotHash))
+            + "\0" + DevelopmentOrderSnapshot.GuestEndMarker + "\0";
+        string raw = Path.Combine(results, "reports", "hami-code-" + id, "report.json");
+        bool created = false, removed = false;
+        int calls = 0, executions = 0, afterReturn = 0;
+        byte[]? originalReport = null;
+        Task<DevelopmentSandboxRunner.SandboxProcess> Transport(TimeSpan limit, CancellationToken token,
+            string[] args, DevelopmentOrderSafetyWindow? safety)
+        {
+            token.ThrowIfCancellationRequested();
+            if (safety is null || limit <= TimeSpan.Zero)
+                throw new InvalidOperationException("Missing reserved transport safety window.");
+            calls++;
+            DevelopmentSandboxRunner.SandboxProcess response = new(0, "", "");
+            switch (args[0])
+            {
+                case "inspect":
+                    if (args.Contains("--json", StringComparer.Ordinal))
+                        response = new(0, System.Text.Json.JsonSerializer.Serialize(new { name, id = "integration-backend-id" }), "");
+                    else if (!created || removed)
+                    {
+                        response = new(1, "", absent);
+                        if (File.Exists(raw))
+                        {
+                            afterReturn++;
+                            originalReport = File.ReadAllBytes(raw);
+                            File.WriteAllText(raw, "not the captured report");
+                        }
+                    }
+                    else
+                        response = new(0, healthy, "");
+                    break;
+                case "create": created = true; break;
+                case "rm": removed = true; break;
+                case "policy": response = new(1, "Denied: " + args[^1] + " default deny", ""); break;
+                case "exec":
+                    if (args.Any(a => a.Contains("CREDENTIAL_ENV=clean", StringComparison.Ordinal)))
+                        response = new(0, "CREDENTIAL_ENV=clean", "");
+                    else if (args.Contains("--version", StringComparer.Ordinal))
+                        response = new(0, "11.0.100", "");
+                    else if (args.Contains("hami-snapshot", StringComparer.Ordinal))
+                        response = new(0, guestOutput, "");
+                    else if (args.Contains("run", StringComparer.Ordinal))
+                    {
+                        executions++;
+                        response = new(0, DevelopmentOrderIntegrationVerifier.ExpectedStdout + "\n", "");
+                    }
+                    break;
+            }
+            return Task.FromResult(response);
+        }
+
+        Task<OrderGuestOutcome?> Run(DevelopmentOrderOperationLedger ack, OrderPairHistory? pair, OrderPairObservation? observation) =>
+            DevelopmentSandboxRunner.RunReservedCoreAsync(CalculatorRepository(root), source, results, owner,
+                ack, proposal, Transport, (_, _, _, _) => { }, pairHistory: pair, pairObservation: observation);
+
+        async Task RejectRunAsync(DevelopmentOrderOperationLedger ack, OrderPairHistory? pair, OrderPairObservation? observation)
+        {
+            bool rejected = false;
+            try { _ = await Run(ack, pair, observation); }
+            catch (InvalidOperationException) { rejected = true; }
+            if (!rejected)
+                throw new InvalidOperationException("Invalid integration runner context accepted.");
+        }
+
+        await RejectRunAsync(admitted, null, null);
+        await RejectRunAsync(admitted, history, null);
+        await RejectRunAsync(admitted with { ReservedSeconds = 0 }, history, observed);
+        await RejectRunAsync(admitted, history, observed with { Formatter = null });
+        byte[] programBytes = File.ReadAllBytes(program);
+        File.WriteAllBytes(program, [.. programBytes, 0x20]);
+        try { await RejectRunAsync(admitted, history, observed); }
+        finally { File.WriteAllBytes(program, programBytes); }
+        if (calls != 0 || File.Exists(journal + ".guest-dispatch-5"))
+            throw new InvalidOperationException("Invalid integration context reached dispatch.");
+
+        var outcome = await Run(admitted, history, observed)
+            ?? throw new InvalidOperationException("Integration runner returned no outcome.");
+        owner.RequireOrderGuestDispatch(proposal);
+        byte[] captured = owner.RequireOrderGuestReport(outcome, proposal);
+        if (!created || !removed || executions != 1 || afterReturn != 1 || originalReport is null
+            || !captured.SequenceEqual(originalReport) || captured.SequenceEqual(File.ReadAllBytes(raw))
+            || !DevelopmentOrderGuestReconciliation.IsIntegrationReport(proposal, captured)
+            || DevelopmentOrderGuestReconciliation.IsCalculatorReport(proposal, captured)
+            || DevelopmentOrderGuestReconciliation.IsFormatterReport(proposal, captured))
+            throw new InvalidOperationException("Integration report provenance differs.");
+        var report = System.Text.Json.JsonSerializer.Deserialize<DevelopmentSandboxRunner.SandboxRunReport>(captured,
+            new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web))
+            ?? throw new InvalidOperationException("Integration report missing.");
+        byte[] Encode(DevelopmentSandboxRunner.SandboxRunReport value) =>
+            System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(value,
+                new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web) { WriteIndented = true });
+        if (DevelopmentOrderGuestReconciliation.IsSuccessfulReport(proposal,
+                Encode(report with { VerifiedBy = DevelopmentOrderFormatterVerifier.Id }))
+            || DevelopmentOrderGuestReconciliation.IsSuccessfulReport(proposal,
+                Encode(report with { VerifiedBy = DevelopmentOrderCalculatorVerifier.Id }))
+            || DevelopmentOrderGuestReconciliation.IsIntegrationReport(proposal,
+                Encode(report with { SchemaVersion = 4, VerifiedBy = null }))
+            || DevelopmentOrderGuestReconciliation.IsSuccessfulReport(proposal,
+                Encode(report with { SnapshotHash = new string('A', 64) })))
+            throw new InvalidOperationException("Incorrect integration report accepted.");
+        int before = calls;
+        await RejectRunAsync(admitted, history, observed);
+        if (calls != before || ledger.Pending is not null || ledger.FinalGuests != 0)
+            throw new InvalidOperationException("Integration runner repeated or changed acceptance history.");
+        Console.WriteLine("BRIDGE_PHASE: FINAL controlled runner captures exact integration report, rejects generic or wrong verifier context and duplicate dispatch.");
     }
 
     private static async Task TestFormatterSnapshotAsync(DevelopmentJobStateStore.Lease owner,
@@ -1754,9 +1875,9 @@ internal static class PersistenceBridgeProbe
                     if (formatterGuestScenario && (guestSlots.Where((slot, i) =>
                             File.Exists(calculatorPrefix + slot) != expectedGuestSlots[i]
                             || expectedGuestSlots[i] && !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(guestEvidence[i])).Any()
-                        || File.Exists(calculatorPrefix + "guest-dispatch-5")
+                        || File.Exists(calculatorPrefix + "guest-dispatch-5") != (scenario == "model-accepted")
                         || File.Exists(calculatorPrefix + "snapshot-5") != (scenario == "model-accepted")
-                        || File.Exists(calculatorPrefix + "guest-report-5")))
+                        || File.Exists(calculatorPrefix + "guest-report-5") != (scenario == "model-accepted")))
                         throw new InvalidOperationException("Formatter guest recovery changed protected slots.");
                 }
                 finally
@@ -2428,8 +2549,8 @@ internal static class PersistenceBridgeProbe
                     var pairObservation = new OrderPairObservation(ObserveCalculatorFixture(owner, claim, outcome),
                         freshFormatterObservation, ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root),
                         DevelopmentOrderCalculatorVerifier.ReadStagedPair(Path.Combine(root, "formatter-stage")));
-                    TestIntegrationSnapshot(owner, pairHistory, pairObservation, root, database);
-                    if (await ReadAsync() != current || File.Exists(database + ".guest-dispatch-5"))
+                    await TestIntegrationSnapshotAsync(owner, pairHistory, pairObservation, root, database);
+                    if (await ReadAsync() != current || File.Exists(database + ".guest-dispatch-6"))
                         throw new InvalidOperationException("Formatter acceptance recovery mutated journal.");
                     Console.WriteLine("BRIDGE_PHASE: persisted S02 acceptance recovered after process kill; exact predecessor, candidate, guest evidence and budget unchanged.");
                     Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");

@@ -105,6 +105,15 @@ internal static class DevelopmentSandboxRunner
             SbxWithCancellationAsync, phaseObserver, cancellationToken, completedFormatterModel: completedModel,
             acceptedCalculatorLedger: acceptedLedger, formatterInputs: inputs);
 
+    // Fixed FINAL entry: both accepted step histories and their independent
+    // observations are mandatory before consuming the guest dispatch.
+    internal static Task<OrderGuestOutcome?> RunIntegrationReservedAsync(string repo, string source, string resultsDirectory,
+        DevelopmentJobStateStore.Lease owner, OrderPairHistory history, OrderPairObservation observed,
+        DevelopmentOrderOperationLedger acknowledged, OrderOperationReservation reservation,
+        Action<string, string, long, int> phaseObserver, CancellationToken cancellationToken = default) =>
+        RunReservedCoreAsync(repo, source, resultsDirectory, owner, acknowledged, reservation,
+            SbxWithCancellationAsync, phaseObserver, cancellationToken, pairHistory: history, pairObservation: observed);
+
     // Offline probe supplies the transport, not a result or report path.
     // The production entry above fixes the executable and command surface.
     internal static async Task<OrderGuestOutcome?> RunReservedCoreAsync(string repo, string source, string resultsDirectory,
@@ -114,8 +123,13 @@ internal static class DevelopmentSandboxRunner
         Action<string, string, long, int>? phaseObserver = null, CancellationToken cancellationToken = default,
         DevelopmentOrderOperationLedger? completedCalculatorModel = null,
         DevelopmentOrderOperationLedger? completedFormatterModel = null,
-        DevelopmentOrderOperationLedger? acceptedCalculatorLedger = null, OrderFormatterInputs? formatterInputs = null)
+        DevelopmentOrderOperationLedger? acceptedCalculatorLedger = null, OrderFormatterInputs? formatterInputs = null,
+        OrderPairHistory? pairHistory = null, OrderPairObservation? pairObservation = null)
     {
+        OrderCheck.Require((pairHistory is null) == (pairObservation is null)
+            && (pairHistory is null || completedCalculatorModel is null && completedFormatterModel is null
+                && acceptedCalculatorLedger is null && formatterInputs is null)
+            && (acknowledged.AcceptedS02 is null || pairHistory is not null), "ORDER_FINAL_VERIFIER_CONTEXT");
         OrderCheck.Require(completedFormatterModel is null
             ? acceptedCalculatorLedger is null && formatterInputs is null
             : completedCalculatorModel is null && acceptedCalculatorLedger is not null && formatterInputs is not null,
@@ -140,6 +154,15 @@ internal static class DevelopmentSandboxRunner
             DevelopmentOrderFormatterVerifier.RequireGuestSnapshot(owner, acceptedCalculatorLedger!, completedFormatterModel,
                 formatterInputs!, reservation, source);
             verifier = DevelopmentOrderFormatterVerifier.Id;
+        }
+        if (pairHistory is not null)
+        {
+            var pairClaim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            var limits = pairHistory.AcceptedPair.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+            OrderCheck.Require(acknowledged == pairHistory.AcceptedPair.Reserve(pairClaim.JobId, limits, reservation),
+                "ORDER_FINAL_VERIFIER_ACK");
+            DevelopmentOrderIntegrationVerifier.RequireGuestSnapshot(owner, pairHistory, pairObservation!, reservation, source);
+            verifier = DevelopmentOrderIntegrationVerifier.Id;
         }
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(owner.RequireArchivedOrder().BudgetPolicy));
         OrderCheck.Require(acknowledged.PolicyHash == policy.Sha256, "ORDER_BUDGET_POLICY_BINDING");
@@ -193,7 +216,8 @@ internal static class DevelopmentSandboxRunner
         OrderCheck.Require((reservation is null) == (safety is null), "ORDER_SAFETY_WINDOW_REQUIRED");
         OrderCheck.Require(verifier is null || mode == "run" && project == "Demo.csproj"
             && (verifier == DevelopmentOrderCalculatorVerifier.Id && reservation is { Step: "S01", Kind: "guest" }
-                || verifier == DevelopmentOrderFormatterVerifier.Id && reservation is { Step: "S02", Kind: "guest" }),
+                || verifier == DevelopmentOrderFormatterVerifier.Id && reservation is { Step: "S02", Kind: "guest" }
+                || verifier == DevelopmentOrderIntegrationVerifier.Id && reservation is { Step: "FINAL", Kind: "guest" }),
             "ORDER_VERIFIER_MODE");
         Task<SandboxProcess> InvokeAsync(TimeSpan limit, params string[] arguments) =>
             transport(deadline?.Limit(limit) ?? limit, deadline?.Token ?? CancellationToken.None, arguments);
@@ -418,14 +442,22 @@ internal static class DevelopmentSandboxRunner
                 execution = checkedCode.ExitCode;
                 if (verifier is not null && execution == 0)
                 {
-                    bool matches = verifier == DevelopmentOrderCalculatorVerifier.Id
-                        ? DevelopmentOrderCalculatorVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error)
-                        : DevelopmentOrderFormatterVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error);
+                    bool matches = verifier switch
+                    {
+                        DevelopmentOrderCalculatorVerifier.Id => DevelopmentOrderCalculatorVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error),
+                        DevelopmentOrderFormatterVerifier.Id => DevelopmentOrderFormatterVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error),
+                        DevelopmentOrderIntegrationVerifier.Id => DevelopmentOrderIntegrationVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error),
+                        _ => false
+                    };
                     if (matches)
                         verifiedBy = verifier;
                     else
-                        error = verifier == DevelopmentOrderCalculatorVerifier.Id
-                            ? "ORDER_CALCULATOR_VERIFIER_STDOUT" : "ORDER_FORMATTER_VERIFIER_STDOUT";
+                        error = verifier switch
+                        {
+                            DevelopmentOrderCalculatorVerifier.Id => "ORDER_CALCULATOR_VERIFIER_STDOUT",
+                            DevelopmentOrderFormatterVerifier.Id => "ORDER_FORMATTER_VERIFIER_STDOUT",
+                            _ => "ORDER_FINAL_VERIFIER_STDOUT"
+                        };
                 }
                 await WriteOutputAsync(reportDir, "execution.log", checkedCode);
                 ProgressMessage($"Ausführung beendet: Exitcode {execution} ({executionMs / 1000.0:F2} s).", "EXECUTION_COMPLETED", execution);
