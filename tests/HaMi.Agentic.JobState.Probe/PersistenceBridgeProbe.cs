@@ -528,7 +528,8 @@ internal static class PersistenceBridgeProbe
     {
         byte[] baseline = Encoding.UTF8.GetBytes("internal static class PairCalculator { }");
         const string candidate = "internal static class PairCalculator { /* generated */ }";
-        foreach (string scenario in new[] { "success", "adapter-success", "wrong-config", "wrong-input", "wrong-assignment", "cancelled", "unknown", "invalid-source" })
+        foreach (string scenario in new[] { "success", "adapter-success", "adapter-rejected", "adapter-empty",
+            "adapter-length", "wrong-config", "wrong-input", "wrong-assignment", "cancelled", "unknown", "invalid-source" })
         {
             string root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
             var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
@@ -541,10 +542,16 @@ internal static class PersistenceBridgeProbe
                 DevelopmentOrderClaim claim = owner.CurrentOrder ?? throw new InvalidOperationException("Claim missing.");
                 var archive = owner.RequireArchivedOrder();
                 var assignment = FixtureAssignment(claim, archive, "S01");
-                using var scripted = new DevelopmentAiGenerator.ScriptedChatClient(
-                    System.Text.Json.JsonSerializer.Serialize(new { source = candidate }));
+                string payload = scenario switch
+                {
+                    "adapter-rejected" => """{"source":"one","source":"two"}""",
+                    "adapter-empty" => """{"source":""}""",
+                    _ => System.Text.Json.JsonSerializer.Serialize(new { source = candidate })
+                };
+                using var scripted = new DevelopmentAiGenerator.ScriptedChatClient(payload,
+                    scenario == "adapter-length" ? Microsoft.Extensions.AI.ChatFinishReason.Length : null);
                 var generator = new DevelopmentAiGenerator(scripted, "fixture-model");
-                bool adapter = scenario is "adapter-success" or "wrong-config";
+                bool adapter = scenario.StartsWith("adapter-", StringComparison.Ordinal) || scenario == "wrong-config";
                 if (adapter)
                     assignment = assignment with
                     {
@@ -576,7 +583,7 @@ internal static class PersistenceBridgeProbe
                     return Task.FromResult(scenario == "invalid-source" ? "\0" : candidate);
                 }
 
-                OrderGeneratedModelResult? generated = null;
+                OrderModelDispatchResult? generated = null;
                 bool rejected = false;
                 try
                 {
@@ -590,17 +597,21 @@ internal static class PersistenceBridgeProbe
                 }
                 catch (InvalidOperationException) when (scenario is "wrong-input" or "wrong-assignment" or "invalid-source" or "wrong-config")
                 { rejected = true; }
+                catch (InvalidOperationException ex) when (scenario == "adapter-length" && ex.Message == "ORDER_MODEL_RESPONSE_INCOMPLETE")
+                { rejected = true; }
                 catch (OperationCanceledException) when (scenario == "cancelled") { rejected = true; }
                 catch (IOException) when (scenario == "unknown") { rejected = true; }
 
                 bool dispatched = scenario is not ("wrong-input" or "wrong-assignment" or "wrong-config");
                 bool success = scenario is "success" or "adapter-success";
+                bool knownFailure = scenario is "adapter-rejected" or "adapter-empty";
+                bool completedResponse = success || knownFailure;
                 string receipt = journal + ".model-dispatch-1";
                 string artifact = journal + ".candidate-1";
                 string evidencePath = journal + ".evidence-1";
-                if (rejected == success || (generated is not null) != success
+                if (rejected == completedResponse || (generated is not null) != completedResponse
                     || calls + scripted.Calls != (dispatched ? 1 : 0) || File.Exists(receipt) != dispatched
-                    || File.Exists(artifact) != success || File.Exists(evidencePath) != success
+                    || File.Exists(artifact) != success || File.Exists(evidencePath) != completedResponse
                     || ledger.Pending != operation || ledger.Models != 1)
                     throw new InvalidOperationException("Model dispatch outcome differs: " + scenario);
                 if (dispatched)
@@ -617,7 +628,7 @@ internal static class PersistenceBridgeProbe
                 if (success)
                 {
                     var result = generated ?? throw new InvalidOperationException("Missing generated result.");
-                    var recorded = result.Candidate;
+                    var recorded = result.Candidate ?? throw new InvalidOperationException("Missing generated candidate.");
                     var completion = result.Completion;
                     var evidence = owner.RequireOrderOperationEvidence(operation, completion, recorded);
                     var checkpointed = ledger.Checkpoint(claim, recorded);
@@ -649,6 +660,42 @@ internal static class PersistenceBridgeProbe
                     if (ledger.Pending != operation || File.Exists(journal + ".s01"))
                         throw new InvalidOperationException("Private model evidence became journal or step authority.");
                 }
+                if (knownFailure)
+                {
+                    var result = generated ?? throw new InvalidOperationException("Missing rejected-response result.");
+                    var completion = result.Completion;
+                    var evidence = owner.RequireOrderOperationEvidence(operation, completion);
+                    var completed = ledger.Complete(completion);
+                    if (result.Candidate is not null || evidence.Observer != OrderOperationEvidence.RejectedResponseObserver
+                        || evidence.OutputHash is not null || completed.Pending is not null || completed.Models != 1
+                        || completed.ReservedSeconds != 30 || completed.LatestCandidate is not null
+                        || completed.LastOutcome != "failed" || ledger.Pending != operation)
+                        throw new InvalidOperationException("Rejected response became candidate or changed charge.");
+
+                    var next = completed.Propose(claim.JobId, "S01", "model", 30,
+                        DateTime.UtcNow.Ticks, OrderOperationAgentBinding.FromAssignment(assignment));
+                    var retry = completed.Reserve(claim.JobId, archive.EffectiveLimits, next);
+                    if (retry.Models != 2 || retry.ReservedSeconds != 60 || retry.Pending != next
+                        || next.OperationId == operation.OperationId || scripted.Calls != 1)
+                        throw new InvalidOperationException("Known failure retry was not a new charged reservation.");
+                    Reject(() => owner.StoreOrderOperationEvidence(evidence));
+                    Reject(() => owner.StoreOrderOperationEvidence(evidence with { Observer = OrderOperationEvidence.GeneratedObserver }));
+                    File.WriteAllBytes(artifact, Encoding.UTF8.GetBytes(candidate));
+                    try { Reject(() => owner.RequireOrderOperationEvidence(operation, completion)); }
+                    finally { File.Delete(artifact); }
+                    foreach (string path in new[] { receipt, evidencePath })
+                    {
+                        byte[] original = File.ReadAllBytes(path);
+                        File.Move(path, path + ".saved");
+                        try { Reject(() => owner.RequireOrderOperationEvidence(operation, completion)); }
+                        finally { File.Move(path + ".saved", path); }
+                        File.WriteAllBytes(path, [.. original, 0x20]);
+                        try { Reject(() => owner.RequireOrderOperationEvidence(operation, completion)); }
+                        finally { File.WriteAllBytes(path, original); }
+                    }
+
+                    _ = owner.RequireOrderOperationEvidence(operation, completion);
+                }
                 owner.ValidateOrderJournalFiles();
             }
             finally
@@ -657,7 +704,7 @@ internal static class PersistenceBridgeProbe
             }
         }
 
-        Console.WriteLine("PASS: reserved S01 model dispatch, generated candidate and host outcome, exact replay evidence, unknown/cancelled remain pending.");
+        Console.WriteLine("PASS: reserved S01 model dispatch, generated and terminal-rejected host outcomes, exact evidence, unknown/cancelled remain pending.");
     }
 
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,

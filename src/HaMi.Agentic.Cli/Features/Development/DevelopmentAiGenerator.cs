@@ -121,26 +121,36 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
         ChatResponse result = await client.GetResponseAsync(
             [new ChatMessage(ChatRole.User, prompt.User)], options, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
-        OrderCheck.Require(result.FinishReason == ChatFinishReason.Stop
-            && !string.IsNullOrWhiteSpace(result.Text) && result.Text.Length <= 128 * 1024,
-            "ORDER_MODEL_RESPONSE_INCOMPLETE");
+        // Only an explicitly completed response can become a known
+        // unusable outcome. A missing/other finish reason is ambiguous.
+        OrderCheck.Require(result.FinishReason == ChatFinishReason.Stop, "ORDER_MODEL_RESPONSE_INCOMPLETE");
+        if (string.IsNullOrWhiteSpace(result.Text) || result.Text.Length > 128 * 1024)
+            throw new S01TerminalResponseRejectedException("ORDER_MODEL_RESPONSE_SCHEMA");
         try
         {
             using JsonDocument document = JsonDocument.Parse(result.Text, new JsonDocumentOptions { MaxDepth = 4 });
             JsonElement root = document.RootElement;
-            OrderCheck.Require(root.ValueKind == JsonValueKind.Object, "ORDER_MODEL_RESPONSE_SCHEMA");
+            if (root.ValueKind != JsonValueKind.Object)
+                throw new S01TerminalResponseRejectedException("ORDER_MODEL_RESPONSE_SCHEMA");
             JsonProperty[] fields = root.EnumerateObject().ToArray();
-            OrderCheck.Require(fields.Length == 1 && fields[0].Name == "source"
-                && fields[0].Value.ValueKind == JsonValueKind.String, "ORDER_MODEL_RESPONSE_SCHEMA");
+            if (fields.Length != 1 || fields[0].Name != "source"
+                || fields[0].Value.ValueKind != JsonValueKind.String)
+                throw new S01TerminalResponseRejectedException("ORDER_MODEL_RESPONSE_SCHEMA");
             string source = fields[0].Value.GetString() ?? "";
-            OrderCheck.Require(!string.IsNullOrWhiteSpace(source)
-                && source.Length <= OrderCandidateCheckpoint.MaxBytes, "ORDER_MODEL_SOURCE_SIZE");
+            if (string.IsNullOrWhiteSpace(source) || source.Length > OrderCandidateCheckpoint.MaxBytes)
+                throw new S01TerminalResponseRejectedException("ORDER_MODEL_SOURCE_SIZE");
             return source;
         }
         catch (JsonException)
         {
-            throw new InvalidOperationException("ORDER_MODEL_RESPONSE_SCHEMA");
+            throw new S01TerminalResponseRejectedException("ORDER_MODEL_RESPONSE_SCHEMA");
         }
+    }
+
+    // Emitted only after the trusted client returned Stop and the host
+    // rejected the response shape. No response text or provider diagnostic.
+    internal sealed class S01TerminalResponseRejectedException(string code) : InvalidOperationException(code)
+    {
     }
 
     internal static IChatClient CreateReservedClient(string key, PipelineTransport? testTransport = null)
@@ -176,7 +186,7 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
             using var invalid = new ScriptedChatClient(payload);
             bool rejected = false;
             try { _ = await new DevelopmentAiGenerator(invalid, "fixture-model").GenerateS01Async(baseline, cancel.Token); }
-            catch (InvalidOperationException ex) when (ex.Message == "ORDER_MODEL_RESPONSE_SCHEMA") { rejected = true; }
+            catch (S01TerminalResponseRejectedException ex) when (ex.Message == "ORDER_MODEL_RESPONSE_SCHEMA") { rejected = true; }
             if (!rejected || invalid.Calls != 1)
                 throw new InvalidOperationException("Invalid S01 response was accepted.");
         }

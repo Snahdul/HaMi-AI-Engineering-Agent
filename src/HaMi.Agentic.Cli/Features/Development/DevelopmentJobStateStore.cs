@@ -477,6 +477,16 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 return;
             }
 
+            if (evidence.Observer == OrderOperationEvidence.RejectedResponseObserver)
+            {
+                DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+                int sequence = evidence.ValidateBinding(claim);
+                OrderCheck.Require(generated is null && !RegularFileExists(CandidatePath(sequence)),
+                    "ORDER_MODEL_REJECTED_RESPONSE_CANDIDATE");
+                RequireOrderModelDispatch(evidence.Reservation);
+                return;
+            }
+
             OrderCheck.Require(generated is not null, "ORDER_MODEL_EVIDENCE_CANDIDATE");
             var candidate = generated ?? throw new InvalidOperationException("ORDER_MODEL_EVIDENCE_CANDIDATE");
             OrderCheck.Require(candidate.ArchiveHash == evidence.ArchiveHash

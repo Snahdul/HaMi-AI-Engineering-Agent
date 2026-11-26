@@ -2,7 +2,7 @@ using System.Text;
 
 namespace HaMi.Agentic.Cli.Features.Development;
 
-internal sealed record OrderGeneratedModelResult(OrderCandidateCheckpoint Candidate, OrderOperationCompletion Completion);
+internal sealed record OrderModelDispatchResult(OrderCandidateCheckpoint? Candidate, OrderOperationCompletion Completion);
 
 // S01 only: a trusted host supplies a verified assignment and a single
 // tool-free source-extraction transport. This is not a provider factory,
@@ -13,7 +13,7 @@ internal static class DevelopmentOrderModelDispatch
 
     // Real composition fixes the retry-disabled provider factory. The
     // injected core below is used only by the controlled offline probe.
-    internal static async Task<OrderGeneratedModelResult> RunS01Async(
+    internal static async Task<OrderModelDispatchResult> RunS01Async(
         DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
         OrderOperationReservation reservation, DevelopmentOrderApproval approval,
         OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, byte[] baseline,
@@ -26,7 +26,7 @@ internal static class DevelopmentOrderModelDispatch
             baseline, generator, cancellationToken);
     }
 
-    internal static Task<OrderGeneratedModelResult> RunS01CoreAsync(
+    internal static Task<OrderModelDispatchResult> RunS01CoreAsync(
         DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
         OrderOperationReservation reservation, DevelopmentOrderApproval approval,
         OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, byte[] baseline,
@@ -40,7 +40,7 @@ internal static class DevelopmentOrderModelDispatch
             baseline, generator.GenerateS01Async, cancellationToken);
     }
 
-    internal static async Task<OrderGeneratedModelResult> RunAsync(
+    internal static async Task<OrderModelDispatchResult> RunAsync(
         DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
         OrderOperationReservation reservation, DevelopmentOrderApproval approval,
         OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, byte[] baseline,
@@ -74,7 +74,27 @@ internal static class DevelopmentOrderModelDispatch
         // The adapter must be asynchronous and honour cancellation. A
         // provider may ignore cancellation or complete remotely afterwards;
         // never turn that ambiguity into a retryable failure.
-        string generated = await generate(source, deadline.Token).WaitAsync(deadline.Token);
+        string generated;
+        try
+        {
+            generated = await generate(source, deadline.Token).WaitAsync(deadline.Token);
+        }
+        catch (DevelopmentAiGenerator.S01TerminalResponseRejectedException)
+        {
+            // This catch covers only the trusted response adapter, not
+            // preflight, storage, generic transport or verifier failures.
+            _ = deadline.Limit(TimeSpan.FromSeconds(1));
+            var failed = new OrderOperationEvidence(2, claim.ArchiveHash, reservation,
+                OrderOperationEvidence.RejectedResponseObserver, "failed", claim.Binding.CalculatorBaselineHash,
+                claim.Binding.CalculatorBaselineHash, null, DateTime.UtcNow.Ticks);
+            var failedCompletion = failed.Completion();
+            _ = acknowledged.Complete(failedCompletion);
+            OrderCheck.Require(owner.StoreOrderOperationEvidence(failed) == failedCompletion,
+                "ORDER_MODEL_EVIDENCE_COMPLETION");
+            _ = deadline.Limit(TimeSpan.FromSeconds(1));
+            return new(null, failedCompletion);
+        }
+
         _ = deadline.Limit(TimeSpan.FromSeconds(1));
         OrderCheck.Require(!string.IsNullOrWhiteSpace(generated) && generated.Length <= OrderCandidateCheckpoint.MaxBytes,
             "ORDER_MODEL_SOURCE_SIZE");
