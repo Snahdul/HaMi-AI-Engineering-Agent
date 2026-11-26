@@ -1111,6 +1111,18 @@ internal static class PersistenceBridgeProbe
             history with { AcceptedCalculator = history.CalculatorGuest }, observed));
         Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner,
             history with { AcceptedPair = history.AcceptedPair with { ReservedSeconds = 0 } }, observed));
+        if (history.FormatterContinuation is { } extensionHistory)
+        {
+            Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner,
+                history with { FormatterContinuation = null }, observed));
+            Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner,
+                history with { AcceptedCalculator = extensionHistory.Resumed }, observed));
+            Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner,
+                history with
+                {
+                    FormatterContinuation = extensionHistory with { Events = extensionHistory.Events.Reverse().ToArray() }
+                }, observed));
+        }
         Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner, history, observed with { Calculator = null }));
         Reject(() => DevelopmentOrderIntegrationVerifier.Prepare(owner, history, observed with { Formatter = null }));
         var changedPair = observed.PairStage.ToDictionary(file => file.Key, file => file.Value.ToArray(), StringComparer.Ordinal);
@@ -1567,7 +1579,7 @@ internal static class PersistenceBridgeProbe
             if (Correlate(completedGuest, observed) != candidate
                 || completedGuest.AcceptedS01 != inputs.CalculatorAcceptance
                 || completedGuest.Pending is not null || completedGuest.Sequence != 4
-                || completedGuest.ReservedSeconds != 80)
+                || completedGuest.ReservedSeconds != completed.ReservedSeconds + proposal.ReservedSeconds)
                 throw new InvalidOperationException("Formatter guest history differs.");
             Reject(() => Correlate(admitted, observed));
             Reject(() => Correlate(completed, observed));
@@ -1660,9 +1672,9 @@ internal static class PersistenceBridgeProbe
             bool softScenario = scenario == "soft-stop";
             bool formatterScenario = scenario.StartsWith("model-formatter-", StringComparison.Ordinal);
             bool finalScenario = scenario.StartsWith("model-final-", StringComparison.Ordinal);
-            bool successfulFormatter = scenario == "model-accepted" || finalScenario;
-            bool calculatorScenario = formatterScenario || successfulFormatter || scenario == "model-verified";
             bool budgetGenerated = scenario == "model-formatter-budget-hard-generated";
+            bool successfulFormatter = scenario == "model-accepted" || finalScenario || budgetGenerated;
+            bool calculatorScenario = formatterScenario || successfulFormatter || scenario == "model-verified";
             bool formatterBudgetStop = budgetGenerated || scenario is "model-formatter-budget-hard" or "model-formatter-budget-soft";
             bool formatterHasCandidate = !formatterBudgetStop
                 && scenario is not ("model-formatter-receipt" or "model-formatter-rejected" or "model-formatter-rejected-orphan");
@@ -1852,7 +1864,7 @@ internal static class PersistenceBridgeProbe
                 // Both generated formatter cases now persist guest admission.
                 // Kill the third owner at success or unresolved wrong marker.
                 string[] guestSlots = ["snapshot-4", "guest-dispatch-4", "guest-report-4"];
-                bool formatterGuestScenario = calculatorScenario && !formatterScenario;
+                bool formatterGuestScenario = calculatorScenario && (!formatterScenario || budgetGenerated);
                 bool[] expectedGuestSlots = [true, true, successfulFormatter];
                 byte[][] guestEvidence = [];
                 if (formatterGuestScenario)
@@ -1916,7 +1928,7 @@ internal static class PersistenceBridgeProbe
 
                 string[] finalSlots = ["snapshot-5", "guest-dispatch-5", "guest-report-5"];
                 bool[] expectedFinalSlots = [successfulFormatter, successfulFormatter && scenario != "model-final-pre-dispatch",
-                    scenario is "model-accepted" or "model-final-orphan"];
+                    budgetGenerated || scenario is "model-accepted" or "model-final-orphan"];
                 byte[][] finalEvidence = [];
                 if (successfulFormatter)
                 {
@@ -1948,7 +1960,7 @@ internal static class PersistenceBridgeProbe
                     await expectOwnership(root, "ACQUIRED:order");
                 }
 
-                if (scenario == "model-accepted")
+                if (scenario == "model-accepted" || budgetGenerated)
                 {
                     using Process terminalChild = start(resumeMode, root);
                     Task<string> terminalErrors = terminalChild.StandardError.ReadToEndAsync();
@@ -2016,9 +2028,9 @@ internal static class PersistenceBridgeProbe
                         !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(calculatorEvidence[i])).Any()
                         || File.Exists(calculatorPrefix + "guest-dispatch-3")
                         || File.Exists(calculatorPrefix + "model-dispatch-4")
-                        || File.Exists(calculatorPrefix + "guest-dispatch-4") != !formatterScenario
+                        || File.Exists(calculatorPrefix + "guest-dispatch-4") != formatterGuestScenario
                         || File.Exists(calculatorPrefix + "guest-report-4") != successfulFormatter
-                        || File.Exists(calculatorPrefix + "snapshot-4") != !formatterScenario
+                        || File.Exists(calculatorPrefix + "snapshot-4") != formatterGuestScenario
                         || formatterSlots.Where((slot, i) => File.Exists(calculatorPrefix + slot) != expectedFormatterSlots[i]
                             || expectedFormatterSlots[i] && !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(formatterEvidence[i])).Any()
                         || formatterHasCandidate && !File.ReadAllBytes(calculatorPrefix + "candidate-3")
@@ -2073,6 +2085,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: pair budget extensions persisted; insufficient and unreviewed extension blocked, sufficient extension permits one fresh reservation; process kill recovers pending without dispatch.");
         Console.WriteLine("PASS: S02 verifier handover validates exact replayed stop and extension history; omitted, reordered or substituted events and changed charges rejected.");
         Console.WriteLine("PASS: fresh S02 model dispatch after budget extension completes once; process kill recovers exact verifier preparation, original acceptance and cumulative charges.");
+        Console.WriteLine("PASS: extended budget pair completes S02 guest, acceptance, FINAL and terminal recovery with exact original and resumed journal views; no repeated effects.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2173,7 +2186,9 @@ internal static class PersistenceBridgeProbe
         const string finalModePrefix = "bridge-model-resume-final-";
         string finalCrash = mode.StartsWith(finalModePrefix, StringComparison.Ordinal)
             ? mode[finalModePrefix.Length..] : "completed";
-        bool successfulFormatter = mode == "bridge-model-resume-accepted" || finalCrash != "completed";
+        bool successfulFormatter = mode == "bridge-model-resume-accepted" || finalCrash != "completed" || generateAfterExtension;
+        int expectedFormatterModelCharges = generateAfterExtension ? 160 : 70;
+        int expectedPairCharges = expectedFormatterModelCharges + 10;
         bool calculatorScenario = successfulFormatter || mode is "bridge-model-accepted"
             or "bridge-model-verified" or "bridge-model-resume-verified" || mode.StartsWith(formatterModePrefix, StringComparison.Ordinal);
         bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
@@ -2736,8 +2751,14 @@ internal static class PersistenceBridgeProbe
                 var outcome = guest.LatestGuestOutcome ?? throw new InvalidOperationException("Guest outcome missing.");
                 OrderFormatterInputs ReadFormatterInputs(DevelopmentOrderOperationLedger state,
                     OrderGitBaseline baseline, IReadOnlyDictionary<string, byte[]> pair) =>
-                    DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state,
-                        ObserveCalculatorFixture(owner, claim, outcome), baseline, pair);
+                    current.PairBudgetOrigin is { } original
+                        ? DevelopmentOrderFormatterVerifier.RequireInputsAfterBudgetContinuation(owner, model, guest,
+                            original, state, current.PairBudgetEvents
+                                ?? throw new InvalidOperationException("Pair budget events missing."),
+                            [new("S02", "guest", 10), new("FINAL", "guest", state.FinalReserveSeconds)],
+                            ObserveCalculatorFixture(owner, claim, outcome), baseline, pair)
+                        : DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state,
+                            ObserveCalculatorFixture(owner, claim, outcome), baseline, pair);
 
                 if (nextAction == OrderWorkflowAction.AwaitBudgetExtension)
                 {
@@ -2909,14 +2930,13 @@ internal static class PersistenceBridgeProbe
                         throw new InvalidOperationException("Resumed formatter verification history differs.");
                     Reject(() => DevelopmentOrderFormatterVerifier.Prepare(owner, originalAcceptance, current.Ledger, afterExtensionInputs));
                     Console.WriteLine("BRIDGE_PHASE: completed S02 model after extension recovered; verifier uses exact resumed history and original S01 evidence.");
-                    Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
-                    return 0;
                 }
 
                 // The initial budget fixture must reach GenerateFormatter and
                 // persist its stop before the pending-reservation recovery.
                 if (formatterCrash is ("budget-hard" or "budget-soft")
-                    && nextAction == OrderWorkflowAction.ReconcilePending)
+                    && nextAction == OrderWorkflowAction.ReconcilePending
+                    && current.Ledger.Pending is { Step: "S02", Kind: "model" })
                 {
                     var pairOrigin = current.PairBudgetOrigin
                         ?? throw new InvalidOperationException("Original pair acceptance missing.");
@@ -3056,14 +3076,16 @@ internal static class PersistenceBridgeProbe
                             terminalObservations, completedFinal, freshTerminal) != finalOutcome
                         || current.Ledger != completedFinal.AcceptOrder(claim, terminal)
                         || current.Ledger.Sequence != 5 || current.Ledger.Models != 2 || current.Ledger.Guests != 3
-                        || current.Ledger.ReservedSeconds != 80 + terminalHistory.AcceptedPair.FinalReserveSeconds
+                        || current.Ledger.ReservedSeconds != expectedPairCharges + terminalHistory.AcceptedPair.FinalReserveSeconds
+                        || current.Ledger.BudgetRevision != (generateAfterExtension ? 2 : 0)
                         || current.Ledger.StartedUtcTicks != terminalHistory.AcceptedPair.StartedUtcTicks
                         || current.Ledger.Pending is not null || File.Exists(database + ".s02"))
                         throw new InvalidOperationException("Replayed terminal acceptance differs.");
                     var repeatFinal = current.Ledger.Propose(claim.JobId, "FINAL", "guest",
                         terminalHistory.AcceptedPair.FinalReserveSeconds, DateTime.UtcNow.Ticks, null, finalOutcome.Reservation.SnapshotHash);
-                    Reject(() => current.Ledger.BudgetDenial(claim.JobId, limits, repeatFinal));
-                    Reject(() => current.Ledger.Reserve(claim.JobId, limits, repeatFinal));
+                    var terminalLimits = current.Ledger.CurrentLimits ?? throw new InvalidOperationException("Terminal budget missing.");
+                    Reject(() => current.Ledger.BudgetDenial(claim.JobId, terminalLimits, repeatFinal));
+                    Reject(() => current.Ledger.Reserve(claim.JobId, terminalLimits, repeatFinal));
                     Reject(() => current.Ledger.AcceptOrder(claim, terminal));
                     Reject(() => owner.ConsumeOrderGuestDispatch(current.Ledger, finalOutcome.Reservation));
                     bool terminalRejected = false;
@@ -3072,6 +3094,8 @@ internal static class PersistenceBridgeProbe
                     if (!terminalRejected || await ReadAsync() != current || File.Exists(database + ".guest-dispatch-6"))
                         throw new InvalidOperationException("Terminal recovery mutated journal.");
                     Console.WriteLine("BRIDGE_PHASE: terminal order acceptance recovered after process kill; all evidence retained and new effects blocked.");
+                    if (generateAfterExtension)
+                        Console.WriteLine("BRIDGE_PHASE: extended budget pair recovered terminal; original S01, S02 and FINAL evidence and cumulative charges verified.");
                     Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
                     return 0;
                 }
@@ -3093,7 +3117,7 @@ internal static class PersistenceBridgeProbe
                             current.Ledger, finalObservation) != recordedFinal
                         || current.Ledger.Sequence != 5 || current.Ledger.Models != 2 || current.Ledger.Guests != 3
                         || current.Ledger.FinalGuests != 1 || current.Ledger.Pending is not null
-                        || current.Ledger.ReservedSeconds != 80 + history.AcceptedPair.FinalReserveSeconds
+                        || current.Ledger.ReservedSeconds != expectedPairCharges + history.AcceptedPair.FinalReserveSeconds
                         || current.Ledger.StartedUtcTicks != history.AcceptedPair.StartedUtcTicks
                         || current.Ledger.AcceptedS01 != history.AcceptedPair.AcceptedS01
                         || current.Ledger.AcceptedS02 != history.AcceptedPair.AcceptedS02)
@@ -3102,7 +3126,8 @@ internal static class PersistenceBridgeProbe
                     Reject(() => owner.ConsumeOrderGuestDispatch(current.Ledger, recordedFinal.Reservation));
                     var repeatedFinal = current.Ledger.Propose(claim.JobId, "FINAL", "guest",
                         history.AcceptedPair.FinalReserveSeconds, DateTime.UtcNow.Ticks, null, recordedFinal.Reservation.SnapshotHash);
-                    Reject(() => current.Ledger.Reserve(claim.JobId, limits, repeatedFinal));
+                    var finalLimits = current.Ledger.CurrentLimits ?? throw new InvalidOperationException("Final budget missing.");
+                    Reject(() => current.Ledger.Reserve(claim.JobId, finalLimits, repeatedFinal));
                     bool rejectedFinal = false;
                     try { _ = await actor.Ask<BridgeState>(new RecordIntegrationGuest(recordedFinal), Deadline); }
                     catch (InvalidOperationException) { rejectedFinal = true; }
@@ -3184,13 +3209,14 @@ internal static class PersistenceBridgeProbe
                         DevelopmentOrderCalculatorVerifier.ReadStagedPair(Path.Combine(root, "formatter-stage")));
                     if (formatterAcceptance.Predecessor != accepted || formatterAcceptance.Candidate != acceptedFormatter
                         || current.Ledger != historicalFormatterGuest.AcceptS02(claim, formatterAcceptance)
-                        || current.Ledger.Sequence != 4 || current.Ledger.ReservedSeconds != 80
+                        || current.Ledger.Sequence != 4 || current.Ledger.ReservedSeconds != expectedPairCharges
                         || current.Ledger.Models != 2 || current.Ledger.Guests != 2
                         || current.Ledger.StartedUtcTicks != beforeFormatterAcceptance.StartedUtcTicks
                         || current.Ledger.Pending is not null || File.Exists(database + ".s02"))
                         throw new InvalidOperationException("Replayed formatter acceptance differs.");
                     var repeatedFormatterRequest = ProposeModel(current.Ledger, "S02", 1, DateTime.UtcNow.Ticks);
-                    Reject(() => current.Ledger.Reserve(claim.JobId, limits, repeatedFormatterRequest));
+                    var pairLimits = current.Ledger.CurrentLimits ?? throw new InvalidOperationException("Pair budget missing.");
+                    Reject(() => current.Ledger.Reserve(claim.JobId, pairLimits, repeatedFormatterRequest));
                     Reject(() => current.Ledger.AcceptS02(claim, formatterAcceptance));
                     try
                     {
@@ -3198,8 +3224,7 @@ internal static class PersistenceBridgeProbe
                         throw new InvalidOperationException("Duplicate formatter acceptance returned success.");
                     }
                     catch (InvalidOperationException ex) when (ex.Message == "Formatter acceptance blocked.") { }
-                    var pairHistory = new OrderPairHistory(model, guest, beforeFormatterAcceptance,
-                        historicalFormatterModel, historicalFormatterGuest, current.Ledger);
+                    var pairHistory = RequirePairHistory(current);
                     var pairObservation = new OrderPairObservation(ObserveCalculatorFixture(owner, claim, outcome),
                         freshFormatterObservation, ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root),
                         DevelopmentOrderCalculatorVerifier.ReadStagedPair(Path.Combine(root, "formatter-stage")));
@@ -3251,7 +3276,7 @@ internal static class PersistenceBridgeProbe
                     if (current.Stage != (success ? 12 : 11)
                         || (current.Ledger.Pending is not null) == success
                         || current.Ledger.Sequence != 4 || current.Ledger.Models != 2 || current.Ledger.Guests != 2
-                        || current.Ledger.ReservedSeconds != 80 || current.Ledger.AcceptedS01 != accepted
+                        || current.Ledger.ReservedSeconds != expectedPairCharges || current.Ledger.AcceptedS01 != accepted
                         || current.Ledger.StartedUtcTicks != beforeFormatter.StartedUtcTicks
                         || File.Exists(database + ".guest-report-4") != success || File.Exists(database + ".s02"))
                         throw new InvalidOperationException("Recovered formatter guest journal differs.");
@@ -3362,7 +3387,7 @@ internal static class PersistenceBridgeProbe
                     var recovered = DevelopmentOrderCompletion.ObserveModel(owner, current.Ledger);
                     var expectedStatus = formatterCrash switch
                     {
-                        "generated" => OrderModelRecoveryStatus.Generated,
+                        "generated" or "budget-hard" when generateAfterExtension || formatterCrash == "generated" => OrderModelRecoveryStatus.Generated,
                         "rejected" => OrderModelRecoveryStatus.Rejected,
                         "receipt" or "orphan" or "checkpoint" or "rejected-orphan" => OrderModelRecoveryStatus.PendingBlocked,
                         _ => throw new InvalidOperationException("Unknown formatter crash mode.")
@@ -3377,15 +3402,15 @@ internal static class PersistenceBridgeProbe
                     };
                     if (nextAction != expectedAction)
                         throw new InvalidOperationException("Formatter workflow action differs.");
-                    bool hasCandidate = formatterCrash is "generated" or "orphan" or "checkpoint";
+                    bool hasCandidate = generateAfterExtension || formatterCrash is "generated" or "orphan" or "checkpoint";
                     bool hasEvidence = formatterCrash != "receipt";
                     var candidate = recovered.Candidate;
                     if (recovered.Status != expectedStatus || (candidate is not null) != (expectedStatus == OrderModelRecoveryStatus.Generated)
                         || (recovered.Completion is null) != blocked || (current.Ledger.Pending is not null) != blocked
                         || current.Stage != (blocked ? 9 : 10) || recovered.Reservation.Step != "S02"
-                        || (current.Ledger.LatestCandidate?.Step == "S02") != (formatterCrash is "checkpoint" or "generated")
+                        || (current.Ledger.LatestCandidate?.Step == "S02") != (generateAfterExtension || formatterCrash is "checkpoint" or "generated")
                         || beforeFormatter.AcceptedS01 != accepted || current.Ledger.Sequence != 3
-                        || current.Ledger.Models != 2 || current.Ledger.Guests != 1 || current.Ledger.ReservedSeconds != 70
+                        || current.Ledger.Models != 2 || current.Ledger.Guests != 1 || current.Ledger.ReservedSeconds != expectedFormatterModelCharges
                         || current.Ledger.StartedUtcTicks != beforeFormatter.StartedUtcTicks
                         || File.Exists(database + ".candidate-3") != hasCandidate
                         || File.Exists(database + ".evidence-3") != hasEvidence)
@@ -4305,11 +4330,15 @@ internal static class PersistenceBridgeProbe
     private static OrderPairHistory RequirePairHistory(BridgeState state) =>
         new(state.CalculatorModel ?? throw new InvalidOperationException("Calculator model history missing."),
             state.CalculatorGuest ?? throw new InvalidOperationException("Calculator guest history missing."),
-            state.FormatterInputState ?? throw new InvalidOperationException("Calculator acceptance history missing."),
+            state.PairBudgetOrigin ?? state.FormatterInputState ?? throw new InvalidOperationException("Calculator acceptance history missing."),
             state.FormatterModel ?? throw new InvalidOperationException("Formatter model history missing."),
             state.FormatterGuest ?? throw new InvalidOperationException("Formatter guest history missing."),
             state.PairAcceptance ?? (state.Stage == 13 ? state.Ledger
-                : throw new InvalidOperationException("Pair acceptance history missing.")));
+                : throw new InvalidOperationException("Pair acceptance history missing.")),
+            state.PairBudgetOrigin is null ? null : new OrderFormatterBudgetContinuation(
+                state.FormatterInputState ?? throw new InvalidOperationException("Resumed formatter admission missing."),
+                state.PairBudgetEvents ?? throw new InvalidOperationException("Pair budget events missing."),
+                [new("S02", "guest", 10), new("FINAL", "guest", state.Ledger.FinalReserveSeconds)]));
 
     private static OrderPairObservation ObservePairFixture(DevelopmentJobStateStore.Lease owner,
         DevelopmentOrderClaim claim, OrderPairHistory history, string root)
@@ -4511,9 +4540,16 @@ internal static class PersistenceBridgeProbe
                 var guest = state.CalculatorGuest ?? throw new InvalidOperationException("Calculator guest history missing.");
                 var accepted = state.FormatterInputState ?? throw new InvalidOperationException("Accepted input history missing.");
                 var outcome = guest.LatestGuestOutcome ?? throw new InvalidOperationException("Calculator outcome missing.");
-                return DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, accepted,
-                    ObserveCalculatorFixture(owner, claim, outcome), ObserveCalculatorBaseline(root, claim.Binding),
-                    CalculatorRecoveryPair(root));
+                return state.PairBudgetOrigin is { } original
+                    ? DevelopmentOrderFormatterVerifier.RequireInputsAfterBudgetContinuation(owner, model, guest,
+                        original, accepted, state.PairBudgetEvents
+                            ?? throw new InvalidOperationException("Pair budget events missing."),
+                        [new("S02", "guest", 10), new("FINAL", "guest", state.Ledger.FinalReserveSeconds)],
+                        ObserveCalculatorFixture(owner, claim, outcome), ObserveCalculatorBaseline(root, claim.Binding),
+                        CalculatorRecoveryPair(root))
+                    : DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, accepted,
+                        ObserveCalculatorFixture(owner, claim, outcome), ObserveCalculatorBaseline(root, claim.Binding),
+                        CalculatorRecoveryPair(root));
             }
 
             Command<AdmitFormatterGuest>(command =>

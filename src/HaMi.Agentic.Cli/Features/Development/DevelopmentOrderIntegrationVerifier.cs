@@ -2,10 +2,13 @@ namespace HaMi.Agentic.Cli.Features.Development;
 
 // Genuine historical replay views; the host must supply these under the
 // exclusive issue lease, not synthesize them from private files.
+internal sealed record OrderFormatterBudgetContinuation(DevelopmentOrderOperationLedger Resumed,
+    IReadOnlyList<string> Events, IReadOnlyList<OrderRequiredOperation> RequiredAfter);
+
 internal sealed record OrderPairHistory(DevelopmentOrderOperationLedger CalculatorModel,
     DevelopmentOrderOperationLedger CalculatorGuest, DevelopmentOrderOperationLedger AcceptedCalculator,
     DevelopmentOrderOperationLedger FormatterModel, DevelopmentOrderOperationLedger FormatterGuest,
-    DevelopmentOrderOperationLedger AcceptedPair);
+    DevelopmentOrderOperationLedger AcceptedPair, OrderFormatterBudgetContinuation? FormatterContinuation = null);
 
 // Independent host observations, not generated test data or authority to
 // dispatch. Both staging views must be exclusively host controlled.
@@ -30,9 +33,15 @@ internal static class DevelopmentOrderIntegrationVerifier
             && history.AcceptedPair.AcceptedS01 == accepted.Predecessor
             && history.AcceptedCalculator.AcceptedS01 == accepted.Predecessor,
             "ORDER_FINAL_ACCEPTANCE_HISTORY");
-        var inputs = DevelopmentOrderFormatterVerifier.RequireInputs(owner, history.CalculatorModel,
-            history.CalculatorGuest, history.AcceptedCalculator, observed.Calculator, observed.Baseline, observed.CalculatorStage);
-        var formatter = DevelopmentOrderFormatterVerifier.RequireCompletedGuest(owner, history.AcceptedCalculator,
+        var continuation = history.FormatterContinuation;
+        var admission = continuation?.Resumed ?? history.AcceptedCalculator;
+        var inputs = continuation is null
+            ? DevelopmentOrderFormatterVerifier.RequireInputs(owner, history.CalculatorModel,
+                history.CalculatorGuest, history.AcceptedCalculator, observed.Calculator, observed.Baseline, observed.CalculatorStage)
+            : DevelopmentOrderFormatterVerifier.RequireInputsAfterBudgetContinuation(owner, history.CalculatorModel,
+                history.CalculatorGuest, history.AcceptedCalculator, admission, continuation.Events, continuation.RequiredAfter,
+                observed.Calculator, observed.Baseline, observed.CalculatorStage);
+        var formatter = DevelopmentOrderFormatterVerifier.RequireCompletedGuest(owner, admission,
             history.FormatterModel, history.FormatterGuest, inputs, observed.Formatter);
         OrderCheck.Require(formatter == accepted.Candidate && inputs.CalculatorAcceptance == accepted.Predecessor,
             "ORDER_FINAL_ACCEPTANCE_CANDIDATES");
