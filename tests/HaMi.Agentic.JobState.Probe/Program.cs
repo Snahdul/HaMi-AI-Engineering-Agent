@@ -36,7 +36,7 @@ internal static class Program
             return 0;
         }
 
-        if (args.Length == 2 && args[0] is "hold" or "probe" or "bridge-hold" or "bridge-unknown" or "bridge-resume" or "bridge-blocked" or "bridge-failed" or "bridge-retry" or "bridge-guest" or "bridge-guest-resume" or "bridge-probe")
+        if (args.Length == 2 && args[0] is "hold" or "probe" or "bridge-hold" or "bridge-unknown" or "bridge-resume" or "bridge-blocked" or "bridge-failed" or "bridge-retry" or "bridge-guest" or "bridge-guest-resume" or "bridge-guest-unknown" or "bridge-guest-blocked" or "bridge-guest-orphan" or "bridge-guest-orphan-resume" or "bridge-probe")
         {
             string root = args[1];
             string name = Path.GetFileName(root);
@@ -62,7 +62,8 @@ internal static class Program
                         Console.WriteLine(owner.CurrentOrder is null ? "ACQUIRED:none" : "ACQUIRED:order");
                         return 0;
                     }
-                    if (args[0] is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest")
+                    if (args[0] is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
+                        or "bridge-guest-unknown" or "bridge-guest-orphan")
                         owner.ClaimOrder(Guid.NewGuid().ToString("N"), PersistenceBridgeProbe.FixtureApproval());
                     _ = owner.RequireArchivedOrder();
                     return await PersistenceBridgeProbe.RunChildAsync(args[0], root, owner);

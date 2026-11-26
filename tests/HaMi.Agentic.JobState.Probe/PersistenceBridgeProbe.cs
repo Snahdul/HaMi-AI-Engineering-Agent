@@ -125,22 +125,35 @@ internal static class PersistenceBridgeProbe
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
         Func<string, string, Task> expectOwnership)
     {
-        foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest" })
+        foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan" })
         {
             bool unknown = scenario == "unknown";
             bool failed = scenario == "failed";
             bool guest = scenario == "guest";
+            bool guestUnknown = scenario == "guest-unknown";
+            bool guestOrphan = scenario == "guest-orphan";
+            bool guestScenario = guest || guestUnknown || guestOrphan;
+            (string firstMode, string firstMarker, string resumeMode, string resumeMarker) = scenario switch
+            {
+                "accepted" => ("bridge-hold", "BRIDGE_ACCEPTED", "bridge-resume", "BRIDGE_COMPLETED"),
+                "unknown" => ("bridge-unknown", "BRIDGE_RESERVED", "bridge-blocked", "BRIDGE_BLOCKED"),
+                "failed" => ("bridge-failed", "BRIDGE_FAILED", "bridge-retry", "BRIDGE_RETRIED"),
+                "guest" => ("bridge-guest", "BRIDGE_GUEST", "bridge-guest-resume", "BRIDGE_GUEST_RECOVERED"),
+                "guest-unknown" => ("bridge-guest-unknown", "BRIDGE_GUEST_UNKNOWN", "bridge-guest-blocked", "BRIDGE_GUEST_BLOCKED"),
+                "guest-orphan" => ("bridge-guest-orphan", "BRIDGE_GUEST_ORPHAN", "bridge-guest-orphan-resume", "BRIDGE_GUEST_ORPHAN_RECOVERED"),
+                _ => throw new InvalidOperationException("Unknown bridge scenario.")
+            };
             string root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
             var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
             try
             {
-                using (Process child = start(guest ? "bridge-guest" : unknown ? "bridge-unknown" : failed ? "bridge-failed" : "bridge-hold", root))
+                using (Process child = start(firstMode, root))
                 {
                     Task<string> stderr = child.StandardError.ReadToEndAsync();
                     var startup = Stopwatch.StartNew();
                     try
                     {
-                        await WaitForMarkerAsync(child, guest ? "BRIDGE_GUEST" : unknown ? "BRIDGE_RESERVED" : failed ? "BRIDGE_FAILED" : "BRIDGE_ACCEPTED").WaitAsync(Deadline);
+                        await WaitForMarkerAsync(child, firstMarker).WaitAsync(Deadline);
                         Console.WriteLine($"Bridge fixture startup/acceptance: {startup.ElapsedMilliseconds} ms.");
                         if (child.HasExited)
                             throw new InvalidOperationException("Bridge owner stopped before the crash test.");
@@ -180,9 +193,9 @@ internal static class PersistenceBridgeProbe
                     }
                     Reject(() => owner.CreateOrderJournal());
                     Reject(() => store.Acquire(Issue).Dispose());
-                    if (!unknown && !failed && !guest && !File.Exists(journal + "-journal"))
+                    if (!unknown && !failed && !guestScenario && !File.Exists(journal + "-journal"))
                         throw new InvalidOperationException("Crash did not retain the live rollback sidecar.");
-                    if (!unknown && !failed && !guest)
+                    if (!unknown && !failed && !guestScenario)
                     {
                         byte[] original = owner.RequireOrderArtifact("S01", AcceptedHash);
                         File.WriteAllBytes(artifact, [.. original, 0x20]);
@@ -211,7 +224,7 @@ internal static class PersistenceBridgeProbe
                 }
                 await expectOwnership(root, "ACQUIRED:order");
 
-                using Process resumed = start(guest ? "bridge-guest-resume" : unknown ? "bridge-blocked" : failed ? "bridge-retry" : "bridge-resume", root);
+                using Process resumed = start(resumeMode, root);
                 Task<string> output = resumed.StandardOutput.ReadToEndAsync();
                 Task<string> errors = resumed.StandardError.ReadToEndAsync();
                 try
@@ -222,13 +235,13 @@ internal static class PersistenceBridgeProbe
                         line.StartsWith("BRIDGE_PHASE:", StringComparison.Ordinal)))
                         Console.WriteLine("[bridge reentry] " + line.TrimEnd());
                     if (resumed.ExitCode != 0 || !result.Split('\n').Any(line =>
-                        line.Trim() == (guest ? "BRIDGE_GUEST_RECOVERED" : unknown ? "BRIDGE_BLOCKED" : failed ? "BRIDGE_RETRIED" : "BRIDGE_COMPLETED")))
+                        line.Trim() == resumeMarker))
                         throw new InvalidOperationException("Bridge reentry failed: " + result + await errors);
 
                     string s02 = Path.Combine(root, $"issue-{Issue}.order.db.s02");
                     string candidatePath = Path.Combine(root, $"issue-{Issue}.order.db.candidate-1");
-                    if (guest ? File.Exists(artifact) || File.Exists(s02)
-                        || !File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.guest-report-1"))
+                    if (guestScenario ? File.Exists(artifact) || File.Exists(s02)
+                        || File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.guest-report-1")) == guestUnknown
                         : unknown ? File.Exists(artifact) || File.Exists(s02)
                         || !File.ReadAllBytes(candidatePath).SequenceEqual(PartialBytes)
                         : failed ? !File.ReadAllBytes(artifact).SequenceEqual(AcceptedBytes) || File.Exists(s02)
@@ -264,6 +277,8 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: known failed fixture operation survives process kill; verified receipt and retained candidate permit one newly charged retry.");
         Console.WriteLine("PASS: exact historical model assignment survives process kill with reservation and receipts.");
         Console.WriteLine("PASS: protected guest report survives process kill; exact bytes and fresh fixture observation required, no step accepted.");
+        Console.WriteLine("PASS: unknown guest reservation survives process kill; absent report or unconfirmed sandbox blocks all new reservations.");
+        Console.WriteLine("PASS: orphan guest report alone does not settle reservation; explicit fresh fixture observation and journal acknowledgement required.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -328,7 +343,8 @@ internal static class PersistenceBridgeProbe
         // Recovery uses only the validated immutable archive, not today's policy.
         OrderOperationLimits limits = archive.EffectiveLimits;
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
-        bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest";
+        bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
+            or "bridge-guest-unknown" or "bridge-guest-orphan";
         if (first)
         {
             var fixtureApproval = FixtureApproval();
@@ -436,7 +452,7 @@ internal static class PersistenceBridgeProbe
                 current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeStart(
                     new(1, claim.ArchiveHash, processStart)), 1);
                 Console.WriteLine("BRIDGE_PHASE: order accepted.");
-                if (mode == "bridge-guest")
+                if (mode is "bridge-guest" or "bridge-guest-unknown" or "bridge-guest-orphan")
                 {
                     var guestReservation = current.Ledger.Propose(claim.JobId, "S01", "guest", 30, DateTime.UtcNow.Ticks, null);
                     current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(guestReservation), 2);
@@ -444,11 +460,31 @@ internal static class PersistenceBridgeProbe
                         || current.Ledger.ReservedSeconds != 30)
                         throw new InvalidOperationException("Guest reservation acknowledgement differs.");
                     _ = current.Ledger.DispatchAllowance(limits, guestReservation.OperationId, DateTime.UtcNow.Ticks);
+                    if (mode == "bridge-guest-unknown")
+                    {
+                        // Simulate interruption after the durable reservation
+                        // and before any trustworthy result is available.
+                        owner.ValidateOrderJournalFiles();
+                        Console.WriteLine("BRIDGE_GUEST_UNKNOWN");
+                        Console.Out.Flush();
+                        await Task.Delay(Timeout.InfiniteTimeSpan);
+                        return 1;
+                    }
                     byte[] guestBytes = FixtureGuestReport(guestReservation);
                     var guestOutcome = ObserveFixtureGuest(claim, guestReservation, guestBytes)
                         ?? throw new InvalidOperationException("Fixture guest observation missing.");
                     owner.StoreOrderGuestReport(guestOutcome, guestReservation, guestBytes);
                     Reject(() => owner.StoreOrderGuestReport(guestOutcome, guestReservation, guestBytes));
+                    if (mode == "bridge-guest-orphan")
+                    {
+                        // Crash window: exact private bytes are durable,
+                        // but no guest outcome event has been appended.
+                        owner.ValidateOrderJournalFiles();
+                        Console.WriteLine("BRIDGE_GUEST_ORPHAN");
+                        Console.Out.Flush();
+                        await Task.Delay(Timeout.InfiniteTimeSpan);
+                        return 1;
+                    }
                     current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeGuestOutcome(guestOutcome), 6);
                     if (current.Ledger.Pending is not null || current.Ledger.LatestGuestOutcome != guestOutcome
                         || current.Ledger.Guests != 1 || current.Ledger.ReservedSeconds != 30
@@ -535,6 +571,82 @@ internal static class PersistenceBridgeProbe
                 Console.Out.Flush();
                 await Task.Delay(Timeout.InfiniteTimeSpan);
                 return 1;
+            }
+
+            if (mode is "bridge-guest-blocked" or "bridge-guest-orphan-resume")
+            {
+                var pendingGuest = current.Ledger.Pending
+                    ?? throw new InvalidOperationException("Pending guest missing after replay.");
+                if (current.Stage != 2 || pendingGuest.Kind != "guest" || pendingGuest.Step != "S01"
+                    || pendingGuest.OperationId != claim.JobId + ":1" || current.Ledger.Sequence != 1
+                    || current.Ledger.Guests != 1 || current.Ledger.Models != 0 || current.Ledger.ReservedSeconds != 30
+                    || current.Ledger.LatestGuestOutcome is not null || current.Ledger.LastOutcome is not null
+                    || current.S01 is not null || current.S02 is not null || current.ArtifactHash is not null)
+                    throw new InvalidOperationException("Unknown guest reservation changed during replay.");
+
+                string recoveredRunId = DevelopmentOrderGuestReconciliation.RunId(pendingGuest);
+                string absent = "error: sandbox 'hami-code-" + recoveredRunId[..12] + "' not found";
+                string orphanPath = database + ".guest-report-1";
+                long observedAt = DateTime.UtcNow.Ticks;
+                byte[] expectedBytes = FixtureGuestReport(pendingGuest);
+                // A descriptor fabricated from expected fixture bytes is not
+                // evidence that these bytes were actually persisted.
+                var expectedOutcome = ObserveFixtureGuest(claim, pendingGuest, expectedBytes)
+                    ?? throw new InvalidOperationException("Fixture observation missing.");
+                Reject(() => current.Ledger.Complete(new(2, pendingGuest.OperationId,
+                    expectedOutcome.ReportHash, "failed", observedAt)));
+                Reject(() => current.Ledger.Reserve(claim.JobId, limits,
+                    current.Ledger.Propose(claim.JobId, "S01", "guest", 1, observedAt, null)));
+                Reject(() => current.Ledger.Reserve(claim.JobId, limits,
+                    ProposeModel(current.Ledger, "S02", 1, observedAt)));
+
+                if (mode == "bridge-guest-blocked")
+                {
+                    if (File.Exists(orphanPath))
+                        throw new InvalidOperationException("Unexpected report for interrupted fixture.");
+                    Reject(() => owner.RequireOrderGuestReport(expectedOutcome, pendingGuest));
+                    if (DevelopmentOrderGuestReconciliation.Observe(claim.ArchiveHash, pendingGuest,
+                        null, 1, "", absent, observedAt) is not null)
+                        throw new InvalidOperationException("Absence alone settled unknown guest.");
+                    if (await ReadAsync() != current)
+                        throw new InvalidOperationException("Blocked reconciliation mutated journal.");
+                    guard.RequireObserved();
+                    Console.WriteLine("BRIDGE_PHASE: pending guest retained; no report and no new execution.");
+                    Console.WriteLine("BRIDGE_GUEST_BLOCKED");
+                    return 0;
+                }
+
+                // Fixture only: expected report hash derives from known fixed
+                // reference bytes, not from arbitrary orphan data. Production
+                // must establish trusted dispatch/snapshot/report provenance.
+                byte[] orphanBytes = owner.RequireOrderGuestReport(expectedOutcome, pendingGuest);
+                if (!orphanBytes.SequenceEqual(expectedBytes))
+                    throw new InvalidOperationException("Orphan report differs from fixture reference.");
+                if (DevelopmentOrderGuestReconciliation.Observe(claim.ArchiveHash, pendingGuest,
+                    orphanBytes, 0, "existing sandbox", "", observedAt) is not null
+                    || DevelopmentOrderGuestReconciliation.Observe(claim.ArchiveHash, pendingGuest,
+                        orphanBytes, 1, "", "backend unavailable", observedAt) is not null)
+                    throw new InvalidOperationException("Unconfirmed sandbox settled orphan report.");
+                File.WriteAllBytes(orphanPath, [.. orphanBytes, 0x20]);
+                try { Reject(() => owner.RequireOrderGuestReport(expectedOutcome, pendingGuest)); }
+                finally { File.WriteAllBytes(orphanPath, orphanBytes); }
+                Reject(() => owner.StoreOrderGuestReport(expectedOutcome, pendingGuest, orphanBytes));
+                if (await ReadAsync() != current)
+                    throw new InvalidOperationException("Orphan file became journal authority.");
+                var verifiedGuest = ObserveFixtureGuest(claim, pendingGuest,
+                    owner.RequireOrderGuestReport(expectedOutcome, pendingGuest))
+                    ?? throw new InvalidOperationException("Fresh fixture observation missing.");
+                current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeGuestOutcome(verifiedGuest), 6);
+                if (current.Ledger.Pending is not null || current.Ledger.LatestGuestOutcome != verifiedGuest
+                    || current.Ledger.Sequence != 1 || current.Ledger.Guests != 1
+                    || current.Ledger.Models != 0 || current.Ledger.ReservedSeconds != 30
+                    || current.S01 is not null || current.ArtifactHash is not null)
+                    throw new InvalidOperationException("Orphan reconciliation changed charge or accepted step.");
+                VerifyFixtureGuest(owner, claim, verifiedGuest);
+                guard.RequireObserved();
+                Console.WriteLine("BRIDGE_PHASE: orphan report reconciled by explicit fixture observation, no redispatch.");
+                Console.WriteLine("BRIDGE_GUEST_ORPHAN_RECOVERED");
+                return 0;
             }
 
             if (mode == "bridge-guest-resume")
