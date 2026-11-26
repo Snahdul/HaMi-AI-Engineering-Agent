@@ -115,6 +115,24 @@ internal static class DevelopmentOrderIntegrationVerifier
         return outcome;
     }
 
+    // Proposal only, not a terminal journal write or publication authority.
+    internal static OrderAccepted ProposeAcceptance(DevelopmentJobStateStore.Lease owner,
+        OrderPairHistory history, OrderPairObservation observed, DevelopmentOrderOperationLedger completedGuest,
+        OrderGuestOutcome? independentlyObserved, long now)
+    {
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var pair = history.AcceptedPair.AcceptedS02 ?? throw new InvalidOperationException("ORDER_FINAL_ACCEPTANCE_REQUIRED");
+        var guest = RequireCompletedGuest(owner, history, observed, completedGuest, independentlyObserved);
+        var proposal = new OrderAccepted(1, claim.ArchiveHash, DevelopmentOrderOperationLedger.PairAcceptanceHash(pair),
+            guest.Reservation.OperationId, guest.ReportHash,
+            guest.Reservation.SnapshotHash ?? throw new InvalidOperationException("ORDER_FINAL_VERIFIER_MANIFEST"), now);
+        OrderCheck.Require(independentlyObserved is not null && now >= independentlyObserved.ObservedUtcTicks
+            && observed.Calculator is not null && now >= observed.Calculator.ObservedUtcTicks
+            && observed.Formatter is not null && now >= observed.Formatter.ObservedUtcTicks, "ORDER_FINAL_ACCEPTANCE_CLOCK");
+        _ = completedGuest.AcceptOrder(claim, proposal);
+        return proposal;
+    }
+
     internal static bool MatchesOutput(string output, string error) =>
         error.Length == 0 && (output == ExpectedStdout + "\n" || output == ExpectedStdout + "\r\n");
 

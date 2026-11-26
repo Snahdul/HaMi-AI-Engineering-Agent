@@ -53,6 +53,9 @@ internal sealed record OrderS01Accepted(int Version, string ArchiveHash, OrderCa
 internal sealed record OrderS02Accepted(int Version, string ArchiveHash, OrderS01Accepted Predecessor,
     OrderCandidateCheckpoint Candidate, string GuestOperationId, string GuestReportHash, string ScopeHash, long ObservedUtcTicks);
 
+internal sealed record OrderAccepted(int Version, string ArchiveHash, string PairAcceptanceHash,
+    string GuestOperationId, string GuestReportHash, string SnapshotHash, long ObservedUtcTicks);
+
 internal sealed record OrderBudgetExhausted(int Version, OrderOperationReservation Request, string Reason);
 
 internal sealed record OrderRequiredOperation(string Step, string Kind, int Seconds);
@@ -74,7 +77,8 @@ internal sealed record DevelopmentOrderOperationLedger(
     int BudgetRevision = 0, OrderBudgetExhausted? BudgetStop = null, string ExtensionHashes = "",
     OrderCandidateCheckpoint? LatestCandidate = null, OrderGuestOutcome? LatestGuestOutcome = null,
     OrderOperationReservation? LatestModelReservation = null, OrderOperationCompletion? LatestModelCompletion = null,
-    OrderSoftStop? SoftStop = null, OrderS01Accepted? AcceptedS01 = null, OrderS02Accepted? AcceptedS02 = null)
+    OrderSoftStop? SoftStop = null, OrderS01Accepted? AcceptedS01 = null, OrderS02Accepted? AcceptedS02 = null,
+    OrderAccepted? AcceptedOrder = null)
 {
     internal int Models => S01Models + S02Models;
     internal int Guests => S01Guests + S02Guests + FinalGuests;
@@ -141,6 +145,7 @@ internal sealed record DevelopmentOrderOperationLedger(
     // eligible operation that cannot fit may produce the durable stop event.
     internal string? BudgetDenial(string jobId, OrderOperationLimits limits, OrderOperationReservation reservation)
     {
+        OrderCheck.Require(AcceptedOrder is null, "ORDER_ALREADY_ACCEPTED");
         OrderCheck.Require(Pending is null, "ORDER_OPERATION_PENDING");
         OrderCheck.Require(reservation.Version == 4
             && reservation.OperationId == OperationId(jobId, checked(Sequence + 1))
@@ -288,6 +293,7 @@ internal sealed record DevelopmentOrderOperationLedger(
     internal DevelopmentOrderOperationLedger Extend(string jobId, DevelopmentOrderBudgetPolicy policy,
         OrderBudgetExtensionApproved extension)
     {
+        OrderCheck.Require(AcceptedOrder is null, "ORDER_ALREADY_ACCEPTED");
         var requestAtStop = BudgetStop?.Request ?? SoftStop?.Request
             ?? throw new InvalidOperationException("ORDER_BUDGET_NOT_STOPPED");
         var old = CurrentLimits ?? throw new InvalidOperationException("ORDER_BUDGET_REVISION");
@@ -431,6 +437,36 @@ internal sealed record DevelopmentOrderOperationLedger(
         return this with { AcceptedS02 = accepted, LastUtcTicks = accepted.ObservedUtcTicks };
     }
 
+    internal static string PairAcceptanceHash(OrderS02Accepted pair) =>
+        DevelopmentJobState.Hash(OrderStorageJson.Encode(pair, EventMaxBytes));
+
+    // Terminal pure fold. Late acknowledgement of already completed work
+    // is allowed, but never changes the original window or permits new effects.
+    // The host must independently verify the full chain before persistence.
+    internal DevelopmentOrderOperationLedger AcceptOrder(DevelopmentOrderClaim claim, OrderAccepted accepted)
+    {
+        var pair = AcceptedS02 ?? throw new InvalidOperationException("ORDER_FINAL_ACCEPTANCE_REQUIRED");
+        var guest = LatestGuestOutcome ?? throw new InvalidOperationException("ORDER_FINAL_GUEST_REQUIRED");
+        int formatterSequence = pair.Candidate.ValidateBinding(claim);
+        pair.Candidate.RequireFormatterInput(claim, pair.Predecessor);
+        OrderCheck.Require(AcceptedOrder is null && Pending is null && BudgetStop is null && SoftStop is null
+            && FinalGuests == 1 && accepted.Version == 1 && accepted.ArchiveHash == claim.ArchiveHash
+            && ArchiveHash == claim.ArchiveHash && PolicyHash == claim.Binding.PolicyHash
+            && AcceptedS01 == pair.Predecessor && LatestCandidate == pair.Candidate
+            && pair.ArchiveHash == claim.ArchiveHash && pair.ScopeHash == claim.Binding.ScopeHash
+            && accepted.PairAcceptanceHash == PairAcceptanceHash(pair)
+            && formatterSequence + 2 == Sequence && guest.Reservation is { Step: "FINAL", Kind: "guest" }
+            && guest.Reservation.OperationId == OperationId(claim.JobId, Sequence)
+            && accepted.GuestOperationId == guest.Reservation.OperationId && accepted.GuestReportHash == guest.ReportHash
+            && accepted.SnapshotHash == guest.Reservation.SnapshotHash
+            && LastOutcome == "succeeded"
+            && LastEvidenceHash == DevelopmentJobState.Hash(OrderStorageJson.Encode(guest, EventMaxBytes)),
+            "ORDER_FINAL_ACCEPTANCE_BINDING");
+        guest.Validate(claim.ArchiveHash, guest.Reservation);
+        RequireObservation(accepted.ObservedUtcTicks);
+        return this with { AcceptedOrder = accepted, LastUtcTicks = accepted.ObservedUtcTicks };
+    }
+
     private DevelopmentOrderOperationLedger Settle(OrderOperationCompletion completion)
     {
         OrderCheck.Require(completion.Version == 2 && Pending is not null
@@ -525,6 +561,12 @@ internal sealed record DevelopmentOrderOperationLedger(
 
     internal static OrderS02Accepted DecodeS02Accepted(string evt) =>
         OrderStorageJson.Decode<OrderS02Accepted>(EventBytes(evt, "s02-accepted-v1:"), EventMaxBytes);
+
+    internal static string EncodeOrderAccepted(OrderAccepted accepted) =>
+        "order-accepted-v1:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(accepted, EventMaxBytes));
+
+    internal static OrderAccepted DecodeOrderAccepted(string evt) =>
+        OrderStorageJson.Decode<OrderAccepted>(EventBytes(evt, "order-accepted-v1:"), EventMaxBytes);
 
     private static byte[] EventBytes(string evt, string prefix)
     {

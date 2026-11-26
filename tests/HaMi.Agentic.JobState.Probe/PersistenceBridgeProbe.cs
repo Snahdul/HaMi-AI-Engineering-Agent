@@ -1883,6 +1883,32 @@ internal static class PersistenceBridgeProbe
                     await expectOwnership(root, "ACQUIRED:order");
                 }
 
+                if (scenario == "model-accepted")
+                {
+                    using Process terminalChild = start(resumeMode, root);
+                    Task<string> terminalErrors = terminalChild.StandardError.ReadToEndAsync();
+                    try
+                    {
+                        await WaitForMarkerAsync(terminalChild, "BRIDGE_ORDER_ACCEPTED").WaitAsync(Deadline);
+                        if (terminalChild.HasExited)
+                            throw new InvalidOperationException("Terminal acceptance owner stopped before process kill.");
+                        await expectOwnership(root, "BUSY");
+                    }
+                    finally
+                    {
+                        if (!terminalChild.HasExited)
+                            terminalChild.Kill(entireProcessTree: true);
+                        await terminalChild.WaitForExitAsync().WaitAsync(Deadline);
+                        string diagnostics = await terminalErrors.WaitAsync(Deadline);
+                        if (diagnostics.Length > 0)
+                            Console.Error.WriteLine(diagnostics[^Math.Min(diagnostics.Length, 16 * 1024)..]);
+                    }
+
+                    if (terminalChild.ExitCode == 0)
+                        throw new InvalidOperationException("Terminal acceptance owner did not terminate abnormally.");
+                    await expectOwnership(root, "ACQUIRED:order");
+                }
+
                 using Process resumed = start(resumeMode, root);
                 Task<string> output = resumed.StandardOutput.ReadToEndAsync();
                 Task<string> errors = resumed.StandardError.ReadToEndAsync();
@@ -1973,6 +1999,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: S02 guest admission and successful outcome persisted before ack; completed and unresolved wrong-marker process kills recover without redispatch or budget reset.");
         Console.WriteLine("PASS: independent S02 acceptance persisted and recovered after process kill; immutable predecessor, exact evidence, budget and no redispatch.");
         Console.WriteLine("PASS: FINAL guest reservation and successful outcome persisted before ack; process kill recovers all three guest proofs and both acceptances without redispatch or budget reset.");
+        Console.WriteLine("PASS: terminal order acceptance persisted before ack and recovered after process kill; exact evidence, original budget and no further effects.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2574,6 +2601,40 @@ internal static class PersistenceBridgeProbe
                     DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state,
                         ObserveCalculatorFixture(owner, claim, outcome), baseline, pair);
 
+                if (current.Stage == 16)
+                {
+                    var terminalHistory = RequirePairHistory(current);
+                    var terminalObservations = ObservePairFixture(owner, claim, terminalHistory, root);
+                    var completedFinal = current.FinalCompletion ?? throw new InvalidOperationException("Final completion history missing.");
+                    var terminal = current.Ledger.AcceptedOrder ?? throw new InvalidOperationException("Terminal acceptance missing.");
+                    var finalOutcome = completedFinal.LatestGuestOutcome
+                        ?? throw new InvalidOperationException("Final outcome missing.");
+                    byte[] terminalReport = owner.RequireOrderGuestReport(finalOutcome, finalOutcome.Reservation);
+                    var freshTerminal = ObserveFixtureGuest(claim, finalOutcome.Reservation, terminalReport);
+                    if (DevelopmentOrderIntegrationVerifier.RequireCompletedGuest(owner, terminalHistory,
+                            terminalObservations, completedFinal, freshTerminal) != finalOutcome
+                        || current.Ledger != completedFinal.AcceptOrder(claim, terminal)
+                        || current.Ledger.Sequence != 5 || current.Ledger.Models != 2 || current.Ledger.Guests != 3
+                        || current.Ledger.ReservedSeconds != 80 + terminalHistory.AcceptedPair.FinalReserveSeconds
+                        || current.Ledger.StartedUtcTicks != terminalHistory.AcceptedPair.StartedUtcTicks
+                        || current.Ledger.Pending is not null || File.Exists(database + ".s02"))
+                        throw new InvalidOperationException("Replayed terminal acceptance differs.");
+                    var repeatFinal = current.Ledger.Propose(claim.JobId, "FINAL", "guest",
+                        terminalHistory.AcceptedPair.FinalReserveSeconds, DateTime.UtcNow.Ticks, null, finalOutcome.Reservation.SnapshotHash);
+                    Reject(() => current.Ledger.BudgetDenial(claim.JobId, limits, repeatFinal));
+                    Reject(() => current.Ledger.Reserve(claim.JobId, limits, repeatFinal));
+                    Reject(() => current.Ledger.AcceptOrder(claim, terminal));
+                    Reject(() => owner.ConsumeOrderGuestDispatch(current.Ledger, finalOutcome.Reservation));
+                    bool terminalRejected = false;
+                    try { _ = await actor.Ask<BridgeState>(new AcceptOrder(), Deadline); }
+                    catch (InvalidOperationException) { terminalRejected = true; }
+                    if (!terminalRejected || await ReadAsync() != current || File.Exists(database + ".guest-dispatch-6"))
+                        throw new InvalidOperationException("Terminal recovery mutated journal.");
+                    Console.WriteLine("BRIDGE_PHASE: terminal order acceptance recovered after process kill; all evidence retained and new effects blocked.");
+                    Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
+                    return 0;
+                }
+
                 if (current.Stage == 15)
                 {
                     var history = RequirePairHistory(current);
@@ -2602,8 +2663,53 @@ internal static class PersistenceBridgeProbe
                     if (!rejectedFinal || await ReadAsync() != current || File.Exists(database + ".guest-dispatch-6"))
                         throw new InvalidOperationException("Integration recovery mutated journal.");
                     Console.WriteLine("BRIDGE_PHASE: FINAL guest completion recovered after process kill; both acceptances, exact protected evidence and original budget retained.");
-                    Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
-                    return 0;
+                    var finalBeforeAcceptance = current;
+                    var proposedTerminal = DevelopmentOrderIntegrationVerifier.ProposeAcceptance(owner, history, observations,
+                        current.Ledger, finalObservation, DateTime.UtcNow.Ticks);
+                    var expectedTerminal = current.Ledger.AcceptOrder(claim, proposedTerminal);
+                    string terminalEvent = DevelopmentOrderOperationLedger.EncodeOrderAccepted(proposedTerminal);
+                    if (DevelopmentOrderOperationLedger.DecodeOrderAccepted(terminalEvent) != proposedTerminal
+                        || current.Ledger.AcceptedOrder is not null || expectedTerminal.AcceptedOrder != proposedTerminal
+                        || expectedTerminal.Sequence != current.Ledger.Sequence
+                        || expectedTerminal.ReservedSeconds != current.Ledger.ReservedSeconds)
+                        throw new InvalidOperationException("Terminal acceptance fold differs.");
+                    Reject(() => current.Ledger.AcceptOrder(claim, proposedTerminal with { Version = 2 }));
+                    Reject(() => current.Ledger.AcceptOrder(claim, proposedTerminal with { PairAcceptanceHash = new string('A', 64) }));
+                    Reject(() => current.Ledger.AcceptOrder(claim, proposedTerminal with { GuestReportHash = new string('A', 64) }));
+                    Reject(() => current.Ledger.AcceptOrder(claim, proposedTerminal with { SnapshotHash = new string('A', 64) }));
+                    Reject(() => current.Ledger.AcceptOrder(claim, proposedTerminal with { ObservedUtcTicks = current.Ledger.LastUtcTicks - 1 }));
+                    Reject(() => history.AcceptedPair.AcceptOrder(claim, proposedTerminal));
+                    Reject(() => expectedTerminal.AcceptOrder(claim, proposedTerminal));
+                    Reject(() => DevelopmentOrderIntegrationVerifier.ProposeAcceptance(owner, history, observations,
+                        current.Ledger, null, DateTime.UtcNow.Ticks));
+                    Reject(() => DevelopmentOrderOperationLedger.DecodeOrderAccepted(
+                        "order-accepted-v2:" + terminalEvent["order-accepted-v1:".Length..]));
+                    string finalEvidencePath = database + ".guest-report-5";
+                    byte[] savedFinalEvidence = File.ReadAllBytes(finalEvidencePath);
+                    File.WriteAllBytes(finalEvidencePath, [.. savedFinalEvidence, 0x20]);
+                    try
+                    {
+                        bool invalidTerminalRejected = false;
+                        try { _ = await actor.Ask<BridgeState>(new AcceptOrder(), Deadline); }
+                        catch (InvalidOperationException) { invalidTerminalRejected = true; }
+                        if (!invalidTerminalRejected || await ReadAsync() != finalBeforeAcceptance)
+                            throw new InvalidOperationException("Tampered final evidence accepted.");
+                    }
+                    finally { File.WriteAllBytes(finalEvidencePath, savedFinalEvidence); }
+                    Task<BridgeState> terminalAck = actor.Ask<BridgeState>(new AcceptOrder(), Deadline);
+                    await guard.AwaitAsync(terminalAck);
+                    current = await terminalAck;
+                    if (current.Stage != 16 || current.FinalCompletion != finalBeforeAcceptance.Ledger
+                        || current.Ledger.AcceptedOrder is not { } actualTerminal
+                        || (actualTerminal with { ObservedUtcTicks = proposedTerminal.ObservedUtcTicks }) != proposedTerminal
+                        || current.Ledger != finalBeforeAcceptance.Ledger.AcceptOrder(claim, actualTerminal)
+                        || await ReadAsync() != current)
+                        throw new InvalidOperationException("Terminal acceptance acknowledgement differs.");
+                    owner.ValidateOrderJournalFiles();
+                    Console.WriteLine("BRIDGE_ORDER_ACCEPTED");
+                    Console.Out.Flush();
+                    await Task.Delay(Timeout.InfiniteTimeSpan);
+                    return 1;
                 }
 
                 if (current.Stage == 13)
@@ -3568,6 +3674,7 @@ internal static class PersistenceBridgeProbe
     private sealed record AcceptFormatter;
     private sealed record AdmitIntegrationGuest(OrderOperationReservation Request);
     private sealed record RecordIntegrationGuest(OrderGuestOutcome Outcome);
+    private sealed record AcceptOrder;
 
     // Reviewed disposable fixture only: the existing synthetic S01/S02
     // completion already represents accepted work. No dynamic estimator or
@@ -3584,7 +3691,8 @@ internal static class PersistenceBridgeProbe
         RecordedOperation? S01 = null, RecordedOperation? S02 = null, RecordedOperation? FailedS01 = null,
         DevelopmentOrderOperationLedger? CalculatorModel = null, DevelopmentOrderOperationLedger? CalculatorGuest = null,
         DevelopmentOrderOperationLedger? FormatterInputState = null, DevelopmentOrderOperationLedger? FormatterModel = null,
-        DevelopmentOrderOperationLedger? FormatterGuest = null, DevelopmentOrderOperationLedger? PairAcceptance = null);
+        DevelopmentOrderOperationLedger? FormatterGuest = null, DevelopmentOrderOperationLedger? PairAcceptance = null,
+        DevelopmentOrderOperationLedger? FinalCompletion = null);
 
     private static OrderPairHistory RequirePairHistory(BridgeState state) =>
         new(state.CalculatorModel ?? throw new InvalidOperationException("Calculator model history missing."),
@@ -3897,6 +4005,33 @@ internal static class PersistenceBridgeProbe
                     Sender.Tell(new Status.Failure(ex));
                 }
             });
+            Command<AcceptOrder>(command =>
+            {
+                try
+                {
+                    if (!recovered || !calculatorScenario || state.Stage != 15 || state.Ledger.AcceptedOrder is not null)
+                        throw new InvalidOperationException("Terminal acceptance blocked.");
+                    var history = RequirePairHistory(state);
+                    var observations = ObservePairFixture(owner, claim, history, root);
+                    var outcome = state.Ledger.LatestGuestOutcome ?? throw new InvalidOperationException("Final outcome missing.");
+                    byte[] report = owner.RequireOrderGuestReport(outcome, outcome.Reservation);
+                    var observed = ObserveFixtureGuest(claim, outcome.Reservation, report);
+                    var proposal = DevelopmentOrderIntegrationVerifier.ProposeAcceptance(owner, history, observations,
+                        state.Ledger, observed, DateTime.UtcNow.Ticks);
+                    string evt = DevelopmentOrderOperationLedger.EncodeOrderAccepted(proposal);
+                    BridgeState next = Next(state, evt);
+                    IActorRef reply = Sender;
+                    Persist(evt, _ =>
+                    {
+                        state = next;
+                        reply.Tell(state);
+                    });
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException or System.Text.Json.JsonException)
+                {
+                    Sender.Tell(new Status.Failure(ex));
+                }
+            });
             Command<Advance>(command =>
             {
                 if (!recovered)
@@ -3907,7 +4042,8 @@ internal static class PersistenceBridgeProbe
                     return;
                 }
                 if (command.Event.StartsWith("s01-accepted-v1:", StringComparison.Ordinal)
-                    || command.Event.StartsWith("s02-accepted-v1:", StringComparison.Ordinal))
+                    || command.Event.StartsWith("s02-accepted-v1:", StringComparison.Ordinal)
+                    || command.Event.StartsWith("order-accepted-v1:", StringComparison.Ordinal))
                 {
                     Sender.Tell(new Status.Failure(new InvalidOperationException("Use calculator acceptance command.")));
                     return;
@@ -4071,6 +4207,13 @@ internal static class PersistenceBridgeProbe
                     throw new InvalidOperationException("Integration guest outcome required.");
                 return previous with { Stage = 15, Ledger = previous.Ledger.CompleteGuest(outcome) };
             }
+            if (calculatorScenario && previous.Stage == 15)
+                return previous with
+                {
+                    Stage = 16,
+                    FinalCompletion = previous.Ledger,
+                    Ledger = previous.Ledger.AcceptOrder(claim, DevelopmentOrderOperationLedger.DecodeOrderAccepted(evt))
+                };
             if (calculatorScenario && previous.Stage == 7)
             {
                 var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
