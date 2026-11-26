@@ -75,6 +75,11 @@ internal static class DevelopmentOrderCalculatorVerifier
         return manifest;
     }
 
+    // Linux guest writes one exact line. Accept CRLF for transport portability,
+    // but no trimming, extra lines, whitespace or stderr diagnostics.
+    internal static bool MatchesOutput(string output, string error) =>
+        error.Length == 0 && (output == ExpectedStdout + "\n" || output == ExpectedStdout + "\r\n");
+
     private static byte[] ReadAsset(string name)
     {
         using Stream stream = typeof(DevelopmentOrderCalculatorVerifier).Assembly.GetManifestResourceStream(
@@ -102,6 +107,12 @@ internal static class DevelopmentOrderCalculatorVerifier
         Reject((value, min, max) => min == max ? unchecked(min + 1) : Math.Clamp(value, min, max));
         Reject((value, min, max) => value == int.MinValue ? int.MaxValue : Math.Clamp(value, min, max));
         Reject((_, _, _) => throw new InvalidOperationException("Calculator failed a reviewed boundary case."));
+
+        if (!MatchesOutput(ExpectedStdout + "\n", "") || !MatchesOutput(ExpectedStdout + "\r\n", "")
+            || MatchesOutput(ExpectedStdout, "") || MatchesOutput(ExpectedStdout + "\n\n", "")
+            || MatchesOutput(" " + ExpectedStdout + "\n", "") || MatchesOutput(ExpectedStdout + "\n", "diagnostic")
+            || MatchesOutput("HaMi pair acceptance passed\n", ""))
+            throw new InvalidOperationException("Calculator semantic output checks differ.");
 
         if (ReadAsset("Project").Length == 0 || ReadAsset("Program").Length == 0 || ReadAsset("Checks").Length == 0)
             throw new InvalidOperationException("Calculator verifier assets missing.");

@@ -318,14 +318,19 @@ internal static class PersistenceBridgeProbe
     // process-kill cases retain their exact historical reference reports.
     private static async Task TestLiveGuestCaptureAsync(string prefix)
     {
-        foreach (string scenario in new[] { "success", "raw-replaced", "nonzero", "late-inspect-unknown", "late-inspect-timeout" })
+        foreach (string scenario in new[] { "success", "raw-replaced", "nonzero", "late-inspect-unknown", "late-inspect-timeout",
+            "calculator-success", "calculator-wrong-output", "calculator-stderr", "calculator-extra-output" })
         {
             string root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
             var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
             try
             {
                 using var owner = store.AcquireOrder(Issue);
-                owner.ClaimOrder(Guid.NewGuid().ToString("N"), FixtureApproval(scenario == "success" ? 40 : null));
+                bool calculator = scenario.StartsWith("calculator-", StringComparison.Ordinal);
+                byte[] baseline = Encoding.UTF8.GetBytes("internal static class PairCalculator { }");
+                var approval = FixtureApproval(scenario == "success" ? 40 : null,
+                    calculator ? DevelopmentJobState.Hash(baseline) : null);
+                owner.ClaimOrder(Guid.NewGuid().ToString("N"), approval);
                 string journal = owner.CreateOrderJournal();
                 DevelopmentOrderClaim claim = owner.CurrentOrder ?? throw new InvalidOperationException("Claim missing.");
                 DevelopmentOrderArchive archive = owner.RequireArchivedOrder();
@@ -337,15 +342,40 @@ internal static class PersistenceBridgeProbe
                 Directory.CreateDirectory(repo);
                 Directory.CreateDirectory(source);
                 Directory.CreateDirectory(results);
-                File.WriteAllText(Path.Combine(source, "Demo.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"/>");
-                File.WriteAllText(Path.Combine(source, "Program.cs"), "Console.WriteLine(42);");
-                byte[] manifest = DevelopmentOrderSnapshot.CaptureBytes(source, "Demo.csproj");
-                string hash = DevelopmentJobState.Hash(manifest);
                 long now = DateTime.UtcNow.Ticks;
                 var ledger = new DevelopmentOrderOperationLedger().Start(new(1, claim.ArchiveHash, now),
                     claim.ArchiveHash, limits, policy);
-                var reservation = ledger.Propose(claim.JobId, "S01", "guest", 30, now, null, hash);
-                owner.StoreOrderSnapshotManifest(reservation, manifest);
+                DevelopmentOrderOperationLedger? completedModel = null;
+                if (calculator)
+                {
+                    var assignment = FixtureAssignment(claim, archive, "S01");
+                    var model = ledger.Propose(claim.JobId, "S01", "model", 30, now,
+                        OrderOperationAgentBinding.FromAssignment(assignment));
+                    var pending = ledger.Reserve(claim.JobId, limits, model);
+                    var generated = await DevelopmentOrderModelDispatch.RunAsync(owner, pending, model, approval,
+                        assignment, [new(assignment.Agent, true, ["csharp"])], baseline,
+                        (_, _) => Task.FromResult("internal static class PairCalculator { /* fixture */ }"));
+                    completedModel = pending.Checkpoint(claim, generated.Candidate
+                        ?? throw new InvalidOperationException("Fixture candidate missing.")).Complete(generated.Completion);
+                    ledger = completedModel;
+                    foreach (var file in DevelopmentOrderCalculatorVerifier.Prepare(owner, completedModel))
+                        File.WriteAllBytes(Path.Combine(source, file.Key), file.Value);
+                }
+                else
+                {
+                    File.WriteAllText(Path.Combine(source, "Demo.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"/>");
+                    File.WriteAllText(Path.Combine(source, "Program.cs"), "Console.WriteLine(42);");
+                }
+
+                byte[] manifest = DevelopmentOrderSnapshot.CaptureBytes(source, "Demo.csproj");
+                string hash = DevelopmentJobState.Hash(manifest);
+                var reservation = completedModel is null
+                    ? ledger.Propose(claim.JobId, "S01", "guest", 30, now, null, hash)
+                    : DevelopmentOrderCalculatorVerifier.ProposeGuest(owner, completedModel, 30, DateTime.UtcNow.Ticks);
+                if (completedModel is null)
+                    owner.StoreOrderSnapshotManifest(reservation, manifest);
+                else
+                    DevelopmentOrderCalculatorVerifier.StoreGuestSnapshot(owner, completedModel, reservation, source);
                 // Synthetic acknowledged view only in this integration test;
                 // actual Persist/replay is exercised in the six cases below.
                 ledger = ledger.Reserve(claim.JobId, limits, reservation);
@@ -407,11 +437,40 @@ internal static class PersistenceBridgeProbe
                                 response = new(0, "11.0.100", "");
                             else if (args.Contains("hami-snapshot", StringComparer.Ordinal))
                                 response = new(0, guestOutput, "");
-                            else if (scenario == "nonzero" && args.Contains("run", StringComparer.Ordinal))
-                                response = new(1, "", "");
+                            else if (args.Contains("run", StringComparer.Ordinal))
+                            {
+                                string marker = DevelopmentOrderCalculatorVerifier.ExpectedStdout + "\n";
+                                response = scenario switch
+                                {
+                                    "nonzero" => new(1, "", ""),
+                                    "calculator-success" => new(0, marker, ""),
+                                    "calculator-wrong-output" => new(0, "HaMi pair acceptance passed\n", ""),
+                                    "calculator-stderr" => new(0, marker, "unexpected diagnostic"),
+                                    "calculator-extra-output" => new(0, marker + "extra\n", ""),
+                                    _ => response
+                                };
+                            }
                             break;
                     }
                     return Task.FromResult(response);
+                }
+
+                if (completedModel is not null)
+                {
+                    string program = Path.Combine(source, "Program.cs");
+                    byte[] originalProgram = File.ReadAllBytes(program);
+                    File.WriteAllBytes(program, [.. originalProgram, 0x20]);
+                    bool rejectedSnapshot = false;
+                    try
+                    {
+                        _ = await DevelopmentSandboxRunner.RunReservedCoreAsync(repo, source, results, owner,
+                            ledger, reservation, Transport, (_, _, _, _) => { }, completedCalculatorModel: completedModel);
+                    }
+                    catch (InvalidOperationException ex) when (ex.Message == "ORDER_CALCULATOR_VERIFIER_SNAPSHOT")
+                    { rejectedSnapshot = true; }
+                    finally { File.WriteAllBytes(program, originalProgram); }
+                    if (!rejectedSnapshot || calls != 0 || File.Exists(journal + ".guest-dispatch-2"))
+                        throw new InvalidOperationException("Wrong calculator snapshot reached transport.");
                 }
 
                 OrderGuestOutcome? outcome = null;
@@ -419,26 +478,28 @@ internal static class PersistenceBridgeProbe
                 try
                 {
                     outcome = await DevelopmentSandboxRunner.RunReservedCoreAsync(repo, source, results, owner,
-                        ledger, reservation, Transport, (_, _, _, _) => { });
+                        ledger, reservation, Transport, (_, _, _, _) => { }, completedCalculatorModel: completedModel);
                 }
                 catch (TimeoutException ex) when (scenario == "late-inspect-timeout" && ex.Message == "fixture late inspect")
                 {
                     timeout = true;
                 }
 
-                bool success = scenario is "success" or "raw-replaced";
+                bool success = scenario is "success" or "raw-replaced" or "calculator-success";
+                bool unsuccessfulExecution = scenario == "nonzero" || calculator && !success;
                 if ((outcome is not null) != success || timeout != (scenario == "late-inspect-timeout")
-                    || !created || !removed || afterReturn != (scenario == "nonzero" ? 0 : 1)
+                    || !created || !removed || afterReturn != (unsuccessfulExecution ? 0 : 1)
                     || !File.Exists(raw) || ledger.Pending != reservation || ledger.Guests != 1)
                     throw new InvalidOperationException("Live guest capture outcome differs: " + scenario);
                 owner.RequireOrderGuestDispatch(reservation);
-                string slot = journal + ".guest-report-1";
+                string slot = journal + (calculator ? ".guest-report-2" : ".guest-report-1");
                 if (success)
                 {
                     byte[] captured = owner.RequireOrderGuestReport(outcome!, reservation);
                     if (original is null || !captured.SequenceEqual(original)
                         || DevelopmentJobState.Hash(captured) != outcome!.ReportHash
                         || !DevelopmentOrderGuestReconciliation.IsSuccessfulReport(reservation, captured)
+                        || DevelopmentOrderGuestReconciliation.IsCalculatorReport(reservation, captured) != calculator
                         || (scenario == "raw-replaced" && captured.SequenceEqual(File.ReadAllBytes(raw))))
                         throw new InvalidOperationException("Protected report differs from live bytes.");
                 }
@@ -450,7 +511,7 @@ internal static class PersistenceBridgeProbe
                 try
                 {
                     _ = await DevelopmentSandboxRunner.RunReservedCoreAsync(repo, source, results, owner,
-                        ledger, reservation, Transport, (_, _, _, _) => { });
+                        ledger, reservation, Transport, (_, _, _, _) => { }, completedCalculatorModel: completedModel);
                 }
                 catch (InvalidOperationException) { rejected = true; }
                 if (!rejected || calls != before)
@@ -486,6 +547,7 @@ internal static class PersistenceBridgeProbe
         }
 
         Console.WriteLine("PASS: live reserved runner captures exact protected bytes only after success and fresh absence; raw reports cannot authorize completion.");
+        Console.WriteLine("PASS: calculator-specific runner binds model and guest ledgers, exact snapshot, semantic stdout and clean stderr to protected report; mismatches and redispatch blocked.");
     }
 
     private sealed class ReentryClock : TimeProvider

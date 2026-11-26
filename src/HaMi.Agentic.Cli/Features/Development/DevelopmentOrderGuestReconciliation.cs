@@ -87,7 +87,10 @@ internal static class DevelopmentOrderGuestReconciliation
         // Exact canonical runner format rejects duplicate/unknown/missing
         // fields, alternate encodings, and trailing or truncated data.
         if (report is null || !reportBytes.AsSpan().SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(report, ReportOptions))
-            || report.SchemaVersion != 4 || report.RunId != runId || report.Project != "Demo.csproj"
+            || !(report.SchemaVersion == 4 && report.VerifiedBy is null
+                || report.SchemaVersion == 5 && reservation.Step == "S01"
+                    && report.VerifiedBy == DevelopmentOrderCalculatorVerifier.Id)
+            || report.RunId != runId || report.Project != "Demo.csproj"
             || report.SnapshotHash != reservation.SnapshotHash
             || report.Mode != "run" || report.TimedOut || !report.SandboxRemovalSucceeded || report.Error is not null
             || report.RestoreExitCode != 0 || report.BuildExitCode != 0 || report.ExecutionExitCode != 0
@@ -98,6 +101,13 @@ internal static class DevelopmentOrderGuestReconciliation
 
         return true;
     }
+
+    // A legacy successful guest report must never satisfy the independent
+    // calculator check. Call only with protected report bytes.
+    internal static bool IsCalculatorReport(OrderOperationReservation reservation, byte[] reportBytes) =>
+        IsSuccessfulReport(reservation, reportBytes)
+        && JsonSerializer.Deserialize<DevelopmentSandboxRunner.SandboxRunReport>(reportBytes, ReportOptions)
+            is { SchemaVersion: 5, VerifiedBy: DevelopmentOrderCalculatorVerifier.Id };
 
     // Replay can fold an acknowledged outcome descriptor; the host must
     // compare against independently obtained evidence before append or reuse.
