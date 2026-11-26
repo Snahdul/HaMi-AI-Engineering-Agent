@@ -1278,6 +1278,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: actual calculator acceptance event survives Akka SQL process kill; protected candidate, report, scope and charged budget recovered without redispatch.");
         Console.WriteLine("PASS: calculator guest-complete crash before acceptance replays unaccepted; filesystem stage and evidence rechecked, one acceptance appended without redispatch.");
         Console.WriteLine("PASS: calculator recovery binds real Git commit and four exact tracked objects; dirty checkout, untracked entry, skip-worktree and binding drift rejected.");
+        Console.WriteLine("PASS: S02 input handover from actual recovered S01 acceptance; unaccepted or tampered history and input bytes rejected.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -1871,14 +1872,18 @@ internal static class PersistenceBridgeProbe
                 var model = current.CalculatorModel ?? throw new InvalidOperationException("Model history missing.");
                 var guest = current.CalculatorGuest ?? throw new InvalidOperationException("Guest history missing.");
                 var outcome = guest.LatestGuestOutcome ?? throw new InvalidOperationException("Guest outcome missing.");
+                OrderFormatterInputs ReadFormatterInputs(DevelopmentOrderOperationLedger state,
+                    OrderGitBaseline baseline, IReadOnlyDictionary<string, byte[]> pair) =>
+                    DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state,
+                        ObserveCalculatorFixture(owner, claim, outcome), baseline, pair);
+
                 void VerifyAccepted()
                 {
-                    var candidate = DevelopmentOrderCalculatorVerifier.RequireCompletedGuest(owner, model, guest,
-                        ObserveCalculatorFixture(owner, claim, outcome));
                     var baseline = ObserveCalculatorBaseline(root, claim.Binding);
-                    DevelopmentOrderCalculatorVerifier.RequirePairScope(owner, candidate, baseline.Commit,
-                        baseline.Scope, baseline.Calculator, baseline.Formatter, CalculatorRecoveryPair(root));
-                    if (candidate != accepted.Candidate || current.Ledger != guest.AcceptS01(claim, accepted))
+                    var inputs = ReadFormatterInputs(current.Ledger, baseline, CalculatorRecoveryPair(root));
+                    if (inputs.CalculatorAcceptance != accepted
+                        || !inputs.Calculator.AsSpan().SequenceEqual(owner.RequireOrderCandidate(accepted.Candidate))
+                        || !inputs.FormatterBaseline.AsSpan().SequenceEqual(baseline.Formatter))
                         throw new InvalidOperationException("Replayed calculator acceptance differs.");
                 }
 
@@ -1892,6 +1897,29 @@ internal static class PersistenceBridgeProbe
                 try { Reject(VerifyAccepted); }
                 finally { File.WriteAllBytes(path, original); }
                 VerifyAccepted();
+                var reviewedBaseline = ObserveCalculatorBaseline(root, claim.Binding);
+                var stagedPair = CalculatorRecoveryPair(root);
+                var handover = ReadFormatterInputs(current.Ledger, reviewedBaseline, stagedPair);
+                Reject(() => ReadFormatterInputs(guest, reviewedBaseline, stagedPair));
+                Reject(() => ReadFormatterInputs(current.Ledger with
+                {
+                    AcceptedS01 = accepted with { GuestReportHash = new string('0', 64) }
+                }, reviewedBaseline, stagedPair));
+                Reject(() => ReadFormatterInputs(current.Ledger with { ReservedSeconds = 0 }, reviewedBaseline, stagedPair));
+                Reject(() => ReadFormatterInputs(current.Ledger,
+                    reviewedBaseline with { Formatter = [.. reviewedBaseline.Formatter, 0x20] }, stagedPair));
+                stagedPair[DevelopmentAgentContract.PairFirst][0] ^= 1;
+                Reject(() => ReadFormatterInputs(current.Ledger, reviewedBaseline, stagedPair));
+                stagedPair[DevelopmentAgentContract.PairFirst][0] ^= 1;
+                handover.Calculator[0] ^= 1;
+                handover.FormatterBaseline[0] ^= 1;
+                reviewedBaseline.RequireBinding(claim.Binding);
+                var unchangedInputs = ReadFormatterInputs(current.Ledger, reviewedBaseline, stagedPair);
+                if (!unchangedInputs.Calculator.AsSpan().SequenceEqual(owner.RequireOrderCandidate(accepted.Candidate))
+                    || !unchangedInputs.FormatterBaseline.AsSpan().SequenceEqual(reviewedBaseline.Formatter))
+                    throw new InvalidOperationException("Caller mutated trusted input evidence.");
+                VerifyAccepted();
+                Console.WriteLine("BRIDGE_PHASE: accepted S01 bytes handed to S02 read-only input gate; missing or changed acceptance, budget, baseline and predecessor rejected.");
                 Reject(() => current.Ledger.Reserve(claim.JobId, limits,
                     ProposeModel(current.Ledger, "S01", 1, DateTime.UtcNow.Ticks)));
                 try

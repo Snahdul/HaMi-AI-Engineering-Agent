@@ -11,6 +11,9 @@
     <EmbeddedResource Include="../../samples/DevelopmentOrder/Verifiers/PairCalculatorVerifier.cs" LogicalName="HaMi.DevelopmentOrder.CalculatorVerifier.Checks" WithCulture="false" />
     <EmbeddedResource Include="../../samples/DevelopmentOrder/Verifiers/PairCalculatorProgram.cs.txt" LogicalName="HaMi.DevelopmentOrder.CalculatorVerifier.Program" WithCulture="false" />
     <EmbeddedResource Include="../../samples/SandboxCodingPair/Demo.csproj" LogicalName="HaMi.DevelopmentOrder.CalculatorVerifier.Project" WithCulture="false" />
+    <Compile Include="../../samples/DevelopmentOrder/Verifiers/PairFormatterVerifier.cs" Link="Features/Development/PairFormatterVerifier.cs" />
+    <EmbeddedResource Include="../../samples/DevelopmentOrder/Verifiers/PairFormatterVerifier.cs" LogicalName="HaMi.DevelopmentOrder.FormatterVerifier.Checks" WithCulture="false" />
+    <EmbeddedResource Include="../../samples/DevelopmentOrder/Verifiers/PairFormatterProgram.cs.txt" LogicalName="HaMi.DevelopmentOrder.FormatterVerifier.Program" WithCulture="false" />
     <InternalsVisibleTo Include="HaMi.Agentic.JobState.Probe" />
   </ItemGroup>
   <ItemGroup>
