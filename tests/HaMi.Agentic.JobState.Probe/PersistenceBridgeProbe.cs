@@ -2810,7 +2810,10 @@ internal static class PersistenceBridgeProbe
                     return 1;
                 }
 
-                if (formatterCrash is "budget-hard" or "budget-soft")
+                // The initial budget fixture must reach GenerateFormatter and
+                // persist its stop before the pending-reservation recovery.
+                if (formatterCrash is ("budget-hard" or "budget-soft")
+                    && nextAction == OrderWorkflowAction.ReconcilePending)
                 {
                     var pairOrigin = current.PairBudgetOrigin
                         ?? throw new InvalidOperationException("Original pair acceptance missing.");
