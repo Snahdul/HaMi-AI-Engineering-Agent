@@ -167,6 +167,82 @@ internal static class PersistenceBridgeProbe
             ObserveFixtureGuest(claim, outcome.Reservation, bytes));
     }
 
+    // Exercise the real read-only adapter with a controlled transport.
+    // No actual sbx process is started in this disposable CI fixture.
+    private static async Task TestProtectedGuestInspectionAsync(DevelopmentJobStateStore.Lease owner,
+        OrderGuestOutcome recorded, string database)
+    {
+        string name = "hami-code-" + recorded.RunId[..12];
+        string absent = "error: sandbox '" + name + "' not found";
+        int calls = 0;
+        async Task<OrderGuestOutcome> ObserveAsync(DevelopmentSandboxRunner.SandboxProcess result,
+            Action? duringInspect = null)
+        {
+            return await DevelopmentSandboxRunner.RequireProtectedGuestCoreAsync(owner, recorded, (limit, args) =>
+            {
+                if (limit != TimeSpan.FromSeconds(30) || !args.SequenceEqual(new[] { "inspect", name }))
+                    throw new InvalidOperationException("Unexpected reconciliation command.");
+                calls++;
+                duringInspect?.Invoke();
+                return Task.FromResult(result);
+            });
+        }
+
+        async Task RejectObservationAsync(DevelopmentSandboxRunner.SandboxProcess result, Action? duringInspect = null)
+        {
+            try { _ = await ObserveAsync(result, duringInspect); }
+            catch (InvalidOperationException) { return; }
+            throw new InvalidOperationException("Unconfirmed guest inspection accepted.");
+        }
+
+        var fresh = await ObserveAsync(new(1, "", absent));
+        DevelopmentOrderGuestReconciliation.RequireObserved(recorded, fresh);
+        foreach (var result in new DevelopmentSandboxRunner.SandboxProcess[]
+        {
+            new(0, "State: running", ""),
+            new(1, "", "backend unavailable"),
+            new(1, "", "permission denied"),
+            new(1, "", "error: sandbox 'hami-code-ffffffffffff' not found"),
+            new(1, "", absent + " unexpected diagnostic"),
+            new(1, absent.PadRight(256 * 1024), "")
+        })
+            await RejectObservationAsync(result);
+
+        string reportPath = database + ".guest-report-1";
+        byte[] original = owner.RequireOrderGuestReport(recorded, recorded.Reservation);
+        int before = calls;
+        File.Move(reportPath, reportPath + ".saved");
+        try { await RejectObservationAsync(new(1, "", absent)); }
+        finally { File.Move(reportPath + ".saved", reportPath); }
+        if (calls != before)
+            throw new InvalidOperationException("Missing protected report reached backend.");
+        try
+        {
+            await RejectObservationAsync(new(1, "", absent),
+                () => File.WriteAllBytes(reportPath, [.. original, 0x20]));
+        }
+        finally { File.WriteAllBytes(reportPath, original); }
+        if (calls != before + 1)
+            throw new InvalidOperationException("Report change during inspection was not exercised.");
+
+        bool timeout = false;
+        try
+        {
+            _ = await DevelopmentSandboxRunner.RequireProtectedGuestCoreAsync(owner, recorded, (_, args) =>
+            {
+                if (!args.SequenceEqual(new[] { "inspect", name }))
+                    throw new InvalidOperationException("Unexpected timeout command.");
+                throw new TimeoutException("Synthetic inspect timeout.");
+            });
+        }
+        catch (TimeoutException) { timeout = true; }
+        if (!timeout)
+            throw new InvalidOperationException("Inspect timeout became successful evidence.");
+        VerifyFixtureSnapshot(owner, recorded.Reservation);
+        DevelopmentOrderGuestReconciliation.RequireObserved(recorded, await ObserveAsync(new(1, "", absent)));
+        Console.WriteLine("PASS: protected guest read-only adapter requires exact fresh inspect and stable manifest/report; backend failures remain blocked.");
+    }
+
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
         Func<string, string, Task> expectOwnership)
     {
@@ -711,6 +787,9 @@ internal static class PersistenceBridgeProbe
                     throw new InvalidOperationException("Guest outcome changed acceptance or budget.");
                 TestFixtureSnapshotFaults(owner, recoveredGuest.Reservation, database);
                 VerifyFixtureGuest(owner, claim, recoveredGuest);
+                await TestProtectedGuestInspectionAsync(owner, recoveredGuest, database);
+                if (await ReadAsync() != current)
+                    throw new InvalidOperationException("Read-only guest observation changed journal.");
                 string guestPath = database + ".guest-report-1";
                 byte[] originalGuest = owner.RequireOrderGuestReport(recoveredGuest, recoveredGuest.Reservation);
                 File.WriteAllBytes(guestPath, [.. originalGuest, 0x20]);

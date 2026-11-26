@@ -557,6 +557,30 @@ internal static class DevelopmentSandboxRunner
             throw new InvalidOperationException("Recovery sandbox absence not confirmed.");
     }
 
+    // The caller supplies an already authenticated historical descriptor
+    // under the exclusive order lease. This adapter cannot adopt arbitrary
+    // report files, create a VM, or append an event.
+    internal static Task<OrderGuestOutcome> RequireProtectedGuestAsync(
+        DevelopmentJobStateStore.Lease owner, OrderGuestOutcome recorded) =>
+        RequireProtectedGuestCoreAsync(owner, recorded, SbxAsync);
+
+    internal static async Task<OrderGuestOutcome> RequireProtectedGuestCoreAsync(
+        DevelopmentJobStateStore.Lease owner, OrderGuestOutcome recorded,
+        Func<TimeSpan, string[], Task<SandboxProcess>> transport)
+    {
+        byte[] bytes = owner.RequireOrderGuestReport(recorded, recorded.Reservation);
+        string runId = DevelopmentOrderGuestReconciliation.RunId(recorded.Reservation);
+        SandboxProcess result = await transport(TimeSpan.FromSeconds(30), ["inspect", RecoverySandboxName(runId)]);
+        // Recheck the private manifest/report after the external observation.
+        // Report identity must not change across the await.
+        byte[] readback = owner.RequireOrderGuestReport(recorded, recorded.Reservation);
+        OrderCheck.Require(bytes.AsSpan().SequenceEqual(readback), "ORDER_GUEST_REPORT_CHANGED");
+        var observed = DevelopmentOrderGuestReconciliation.Observe(recorded.ArchiveHash, recorded.Reservation,
+            readback, result.ExitCode, result.Output, result.Error, DateTime.UtcNow.Ticks);
+        DevelopmentOrderGuestReconciliation.RequireObserved(recorded, observed);
+        return observed ?? throw new InvalidOperationException("ORDER_GUEST_RECONCILIATION");
+    }
+
     private static string RecoverySandboxName(string runId)
     {
         if (!DevelopmentPublicationPolicy.IsSha(runId, 32) || runId != runId.ToLowerInvariant())
@@ -567,7 +591,7 @@ internal static class DevelopmentSandboxRunner
     internal static bool IsConfirmedAbsent(string runId, int exitCode, string output, string error)
     {
         string name = RecoverySandboxName(runId);
-        if (exitCode == 0)
+        if (exitCode == 0 || output.Length >= MaxOutputChars || error.Length >= MaxOutputChars)
             return false;
         // Observed on HaMi11: sbx reports the exact sandbox name followed
         // by 'not found', with optional wrapping and the fixed CLI hint.
@@ -920,5 +944,5 @@ internal static class DevelopmentSandboxRunner
         throw new InvalidOperationException("Unsafe input was accepted.");
     }
 
-    private sealed record SandboxProcess(int ExitCode, string Output, string Error);
+    internal sealed record SandboxProcess(int ExitCode, string Output, string Error);
 }
