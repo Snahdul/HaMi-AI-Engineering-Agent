@@ -783,7 +783,7 @@ internal static class PersistenceBridgeProbe
         await TestModelDispatchAsync(prefix);
         await TestLiveGuestCaptureAsync(prefix);
         foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan",
-            "model-receipt", "model-orphan", "model-checkpoint", "model-generated", "model-rejected", "model-rejected-orphan" })
+            "model-receipt", "model-orphan", "model-checkpoint", "model-generated", "model-rejected", "model-rejected-orphan", "soft-stop" })
         {
             bool unknown = scenario == "unknown";
             bool failed = scenario == "failed";
@@ -792,6 +792,7 @@ internal static class PersistenceBridgeProbe
             bool guestOrphan = scenario == "guest-orphan";
             bool guestScenario = guest || guestUnknown || guestOrphan;
             bool modelScenario = scenario.StartsWith("model-", StringComparison.Ordinal);
+            bool softScenario = scenario == "soft-stop";
             bool modelGenerated = scenario == "model-generated";
             bool modelRejected = scenario == "model-rejected";
             bool modelCandidate = scenario is "model-orphan" or "model-checkpoint" or "model-generated";
@@ -799,6 +800,7 @@ internal static class PersistenceBridgeProbe
             (string firstMode, string firstMarker, string resumeMode, string resumeMarker) = scenario switch
             {
                 "accepted" => ("bridge-hold", "BRIDGE_ACCEPTED", "bridge-resume", "BRIDGE_COMPLETED"),
+                "soft-stop" => ("bridge-soft-stop", "BRIDGE_SOFT_STOPPED", "bridge-soft-resume", "BRIDGE_SOFT_RESUMED"),
                 "unknown" => ("bridge-unknown", "BRIDGE_RESERVED", "bridge-blocked", "BRIDGE_BLOCKED"),
                 "failed" => ("bridge-failed", "BRIDGE_FAILED", "bridge-retry", "BRIDGE_RETRIED"),
                 "guest" => ("bridge-guest", "BRIDGE_GUEST", "bridge-guest-resume", "BRIDGE_GUEST_RECOVERED"),
@@ -859,7 +861,7 @@ internal static class PersistenceBridgeProbe
                     }
                     Reject(() => owner.CreateOrderJournal());
                     Reject(() => store.Acquire(Issue).Dispose());
-                    if (!unknown && !failed && !guestScenario && !modelScenario && !File.Exists(journal + "-journal"))
+                    if (!unknown && !failed && !guestScenario && !modelScenario && !softScenario && !File.Exists(journal + "-journal"))
                         throw new InvalidOperationException("Crash did not retain the live rollback sidecar.");
                     if (!unknown && !failed && !guestScenario && !modelScenario)
                     {
@@ -906,7 +908,10 @@ internal static class PersistenceBridgeProbe
 
                     string s02 = Path.Combine(root, $"issue-{Issue}.order.db.s02");
                     string candidatePath = Path.Combine(root, $"issue-{Issue}.order.db.candidate-1");
-                    if (modelScenario ? File.Exists(artifact) || File.Exists(s02)
+                    if (softScenario ? !File.ReadAllBytes(artifact).SequenceEqual(AcceptedBytes) || File.Exists(s02)
+                        || !File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.evidence-1"))
+                        || File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.evidence-2"))
+                        : modelScenario ? File.Exists(artifact) || File.Exists(s02)
                         || !File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.model-dispatch-1"))
                         || File.Exists(candidatePath) != modelCandidate
                         || (modelCandidate && !File.ReadAllBytes(candidatePath).SequenceEqual(Encoding.UTF8.GetBytes(ModelCandidate)))
@@ -956,6 +961,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: private canonical snapshot manifests survive guest crash windows; missing/changed/foreign/duplicate manifests rejected.");
         Console.WriteLine("PASS: protected guest dispatch is consumed once across crash/reentry; missing/modified/foreign receipts reject report use.");
         Console.WriteLine("PASS: S01 model dispatch crash windows recover through real Akka SQL replay: receipt-only, orphan, checkpoint-only, generated, rejected and rejected-orphan.");
+        Console.WriteLine("PASS: supervisor admission persists soft stop across process kill; insufficient extension remains stopped, sufficient extension permits fresh charged reservation.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -1024,10 +1030,11 @@ internal static class PersistenceBridgeProbe
         OrderOperationLimits limits = archive.EffectiveLimits;
         var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(archive.BudgetPolicy));
         bool modelScenario = mode.StartsWith("bridge-model-", StringComparison.Ordinal);
+        bool softScenario = mode is "bridge-soft-stop" or "bridge-soft-resume";
         bool first = mode is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
             or "bridge-guest-unknown" or "bridge-guest-orphan"
             or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
-            or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan";
+            or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan" or "bridge-soft-stop";
         if (first)
         {
             var fixtureApproval = FixtureApproval();
@@ -1087,7 +1094,7 @@ internal static class PersistenceBridgeProbe
         try
         {
             var system = host.Services.GetRequiredService<ActorSystem>();
-            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, archive, limits, policy, owner, modelScenario)), "bridge");
+            IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, archive, limits, policy, owner, modelScenario, softScenario)), "bridge");
             async Task<BridgeState> ReadAsync()
             {
                 Task<BridgeState> read = actor.Ask<BridgeState>(new ReadState(), Deadline);
@@ -1102,6 +1109,34 @@ internal static class PersistenceBridgeProbe
                 if (state.Stage != stage)
                     throw new InvalidOperationException("Persisted transition was not acknowledged.");
                 return state;
+            }
+
+            async Task<BridgeState> AdmitAsync(OrderOperationReservation request, int stage)
+            {
+                Task<BridgeState> pending = actor.Ask<BridgeState>(new Admit(request), Deadline);
+                await guard.AwaitAsync(pending);
+                BridgeState state = await pending;
+                if (state.Stage != stage)
+                    throw new InvalidOperationException("Supervisor decision was not acknowledged.");
+                return state;
+            }
+
+            async Task RejectAdmissionAsync(OrderOperationReservation request, bool raw)
+            {
+                try
+                {
+                    if (raw)
+                        _ = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(request), 4);
+                    else
+                        _ = await AdmitAsync(request, 4);
+                }
+                catch (InvalidOperationException ex) when (ex.Message == "Fixture admission blocked."
+                    || ex.Message == "Use supervisor admission.")
+                {
+                    return;
+                }
+
+                throw new InvalidOperationException("Stopped or raw admission was accepted.");
             }
 
             Console.WriteLine("BRIDGE_PHASE: host started; awaiting replay.");
@@ -1240,7 +1275,8 @@ internal static class PersistenceBridgeProbe
                     return 1;
                 }
                 var reserved = ProposeModel(current.Ledger, "S01", 30, DateTime.UtcNow.Ticks);
-                current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(reserved), 2);
+                current = softScenario ? await AdmitAsync(reserved, 2)
+                    : await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(reserved), 2);
                 if (current.Ledger.Pending != reserved || current.Ledger.Models != 1
                     || current.Ledger.ReservedSeconds != 30)
                     throw new InvalidOperationException("Reservation acknowledgement differs.");
@@ -1285,6 +1321,23 @@ internal static class PersistenceBridgeProbe
                     string hash = owner.StoreOrderArtifact("S01", AcceptedBytes);
                     var completion = ObserveFixtureOutcome(owner, claim, reserved, hash);
                     current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeCompletion(completion), 3);
+                    if (softScenario)
+                    {
+                        var request = ProposeModel(current.Ledger, "S02", 50, DateTime.UtcNow.Ticks);
+                        await RejectAdmissionAsync(request, raw: true);
+                        current = await AdmitAsync(request, 3);
+                        if (current.Ledger.SoftStop?.Request != request || current.Ledger.SoftStop.Reason != "time"
+                            || current.Ledger.BudgetStop is not null || current.Ledger.Pending is not null
+                            || current.Ledger.Sequence != 1 || current.Ledger.ReservedSeconds != 30)
+                            throw new InvalidOperationException("Supervisor did not durably stop before optional work.");
+                        await RejectAdmissionAsync(request, raw: false);
+                        owner.ValidateOrderJournalFiles();
+                        Console.WriteLine("BRIDGE_SOFT_STOPPED");
+                        Console.Out.Flush();
+                        await Task.Delay(Timeout.InfiniteTimeSpan);
+                        return 1;
+                    }
+
                     var denied = ProposeModel(current.Ledger, "S02", 100, DateTime.UtcNow.Ticks);
                     current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeBudgetStop(new(1, denied, "time")), 3);
                     if (current.Ledger.BudgetStop?.Request != denied || current.Ledger.Sequence != 1
@@ -1314,6 +1367,49 @@ internal static class PersistenceBridgeProbe
                 Console.Out.Flush();
                 await Task.Delay(Timeout.InfiniteTimeSpan);
                 return 1;
+            }
+
+            if (softScenario)
+            {
+                var recoveredStop = current.Ledger.SoftStop ?? throw new InvalidOperationException("Soft stop not replayed.");
+                var accepted = current.S01 ?? throw new InvalidOperationException("Accepted fixture S01 missing.");
+                VerifyFixtureOutcome(owner, claim, accepted);
+                if (current.Stage != 3 || current.ArtifactHash != AcceptedHash || current.Ledger.Pending is not null
+                    || current.Ledger.BudgetStop is not null || current.Ledger.Sequence != 1
+                    || current.Ledger.Models != 1 || current.Ledger.ReservedSeconds != 30
+                    || recoveredStop.Request.Step != "S02" || recoveredStop.Reason != "time"
+                    || !recoveredStop.RequiredAfter.SequenceEqual(FixtureRequiredAfter("S02", policy)))
+                    throw new InvalidOperationException("Replayed soft stop differs.");
+                var request = ProposeModel(current.Ledger, "S02", 50, DateTime.UtcNow.Ticks);
+                await RejectAdmissionAsync(request, raw: false);
+                await RejectAdmissionAsync(request, raw: true);
+                long originalSoftStart = current.Ledger.StartedUtcTicks;
+                string insufficientHash = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic insufficient soft extension"));
+                var insufficient = new OrderBudgetExtensionApproved(1, claim.JobId, claim.ArchiveHash, 0,
+                    limits with { Seconds = 125 }, insufficientHash, DateTime.UtcNow.Ticks);
+                current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeBudgetExtension(insufficient), 3);
+                if (current.Ledger.SoftStop is null || current.Ledger.BudgetRevision != 1
+                    || current.Ledger.Sequence != 1 || current.Ledger.ReservedSeconds != 30)
+                    throw new InvalidOperationException("Insufficient extension cleared soft stop.");
+                await RejectAdmissionAsync(request with { ObservedUtcTicks = DateTime.UtcNow.Ticks }, raw: false);
+                string sufficientHash = DevelopmentJobState.Hash(Encoding.UTF8.GetBytes("synthetic sufficient soft extension"));
+                var sufficient = new OrderBudgetExtensionApproved(1, claim.JobId, claim.ArchiveHash, 1,
+                    policy.Maximums, sufficientHash, DateTime.UtcNow.Ticks);
+                current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeBudgetExtension(sufficient), 3);
+                if (current.Ledger.SoftStop is not null || current.Ledger.BudgetStop is not null
+                    || current.Ledger.BudgetRevision != 2 || current.Ledger.StartedUtcTicks != originalSoftStart
+                    || current.Ledger.Sequence != 1 || current.Ledger.ReservedSeconds != 30 || current.S01 != accepted)
+                    throw new InvalidOperationException("Sufficient extension lost original state.");
+                VerifyFixtureOutcome(owner, claim, accepted);
+                var resumedRequest = request with { ObservedUtcTicks = DateTime.UtcNow.Ticks };
+                current = await AdmitAsync(resumedRequest, 4);
+                if (current.Ledger.Pending != resumedRequest || current.Ledger.Sequence != 2 || current.Ledger.Models != 2
+                    || current.Ledger.ReservedSeconds != 80 || current.Ledger.StartedUtcTicks != originalSoftStart
+                    || current.S01 != accepted || File.Exists(database + ".s02"))
+                    throw new InvalidOperationException("Fresh admitted reservation differs.");
+                // Stop at the fresh reservation; no transport or S02 acceptance.
+                Console.WriteLine("BRIDGE_SOFT_RESUMED");
+                return 0;
             }
 
             if (modelScenario)
@@ -1770,6 +1866,18 @@ internal static class PersistenceBridgeProbe
 
     private sealed record ReadState;
     private sealed record Advance(string Event);
+    private sealed record Admit(OrderOperationReservation Request);
+
+    // Reviewed disposable fixture only: the existing synthetic S01/S02
+    // completion already represents accepted work. No dynamic estimator or
+    // production verifier durations are asserted by these values.
+    private static OrderRequiredOperation[] FixtureRequiredAfter(string step, DevelopmentOrderBudgetPolicy policy) =>
+        step switch
+        {
+            "S01" => [new("S02", "model", 20), new("S02", "guest", 20), new("FINAL", "guest", policy.FinalVerificationSeconds)],
+            "S02" => [new("S02", "guest", 20), new("FINAL", "guest", policy.FinalVerificationSeconds)],
+            _ => throw new InvalidOperationException("Unexpected fixture admission step.")
+        };
     private sealed record RecordedOperation(OrderOperationReservation Reservation, OrderOperationCompletion Completion);
     private sealed record BridgeState(int Stage, string? ArtifactHash, DevelopmentOrderOperationLedger Ledger,
         RecordedOperation? S01 = null, RecordedOperation? S02 = null, RecordedOperation? FailedS01 = null);
@@ -1783,14 +1891,16 @@ internal static class PersistenceBridgeProbe
         private readonly OrderOperationLimits limits;
         private readonly DevelopmentOrderBudgetPolicy policy;
         private readonly bool modelScenario;
+        private readonly bool softScenario;
 
         public override string PersistenceId { get; }
 
         public BridgeActor(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive,
             OrderOperationLimits limits, DevelopmentOrderBudgetPolicy policy, DevelopmentJobStateStore.Lease owner,
-            bool modelScenario)
+            bool modelScenario, bool softScenario)
         {
             this.modelScenario = modelScenario;
+            this.softScenario = softScenario;
             PersistenceId = claim.PersistenceId;
             this.claim = claim;
             this.archive = archive;
@@ -1801,10 +1911,51 @@ internal static class PersistenceBridgeProbe
             Recover<RecoveryCompleted>(_ => recovered = true);
             Command<ReadState>(_ => Sender.Tell(recovered ? state :
                 throw new InvalidOperationException("Recovery incomplete.")));
+            Command<Admit>(command =>
+            {
+                if (!recovered || !softScenario || state.Ledger.SoftStop is not null
+                    || state.Ledger.BudgetStop is not null || state.Ledger.Pending is not null)
+                {
+                    Sender.Tell(new Status.Failure(new InvalidOperationException("Fixture admission blocked.")));
+                    return;
+                }
+
+                var request = command.Request;
+                var effective = state.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
+                var required = FixtureRequiredAfter(request.Step, policy);
+                string? hard = state.Ledger.BudgetDenial(claim.JobId, effective, request);
+                string? soft = state.Ledger.SoftStopDenial(claim.JobId, effective, request, required);
+                string evt;
+                if (hard is not null)
+                    evt = DevelopmentOrderOperationLedger.EncodeBudgetStop(new(1, request, hard));
+                else if (soft is not null)
+                    evt = DevelopmentOrderOperationLedger.EncodeSoftStop(new(1, request, required, soft));
+                else
+                {
+                    _ = state.Ledger.ReserveWithRequiredWork(claim.JobId, effective, request, required);
+                    evt = DevelopmentOrderOperationLedger.EncodeReservation(request);
+                }
+
+                BridgeState next = Next(state, evt);
+                IActorRef reply = Sender;
+                Persist(evt, _ =>
+                {
+                    state = next;
+                    reply.Tell(state);
+                });
+            });
             Command<Advance>(command =>
             {
                 if (!recovered)
                     throw new InvalidOperationException("Recovery incomplete.");
+                if (softScenario && (command.Event.StartsWith("reserve-v4:", StringComparison.Ordinal)
+                    || command.Event.StartsWith("soft-stop-v1:", StringComparison.Ordinal)
+                    || command.Event.StartsWith("budget-stop-v1:", StringComparison.Ordinal)))
+                {
+                    Sender.Tell(new Status.Failure(new InvalidOperationException("Use supervisor admission.")));
+                    return;
+                }
+
                 BridgeState next = Next(state, command.Event);
                 // Only the live command boundary reads protected evidence.
                 // Replay remains a pure fold and the host verifies recovered
@@ -1862,6 +2013,16 @@ internal static class PersistenceBridgeProbe
             if (previous.Stage is 1 or 3)
             {
                 var effective = previous.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
+                if (evt.StartsWith("soft-stop-v1:", StringComparison.Ordinal))
+                {
+                    var stop = DevelopmentOrderOperationLedger.DecodeSoftStop(evt);
+                    if (!softScenario || stop.Request.Step != (previous.Stage == 1 ? "S01" : "S02")
+                        || stop.Request.Kind != "model"
+                        || !stop.RequiredAfter.SequenceEqual(FixtureRequiredAfter(stop.Request.Step, policy)))
+                        throw new InvalidOperationException("Unexpected fixture soft stop.");
+                    VerifyFixtureAssignment(claim, archive, stop.Request);
+                    return previous with { Ledger = previous.Ledger.StopSoft(claim.JobId, effective, stop) };
+                }
                 if (evt.StartsWith("budget-stop-v1:", StringComparison.Ordinal))
                 {
                     var stop = DevelopmentOrderOperationLedger.DecodeBudgetStop(evt);
@@ -1890,7 +2051,10 @@ internal static class PersistenceBridgeProbe
                 return previous with
                 {
                     Stage = previous.Stage + 1,
-                    Ledger = previous.Ledger.Reserve(claim.JobId, effective, reservation)
+                    Ledger = softScenario
+                        ? previous.Ledger.ReserveWithRequiredWork(claim.JobId, effective, reservation,
+                            FixtureRequiredAfter(reservation.Step, policy))
+                        : previous.Ledger.Reserve(claim.JobId, effective, reservation)
                 };
             }
             if (previous.Stage is 2 or 4)
