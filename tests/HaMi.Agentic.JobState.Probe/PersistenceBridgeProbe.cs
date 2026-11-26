@@ -1284,6 +1284,73 @@ internal static class PersistenceBridgeProbe
                 || DevelopmentOrderGuestReconciliation.IsSuccessfulReport(proposal,
                     Encode(report with { SnapshotHash = new string('A', 64) })))
                 throw new InvalidOperationException("Incorrect formatter report accepted.");
+
+            // This slice exercises historical correlation with a locally
+            // folded guest completion; actual guest Persist/Ack follows.
+            var completedGuest = admitted.CompleteGuest(outcome);
+            var observed = ObserveFixtureGuest(claim, proposal, captured)
+                ?? throw new InvalidOperationException("Formatter fixture absence missing.");
+            OrderCandidateCheckpoint Correlate(DevelopmentOrderOperationLedger guest, OrderGuestOutcome? fresh) =>
+                DevelopmentOrderFormatterVerifier.RequireCompletedGuest(owner, accepted, completed, guest, inputs, fresh);
+            if (Correlate(completedGuest, observed) != candidate
+                || completedGuest.AcceptedS01 != inputs.CalculatorAcceptance
+                || completedGuest.Pending is not null || completedGuest.Sequence != 4
+                || completedGuest.ReservedSeconds != 80)
+                throw new InvalidOperationException("Formatter guest history differs.");
+            Reject(() => Correlate(admitted, observed));
+            Reject(() => Correlate(completed, observed));
+            Reject(() => Correlate(completedGuest with { ReservedSeconds = 0 }, observed));
+            Reject(() => Correlate(completedGuest with { AcceptedS01 = null }, observed));
+            Reject(() => Correlate(completedGuest, null));
+            Reject(() => Correlate(completedGuest, observed with { ReportHash = new string('A', 64) }));
+            Reject(() => Correlate(completedGuest, observed with { ObservedUtcTicks = outcome.ObservedUtcTicks - 1 }));
+            Reject(() => DevelopmentOrderFormatterVerifier.RequireCompletedGuest(owner, accepted, completed, completedGuest,
+                inputs with { Calculator = [.. inputs.Calculator, 0x20] }, observed));
+
+            foreach (string suffix in new[] { ".snapshot-4", ".guest-dispatch-4", ".guest-report-4",
+                ".model-dispatch-3", ".candidate-3", ".evidence-3", ".candidate-1" })
+            {
+                string evidenceFile = journal + suffix;
+                byte[] original = File.ReadAllBytes(evidenceFile);
+                File.WriteAllBytes(evidenceFile, [.. original, 0x20]);
+                try { Reject(() => Correlate(completedGuest, observed)); }
+                finally { File.WriteAllBytes(evidenceFile, original); }
+            }
+
+            // Independent stage observation of the exact two candidate files,
+            // separate from the five-file verifier input directory.
+            var baseline = ObserveCalculatorBaseline(root, claim.Binding);
+            string pairStage = Path.Combine(root, "formatter-stage");
+            Directory.CreateDirectory(pairStage);
+            File.WriteAllBytes(Path.Combine(pairStage, "PairCalculator.cs"), owner.RequireOrderCandidate(inputs.CalculatorAcceptance.Candidate));
+            File.WriteAllBytes(Path.Combine(pairStage, "PairFormatter.cs"), owner.RequireOrderCandidate(candidate));
+            void VerifyScope() => DevelopmentOrderFormatterVerifier.RequirePairScope(owner, inputs.CalculatorAcceptance,
+                Correlate(completedGuest, observed), ObserveCalculatorBaseline(root, claim.Binding),
+                DevelopmentOrderCalculatorVerifier.ReadStagedPair(pairStage));
+            VerifyScope();
+            foreach (string file in new[] { "PairCalculator.cs", "PairFormatter.cs" })
+            {
+                string stagedPath = Path.Combine(pairStage, file);
+                byte[] original = File.ReadAllBytes(stagedPath);
+                File.WriteAllBytes(stagedPath, [.. original, 0x20]);
+                try { Reject(VerifyScope); }
+                finally { File.WriteAllBytes(stagedPath, original); }
+            }
+            string stagedFormatter = Path.Combine(pairStage, "PairFormatter.cs");
+            File.WriteAllBytes(stagedFormatter, baseline.Formatter);
+            try { Reject(VerifyScope); }
+            finally { File.WriteAllBytes(stagedFormatter, owner.RequireOrderCandidate(candidate)); }
+            string additional = Path.Combine(pairStage, "Extra.cs");
+            File.WriteAllText(additional, "// forbidden");
+            try { Reject(VerifyScope); }
+            finally { File.Delete(additional); }
+            File.Delete(stagedFormatter);
+            try { Reject(VerifyScope); }
+            finally { File.WriteAllBytes(stagedFormatter, owner.RequireOrderCandidate(candidate)); }
+            Reject(() => DevelopmentOrderFormatterVerifier.RequirePairScope(owner, inputs.CalculatorAcceptance, candidate,
+                baseline with { Scope = [.. baseline.Scope, 0x20] }, DevelopmentOrderCalculatorVerifier.ReadStagedPair(pairStage)));
+            VerifyScope();
+            Console.WriteLine("BRIDGE_PHASE: S02 historical guest correlation and exact two-file scope verified; changed history, evidence, predecessor and stage rejected.");
         }
         else if (File.Exists(reportSlot))
             throw new InvalidOperationException("Wrong semantic output produced protected evidence.");

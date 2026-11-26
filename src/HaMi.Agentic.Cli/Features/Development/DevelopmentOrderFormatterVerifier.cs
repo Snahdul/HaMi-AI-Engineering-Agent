@@ -128,6 +128,66 @@ internal static class DevelopmentOrderFormatterVerifier
         return manifest;
     }
 
+    // Read-only historical correlation of genuine replay views. Neither
+    // a protected report alone nor a fresh absence observation may replace
+    // the journalled guest completion. No source directory is needed here.
+    internal static OrderCandidateCheckpoint RequireCompletedGuest(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger acceptedLedger, DevelopmentOrderOperationLedger completedModel,
+        DevelopmentOrderOperationLedger completedGuest, OrderFormatterInputs inputs,
+        OrderGuestOutcome? independentlyObserved)
+    {
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var outcome = completedGuest.LatestGuestOutcome
+            ?? throw new InvalidOperationException("ORDER_FORMATTER_VERIFIER_OUTCOME");
+        var reservation = outcome.Reservation;
+        byte[] manifest = ExpectedManifest(owner, acceptedLedger, completedModel, inputs);
+        var limits = completedModel.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+        OrderCheck.Require(reservation == completedModel.Propose(claim.JobId, "S02", "guest",
+            reservation.ReservedSeconds, reservation.ObservedUtcTicks, null, DevelopmentJobState.Hash(manifest))
+            && completedGuest == completedModel.Reserve(claim.JobId, limits, reservation).CompleteGuest(outcome),
+            "ORDER_FORMATTER_VERIFIER_GUEST_HISTORY");
+        OrderCheck.Require(owner.RequireOrderSnapshotManifest(reservation).AsSpan().SequenceEqual(manifest),
+            "ORDER_FORMATTER_VERIFIER_MANIFEST");
+        byte[] report = owner.RequireOrderGuestReport(outcome, reservation);
+        OrderCheck.Require(DevelopmentOrderGuestReconciliation.IsFormatterReport(reservation, report),
+            "ORDER_FORMATTER_VERIFIER_REPORT");
+        DevelopmentOrderGuestReconciliation.RequireObserved(outcome, independentlyObserved);
+        return completedModel.LatestCandidate
+            ?? throw new InvalidOperationException("ORDER_FORMATTER_VERIFIER_CANDIDATE");
+    }
+
+    // Independent bounded two-file scope check against the approved Git
+    // baseline and both protected candidate descriptors. The observed stage
+    // must contain exactly the accepted calculator and the new formatter.
+    // The host must establish trusted checkout/stage ownership separately.
+    internal static void RequirePairScope(DevelopmentJobStateStore.Lease owner, OrderS01Accepted accepted,
+        OrderCandidateCheckpoint formatter, OrderGitBaseline baseline, IReadOnlyDictionary<string, byte[]> stagedPair)
+    {
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        baseline.RequireBinding(claim.Binding);
+        OrderCheck.Require(accepted.ArchiveHash == claim.ArchiveHash
+            && accepted.Candidate is { Step: "S01", Quality: "Generated" }
+            && accepted.ScopeHash == claim.Binding.ScopeHash
+            && accepted.FormatterBaselineHash == claim.Binding.FormatterBaselineHash
+            && formatter is { Step: "S02", Quality: "Generated" },
+            "ORDER_FORMATTER_ACCEPTANCE_BINDING");
+        formatter.RequireFormatterInput(claim, accepted);
+        var scope = DevelopmentContract.Parse(new System.Text.UTF8Encoding(false, true).GetString(baseline.Scope));
+        OrderCheck.Require(scope.TaskId == "sandbox-pair"
+            && scope.AllowedWritePaths.SequenceEqual(
+                [DevelopmentAgentContract.PairFirst, DevelopmentAgentContract.PairSecond], StringComparer.Ordinal)
+            && stagedPair.Count == 2 && stagedPair.Keys.OrderBy(p => p, StringComparer.Ordinal)
+                .SequenceEqual(scope.AllowedWritePaths.OrderBy(p => p, StringComparer.Ordinal), StringComparer.Ordinal),
+            "ORDER_FORMATTER_ACCEPTANCE_SCOPE");
+        byte[] calculatorBytes = owner.RequireOrderCandidate(accepted.Candidate);
+        byte[] formatterBytes = owner.RequireOrderCandidate(formatter);
+        OrderCheck.Require(!calculatorBytes.AsSpan().SequenceEqual(baseline.Calculator)
+            && !formatterBytes.AsSpan().SequenceEqual(baseline.Formatter)
+            && stagedPair[DevelopmentAgentContract.PairFirst].AsSpan().SequenceEqual(calculatorBytes)
+            && stagedPair[DevelopmentAgentContract.PairSecond].AsSpan().SequenceEqual(formatterBytes),
+            "ORDER_FORMATTER_ACCEPTANCE_BYTES");
+    }
+
     internal static bool MatchesOutput(string output, string error) =>
         error.Length == 0 && (output == ExpectedStdout + "\n" || output == ExpectedStdout + "\r\n");
 
