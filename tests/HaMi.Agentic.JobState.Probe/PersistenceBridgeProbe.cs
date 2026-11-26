@@ -1090,7 +1090,9 @@ internal static class PersistenceBridgeProbe
     }
 
     private static async Task TestIntegrationSnapshotAsync(DevelopmentJobStateStore.Lease owner,
-        OrderPairHistory history, OrderPairObservation observed, string root, string journal)
+        OrderPairHistory history, OrderPairObservation observed, string root, string journal,
+        Func<OrderOperationReservation, Task<DevelopmentOrderOperationLedger>> admit,
+        Func<OrderGuestOutcome, Task<DevelopmentOrderOperationLedger>> complete)
     {
         var files = DevelopmentOrderIntegrationVerifier.Prepare(owner, history, observed);
         var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
@@ -1185,8 +1187,11 @@ internal static class PersistenceBridgeProbe
             throw new InvalidOperationException("Integration snapshot preparation dispatched or accepted work.");
         Console.WriteLine("BRIDGE_PHASE: exact four-file FINAL snapshot binds both accepted candidates and original integration harness; substitutions rejected.");
 
-        // Synthetic acknowledged guest view in this slice. Actual FINAL
-        // admission/Persist and process recovery are separate increments.
+        // Only the actual actor acknowledgement authorizes the controlled
+        // transport fixture, and it must equal the expected reservation fold.
+        var acknowledged = await admit(proposal);
+        if (acknowledged != admitted)
+            throw new InvalidOperationException("Integration guest admission acknowledgement differs.");
         string results = Path.Combine(root, "integration-results");
         Directory.CreateDirectory(results);
         string id = DevelopmentOrderGuestReconciliation.RunId(proposal);
@@ -1275,7 +1280,7 @@ internal static class PersistenceBridgeProbe
         if (calls != 0 || File.Exists(journal + ".guest-dispatch-5"))
             throw new InvalidOperationException("Invalid integration context reached dispatch.");
 
-        var outcome = await Run(admitted, history, observed)
+        var outcome = await Run(acknowledged, history, observed)
             ?? throw new InvalidOperationException("Integration runner returned no outcome.");
         owner.RequireOrderGuestDispatch(proposal);
         byte[] captured = owner.RequireOrderGuestReport(outcome, proposal);
@@ -1304,7 +1309,34 @@ internal static class PersistenceBridgeProbe
         await RejectRunAsync(admitted, history, observed);
         if (calls != before || ledger.Pending is not null || ledger.FinalGuests != 0)
             throw new InvalidOperationException("Integration runner repeated or changed acceptance history.");
-        Console.WriteLine("BRIDGE_PHASE: FINAL controlled runner captures exact integration report, rejects generic or wrong verifier context and duplicate dispatch.");
+        var completedGuest = acknowledged.CompleteGuest(outcome);
+        var fresh = ObserveFixtureGuest(claim, proposal, captured)
+            ?? throw new InvalidOperationException("Integration absence observation missing.");
+        OrderGuestOutcome Correlate(DevelopmentOrderOperationLedger state, OrderGuestOutcome? observation) =>
+            DevelopmentOrderIntegrationVerifier.RequireCompletedGuest(owner, history, observed, state, observation);
+        if (Correlate(completedGuest, fresh) != outcome || completedGuest.Pending is not null
+            || completedGuest.AcceptedS02 != accepted || completedGuest.Sequence != 5
+            || completedGuest.ReservedSeconds != ledger.ReservedSeconds + seconds)
+            throw new InvalidOperationException("Integration guest history differs.");
+        Reject(() => Correlate(acknowledged, fresh));
+        Reject(() => Correlate(ledger, fresh));
+        Reject(() => Correlate(completedGuest, null));
+        Reject(() => Correlate(completedGuest, fresh with { ReportHash = new string('A', 64) }));
+        Reject(() => Correlate(completedGuest, fresh with { ObservedUtcTicks = outcome.ObservedUtcTicks - 1 }));
+        Reject(() => Correlate(completedGuest with { AcceptedS02 = null }, fresh));
+        Reject(() => Correlate(completedGuest with { ReservedSeconds = 0 }, fresh));
+        foreach (string suffix in new[] { ".snapshot-5", ".guest-dispatch-5", ".guest-report-5",
+            ".guest-report-2", ".guest-report-4", ".candidate-1", ".candidate-3" })
+        {
+            string evidence = journal + suffix;
+            byte[] original = File.ReadAllBytes(evidence);
+            File.WriteAllBytes(evidence, [.. original, 0x20]);
+            try { Reject(() => Correlate(completedGuest, fresh)); }
+            finally { File.WriteAllBytes(evidence, original); }
+        }
+        if (await complete(outcome) != completedGuest)
+            throw new InvalidOperationException("Integration guest completion acknowledgement differs.");
+        Console.WriteLine("BRIDGE_PHASE: FINAL controlled runner and historical correlation verified; exact integration outcome persisted before ack.");
     }
 
     private static async Task TestFormatterSnapshotAsync(DevelopmentJobStateStore.Lease owner,
@@ -1822,6 +1854,35 @@ internal static class PersistenceBridgeProbe
                     await expectOwnership(root, "ACQUIRED:order");
                 }
 
+                string[] finalSlots = ["snapshot-5", "guest-dispatch-5", "guest-report-5"];
+                byte[][] finalEvidence = [];
+                if (scenario == "model-accepted")
+                {
+                    using Process finalChild = start(resumeMode, root);
+                    Task<string> finalErrors = finalChild.StandardError.ReadToEndAsync();
+                    try
+                    {
+                        await WaitForMarkerAsync(finalChild, "BRIDGE_FINAL_COMPLETED").WaitAsync(Deadline);
+                        if (finalChild.HasExited)
+                            throw new InvalidOperationException("Integration owner stopped before process kill.");
+                        await expectOwnership(root, "BUSY");
+                        finalEvidence = finalSlots.Select(slot => File.ReadAllBytes(calculatorPrefix + slot)).ToArray();
+                    }
+                    finally
+                    {
+                        if (!finalChild.HasExited)
+                            finalChild.Kill(entireProcessTree: true);
+                        await finalChild.WaitForExitAsync().WaitAsync(Deadline);
+                        string diagnostics = await finalErrors.WaitAsync(Deadline);
+                        if (diagnostics.Length > 0)
+                            Console.Error.WriteLine(diagnostics[^Math.Min(diagnostics.Length, 16 * 1024)..]);
+                    }
+
+                    if (finalChild.ExitCode == 0)
+                        throw new InvalidOperationException("Integration owner did not terminate abnormally.");
+                    await expectOwnership(root, "ACQUIRED:order");
+                }
+
                 using Process resumed = start(resumeMode, root);
                 Task<string> output = resumed.StandardOutput.ReadToEndAsync();
                 Task<string> errors = resumed.StandardError.ReadToEndAsync();
@@ -1879,6 +1940,12 @@ internal static class PersistenceBridgeProbe
                         || File.Exists(calculatorPrefix + "snapshot-5") != (scenario == "model-accepted")
                         || File.Exists(calculatorPrefix + "guest-report-5") != (scenario == "model-accepted")))
                         throw new InvalidOperationException("Formatter guest recovery changed protected slots.");
+                    if (scenario == "model-accepted" && (finalSlots.Where((slot, i) =>
+                        !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(finalEvidence[i])).Any()
+                        || File.Exists(calculatorPrefix + "guest-dispatch-6")
+                        || File.Exists(calculatorPrefix + "snapshot-6")
+                        || File.Exists(calculatorPrefix + "guest-report-6")))
+                        throw new InvalidOperationException("Integration recovery changed protected slots.");
                 }
                 finally
                 {
@@ -1905,6 +1972,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: S02 receipt-only, orphan, checkpoint-only, terminal rejected and rejected-orphan crash windows replay without redispatch, evidence adoption or budget reset.");
         Console.WriteLine("PASS: S02 guest admission and successful outcome persisted before ack; completed and unresolved wrong-marker process kills recover without redispatch or budget reset.");
         Console.WriteLine("PASS: independent S02 acceptance persisted and recovered after process kill; immutable predecessor, exact evidence, budget and no redispatch.");
+        Console.WriteLine("PASS: FINAL guest reservation and successful outcome persisted before ack; process kill recovers all three guest proofs and both acceptances without redispatch or budget reset.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2506,6 +2574,38 @@ internal static class PersistenceBridgeProbe
                     DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state,
                         ObserveCalculatorFixture(owner, claim, outcome), baseline, pair);
 
+                if (current.Stage == 15)
+                {
+                    var history = RequirePairHistory(current);
+                    var observations = ObservePairFixture(owner, claim, history, root);
+                    var recordedFinal = current.Ledger.LatestGuestOutcome
+                        ?? throw new InvalidOperationException("Integration outcome missing.");
+                    byte[] finalReport = owner.RequireOrderGuestReport(recordedFinal, recordedFinal.Reservation);
+                    var finalObservation = ObserveFixtureGuest(claim, recordedFinal.Reservation, finalReport);
+                    if (DevelopmentOrderIntegrationVerifier.RequireCompletedGuest(owner, history, observations,
+                            current.Ledger, finalObservation) != recordedFinal
+                        || current.Ledger.Sequence != 5 || current.Ledger.Models != 2 || current.Ledger.Guests != 3
+                        || current.Ledger.FinalGuests != 1 || current.Ledger.Pending is not null
+                        || current.Ledger.ReservedSeconds != 80 + history.AcceptedPair.FinalReserveSeconds
+                        || current.Ledger.StartedUtcTicks != history.AcceptedPair.StartedUtcTicks
+                        || current.Ledger.AcceptedS01 != history.AcceptedPair.AcceptedS01
+                        || current.Ledger.AcceptedS02 != history.AcceptedPair.AcceptedS02)
+                        throw new InvalidOperationException("Recovered integration history differs.");
+                    Reject(() => DevelopmentOrderIntegrationVerifier.RequireCompletedGuest(owner, history, observations, current.Ledger, null));
+                    Reject(() => owner.ConsumeOrderGuestDispatch(current.Ledger, recordedFinal.Reservation));
+                    var repeatedFinal = current.Ledger.Propose(claim.JobId, "FINAL", "guest",
+                        history.AcceptedPair.FinalReserveSeconds, DateTime.UtcNow.Ticks, null, recordedFinal.Reservation.SnapshotHash);
+                    Reject(() => current.Ledger.Reserve(claim.JobId, limits, repeatedFinal));
+                    bool rejectedFinal = false;
+                    try { _ = await actor.Ask<BridgeState>(new RecordIntegrationGuest(recordedFinal), Deadline); }
+                    catch (InvalidOperationException) { rejectedFinal = true; }
+                    if (!rejectedFinal || await ReadAsync() != current || File.Exists(database + ".guest-dispatch-6"))
+                        throw new InvalidOperationException("Integration recovery mutated journal.");
+                    Console.WriteLine("BRIDGE_PHASE: FINAL guest completion recovered after process kill; both acceptances, exact protected evidence and original budget retained.");
+                    Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
+                    return 0;
+                }
+
                 if (current.Stage == 13)
                 {
                     var beforeFormatterAcceptance = current.FormatterInputState
@@ -2549,12 +2649,36 @@ internal static class PersistenceBridgeProbe
                     var pairObservation = new OrderPairObservation(ObserveCalculatorFixture(owner, claim, outcome),
                         freshFormatterObservation, ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root),
                         DevelopmentOrderCalculatorVerifier.ReadStagedPair(Path.Combine(root, "formatter-stage")));
-                    await TestIntegrationSnapshotAsync(owner, pairHistory, pairObservation, root, database);
-                    if (await ReadAsync() != current || File.Exists(database + ".guest-dispatch-6"))
-                        throw new InvalidOperationException("Formatter acceptance recovery mutated journal.");
+                    async Task<DevelopmentOrderOperationLedger> AdmitIntegration(OrderOperationReservation request)
+                    {
+                        Task<BridgeState> ack = actor.Ask<BridgeState>(new AdmitIntegrationGuest(request), Deadline);
+                        await guard.AwaitAsync(ack);
+                        current = await ack;
+                        if (current.Stage != 14 || current.PairAcceptance != pairHistory.AcceptedPair)
+                            throw new InvalidOperationException("Integration admission stage differs.");
+                        return current.Ledger;
+                    }
+
+                    async Task<DevelopmentOrderOperationLedger> CompleteIntegration(OrderGuestOutcome guestOutcome)
+                    {
+                        Task<BridgeState> ack = actor.Ask<BridgeState>(new RecordIntegrationGuest(guestOutcome), Deadline);
+                        await guard.AwaitAsync(ack);
+                        current = await ack;
+                        if (current.Stage != 15)
+                            throw new InvalidOperationException("Integration completion stage differs.");
+                        return current.Ledger;
+                    }
+
+                    await TestIntegrationSnapshotAsync(owner, pairHistory, pairObservation, root, database,
+                        AdmitIntegration, CompleteIntegration);
+                    if (await ReadAsync() != current || current.Stage != 15 || File.Exists(database + ".guest-dispatch-6"))
+                        throw new InvalidOperationException("Integration completion changed history.");
+                    owner.ValidateOrderJournalFiles();
                     Console.WriteLine("BRIDGE_PHASE: persisted S02 acceptance recovered after process kill; exact predecessor, candidate, guest evidence and budget unchanged.");
-                    Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
-                    return 0;
+                    Console.WriteLine("BRIDGE_FINAL_COMPLETED");
+                    Console.Out.Flush();
+                    await Task.Delay(Timeout.InfiniteTimeSpan);
+                    return 1;
                 }
 
                 if (current.Stage is 11 or 12)
@@ -3442,6 +3566,8 @@ internal static class PersistenceBridgeProbe
     private sealed record AdmitFormatterGuest(OrderOperationReservation Request);
     private sealed record RecordFormatterGuest(OrderGuestOutcome Outcome);
     private sealed record AcceptFormatter;
+    private sealed record AdmitIntegrationGuest(OrderOperationReservation Request);
+    private sealed record RecordIntegrationGuest(OrderGuestOutcome Outcome);
 
     // Reviewed disposable fixture only: the existing synthetic S01/S02
     // completion already represents accepted work. No dynamic estimator or
@@ -3458,7 +3584,29 @@ internal static class PersistenceBridgeProbe
         RecordedOperation? S01 = null, RecordedOperation? S02 = null, RecordedOperation? FailedS01 = null,
         DevelopmentOrderOperationLedger? CalculatorModel = null, DevelopmentOrderOperationLedger? CalculatorGuest = null,
         DevelopmentOrderOperationLedger? FormatterInputState = null, DevelopmentOrderOperationLedger? FormatterModel = null,
-        DevelopmentOrderOperationLedger? FormatterGuest = null);
+        DevelopmentOrderOperationLedger? FormatterGuest = null, DevelopmentOrderOperationLedger? PairAcceptance = null);
+
+    private static OrderPairHistory RequirePairHistory(BridgeState state) =>
+        new(state.CalculatorModel ?? throw new InvalidOperationException("Calculator model history missing."),
+            state.CalculatorGuest ?? throw new InvalidOperationException("Calculator guest history missing."),
+            state.FormatterInputState ?? throw new InvalidOperationException("Calculator acceptance history missing."),
+            state.FormatterModel ?? throw new InvalidOperationException("Formatter model history missing."),
+            state.FormatterGuest ?? throw new InvalidOperationException("Formatter guest history missing."),
+            state.PairAcceptance ?? (state.Stage == 13 ? state.Ledger
+                : throw new InvalidOperationException("Pair acceptance history missing.")));
+
+    private static OrderPairObservation ObservePairFixture(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderClaim claim, OrderPairHistory history, string root)
+    {
+        var calculator = history.CalculatorGuest.LatestGuestOutcome
+            ?? throw new InvalidOperationException("Calculator guest outcome missing.");
+        var formatter = history.FormatterGuest.LatestGuestOutcome
+            ?? throw new InvalidOperationException("Formatter guest outcome missing.");
+        byte[] report = owner.RequireOrderGuestReport(formatter, formatter.Reservation);
+        return new(ObserveCalculatorFixture(owner, claim, calculator),
+            ObserveFixtureGuest(claim, formatter.Reservation, report), ObserveCalculatorBaseline(root, claim.Binding),
+            CalculatorRecoveryPair(root), DevelopmentOrderCalculatorVerifier.ReadStagedPair(Path.Combine(root, "formatter-stage")));
+    }
 
     private sealed class BridgeActor : ReceivePersistentActor
     {
@@ -3701,6 +3849,54 @@ internal static class PersistenceBridgeProbe
                     Sender.Tell(new Status.Failure(ex));
                 }
             });
+            Command<AdmitIntegrationGuest>(command =>
+            {
+                try
+                {
+                    if (!recovered || !calculatorScenario || state.Stage != 13)
+                        throw new InvalidOperationException("Integration admission blocked.");
+                    var history = RequirePairHistory(state);
+                    DevelopmentOrderIntegrationVerifier.RequireGuestSnapshot(owner, history,
+                        ObservePairFixture(owner, claim, history, root), command.Request, Path.Combine(root, "integration-verification"));
+                    string evt = DevelopmentOrderOperationLedger.EncodeReservation(command.Request);
+                    BridgeState next = Next(state, evt);
+                    IActorRef reply = Sender;
+                    Persist(evt, _ =>
+                    {
+                        state = next;
+                        reply.Tell(state);
+                    });
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException or System.Text.Json.JsonException)
+                {
+                    Sender.Tell(new Status.Failure(ex));
+                }
+            });
+            Command<RecordIntegrationGuest>(command =>
+            {
+                try
+                {
+                    if (!recovered || !calculatorScenario || state.Stage != 14)
+                        throw new InvalidOperationException("Integration outcome recording blocked.");
+                    var history = RequirePairHistory(state);
+                    string evt = DevelopmentOrderOperationLedger.EncodeGuestOutcome(command.Outcome);
+                    BridgeState next = Next(state, evt);
+                    byte[] report = owner.RequireOrderGuestReport(command.Outcome, command.Outcome.Reservation);
+                    _ = DevelopmentOrderIntegrationVerifier.RequireCompletedGuest(owner, history,
+                        ObservePairFixture(owner, claim, history, root), next.Ledger,
+                        ObserveFixtureGuest(claim, command.Outcome.Reservation, report));
+                    IActorRef reply = Sender;
+                    Persist(evt, _ =>
+                    {
+                        state = next;
+                        reply.Tell(state);
+                    });
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException or System.Text.Json.JsonException)
+                {
+                    Sender.Tell(new Status.Failure(ex));
+                }
+            });
             Command<Advance>(command =>
             {
                 if (!recovered)
@@ -3855,6 +4051,26 @@ internal static class PersistenceBridgeProbe
                     FormatterGuest = previous.Ledger,
                     Ledger = previous.Ledger.AcceptS02(claim, DevelopmentOrderOperationLedger.DecodeS02Accepted(evt))
                 };
+            if (calculatorScenario && previous.Stage == 13)
+            {
+                var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
+                if (reservation is not { Step: "FINAL", Kind: "guest" } || previous.Ledger.AcceptedS02 is null)
+                    throw new InvalidOperationException("Integration guest reservation required.");
+                var effective = previous.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
+                return previous with
+                {
+                    Stage = 14,
+                    PairAcceptance = previous.Ledger,
+                    Ledger = previous.Ledger.ReserveWithRequiredWork(claim.JobId, effective, reservation, [])
+                };
+            }
+            if (calculatorScenario && previous.Stage == 14)
+            {
+                var outcome = DevelopmentOrderOperationLedger.DecodeGuestOutcome(evt);
+                if (outcome.Reservation is not { Step: "FINAL", Kind: "guest" })
+                    throw new InvalidOperationException("Integration guest outcome required.");
+                return previous with { Stage = 15, Ledger = previous.Ledger.CompleteGuest(outcome) };
+            }
             if (calculatorScenario && previous.Stage == 7)
             {
                 var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);

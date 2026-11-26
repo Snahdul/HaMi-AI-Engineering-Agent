@@ -90,6 +90,31 @@ internal static class DevelopmentOrderIntegrationVerifier
         return manifest;
     }
 
+    // Reconstruct from genuine adjacent replay views and protected bytes.
+    // No dispatch, journal append or terminal order acceptance here.
+    internal static OrderGuestOutcome RequireCompletedGuest(DevelopmentJobStateStore.Lease owner,
+        OrderPairHistory history, OrderPairObservation observed, DevelopmentOrderOperationLedger completedGuest,
+        OrderGuestOutcome? independentlyObserved)
+    {
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var outcome = completedGuest.LatestGuestOutcome
+            ?? throw new InvalidOperationException("ORDER_FINAL_VERIFIER_OUTCOME");
+        var reservation = outcome.Reservation;
+        byte[] manifest = ExpectedManifest(owner, history, observed);
+        var limits = history.AcceptedPair.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+        OrderCheck.Require(reservation == history.AcceptedPair.Propose(claim.JobId, "FINAL", "guest",
+            reservation.ReservedSeconds, reservation.ObservedUtcTicks, null, DevelopmentJobState.Hash(manifest))
+            && completedGuest == history.AcceptedPair.ReserveWithRequiredWork(claim.JobId, limits, reservation, [])
+                .CompleteGuest(outcome), "ORDER_FINAL_VERIFIER_HISTORY");
+        OrderCheck.Require(owner.RequireOrderSnapshotManifest(reservation).AsSpan().SequenceEqual(manifest),
+            "ORDER_FINAL_VERIFIER_MANIFEST");
+        byte[] report = owner.RequireOrderGuestReport(outcome, reservation);
+        OrderCheck.Require(DevelopmentOrderGuestReconciliation.IsIntegrationReport(reservation, report),
+            "ORDER_FINAL_VERIFIER_REPORT");
+        DevelopmentOrderGuestReconciliation.RequireObserved(outcome, independentlyObserved);
+        return outcome;
+    }
+
     internal static bool MatchesOutput(string output, string error) =>
         error.Length == 0 && (output == ExpectedStdout + "\n" || output == ExpectedStdout + "\r\n");
 
