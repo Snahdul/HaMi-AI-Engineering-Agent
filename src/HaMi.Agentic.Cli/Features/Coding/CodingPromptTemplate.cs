@@ -72,8 +72,17 @@ internal sealed class CodingPromptTemplate
 
     private sealed record DiagnosticEnvelope(string Source, bool Truncated, string Text);
 
-    private static CodingPromptTemplate Parse(
-        string content, string expectedName = "clamp-expression")
+    internal CodingPrompt RenderJsonInput(string inputName, string data)
+    {
+        string placeholder = "{{" + inputName + "}}";
+        if (!UserTemplate.EndsWith(placeholder, StringComparison.Ordinal))
+            throw new InvalidOperationException("Unexpected prompt input.");
+        return new CodingPrompt(System, UserTemplate.Replace(placeholder,
+            JsonSerializer.Serialize(data), StringComparison.Ordinal));
+    }
+
+    internal static CodingPromptTemplate Parse(
+        string content, string expectedName = "clamp-expression", string expectedInput = "feedback")
     {
         if (content.Length is < 50 or > 16_384)
             throw new InvalidOperationException("Prompt asset is empty or exceeds 16 KiB.");
@@ -104,10 +113,10 @@ internal sealed class CodingPromptTemplate
         if (!yaml.Children.TryGetValue(new YamlScalarNode("inputs"), out YamlNode? inputsNode)
             || inputsNode is not YamlSequenceNode { Children.Count: 1 } inputs
             || inputs.Children[0] is not YamlMappingNode input
-            || GetScalar(input, "name") != "feedback"
+            || GetScalar(input, "name") != expectedInput
             || GetScalar(input, "kind") != "string"
             || GetScalar(input, "required") != "true")
-            throw new InvalidOperationException("Prompt must declare one required string input: feedback.");
+            throw new InvalidOperationException("Prompt must declare one required string input: " + expectedInput + ".");
 
         YamlMappingNode template = GetMap(yaml, "template");
         if (GetScalar(GetMap(template, "format"), "kind") != "jinja2"
@@ -121,15 +130,16 @@ internal sealed class CodingPromptTemplate
             || roles[0].Index != 0)
             throw new InvalidOperationException("Only exactly one system and one user role are supported.");
 
+        string placeholder = "{{" + expectedInput + "}}";
         string system = body[roles[0].Length..roles[1].Index].Trim();
         string user = body[(roles[1].Index + roles[1].Length)..].Trim();
         if (string.IsNullOrEmpty(system) || string.IsNullOrEmpty(user)
             || system.Contains("{{", StringComparison.Ordinal)
-            || user.Split("{{feedback}}", StringSplitOptions.None).Length != 2
-            || !user.EndsWith("{{feedback}}", StringComparison.Ordinal))
+            || user.Split(placeholder, StringSplitOptions.None).Length != 2
+            || !user.EndsWith(placeholder, StringComparison.Ordinal))
             throw new InvalidOperationException("Missing text or required feedback placeholder.");
 
-        string withoutFeedback = user.Replace("{{feedback}}", "", StringComparison.Ordinal);
+        string withoutFeedback = user.Replace(placeholder, "", StringComparison.Ordinal);
         if (withoutFeedback.Contains("{{", StringComparison.Ordinal)
             || withoutFeedback.Contains("}}", StringComparison.Ordinal)
             || withoutFeedback.Contains("{%", StringComparison.Ordinal))

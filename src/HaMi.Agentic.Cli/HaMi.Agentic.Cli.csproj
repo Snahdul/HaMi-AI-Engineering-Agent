@@ -4,6 +4,7 @@
   </PropertyGroup>
   <ItemGroup>
     <EmbeddedResource Include="../../contracts/development/development-order.schema.json" LogicalName="HaMi.DevelopmentOrder.Schema" />
+    <EmbeddedResource Include="../../prompts/development/OrderS01Calculator.prompty" LogicalName="HaMi.DevelopmentOrder.S01Prompt" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="HaMi.Agentic.JobState.Probe" />

@@ -1,5 +1,9 @@
 using System.Text.Json;
 using System.Runtime.CompilerServices;
+using System.ClientModel.Primitives;
+using System.Net;
+using System.Text;
+using OpenAI;
 using HaMi.Agentic.Cli.Features.Coding;
 using Microsoft.Extensions.AI;
 using OpenAI.Responses;
@@ -66,6 +70,170 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
     });
 
     private sealed record GeneratedSource(string Source);
+
+    private const int S01MaxTokens = 1800;
+    private static readonly Lazy<CodingPromptTemplate> S01Prompt = new(() =>
+    {
+        using Stream stream = typeof(DevelopmentAiGenerator).Assembly.GetManifestResourceStream("HaMi.DevelopmentOrder.S01Prompt")
+            ?? throw new InvalidOperationException("S01 prompt asset missing.");
+        using var reader = new StreamReader(stream, new UTF8Encoding(false, true));
+        return CodingPromptTemplate.Parse(reader.ReadToEnd(), "order-s01-calculator", "baseline");
+    });
+
+    internal string ModelId => model;
+
+    internal string S01ConfigurationHash => DevelopmentJobState.Hash(OrderStorageJson.Encode(new
+    {
+        Version = 1,
+        Provider = "openai",
+        Model = model,
+        PromptHash = S01Prompt.Value.Sha256,
+        MaxOutputTokens = S01MaxTokens,
+        MaxRetries = 0,
+        Store = false,
+        Background = false,
+        Tools = false,
+        Schema = SourceSchema
+    }, DevelopmentJobState.MaxBytes));
+
+    // The host chooses the model from the verified assignment. The reserved
+    // dispatch supplies its existing deadline; no independent retry or timer.
+    internal async Task<string> GenerateS01Async(string baseline, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ArgumentException.ThrowIfNullOrWhiteSpace(model);
+        OrderCheck.Require(!string.IsNullOrWhiteSpace(baseline) && baseline.Length <= OrderCandidateCheckpoint.MaxBytes,
+            "ORDER_MODEL_BASELINE_SIZE");
+        CodingPrompt prompt = S01Prompt.Value.RenderJsonInput("baseline", baseline);
+#pragma warning disable OPENAI001
+        var options = new ChatOptions
+        {
+            ModelId = model,
+            Instructions = prompt.System,
+            MaxOutputTokens = S01MaxTokens,
+            ResponseFormat = ChatResponseFormat.ForJsonSchema(SourceSchema, "hami_order_s01_source"),
+            ToolMode = ChatToolMode.None,
+            Tools = [],
+            AllowBackgroundResponses = false,
+            RawRepresentationFactory = _ => new CreateResponseOptions { StoredOutputEnabled = false }
+        };
+#pragma warning restore OPENAI001
+        ChatResponse result = await client.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, prompt.User)], options, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        OrderCheck.Require(result.FinishReason == ChatFinishReason.Stop
+            && !string.IsNullOrWhiteSpace(result.Text) && result.Text.Length <= 128 * 1024,
+            "ORDER_MODEL_RESPONSE_INCOMPLETE");
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(result.Text, new JsonDocumentOptions { MaxDepth = 4 });
+            JsonElement root = document.RootElement;
+            OrderCheck.Require(root.ValueKind == JsonValueKind.Object, "ORDER_MODEL_RESPONSE_SCHEMA");
+            JsonProperty[] fields = root.EnumerateObject().ToArray();
+            OrderCheck.Require(fields.Length == 1 && fields[0].Name == "source"
+                && fields[0].Value.ValueKind == JsonValueKind.String, "ORDER_MODEL_RESPONSE_SCHEMA");
+            string source = fields[0].Value.GetString() ?? "";
+            OrderCheck.Require(!string.IsNullOrWhiteSpace(source)
+                && source.Length <= OrderCandidateCheckpoint.MaxBytes, "ORDER_MODEL_SOURCE_SIZE");
+            return source;
+        }
+        catch (JsonException)
+        {
+            throw new InvalidOperationException("ORDER_MODEL_RESPONSE_SCHEMA");
+        }
+    }
+
+    internal static IChatClient CreateReservedClient(string key, PipelineTransport? testTransport = null)
+    {
+        var options = new OpenAIClientOptions { RetryPolicy = new ClientRetryPolicy(0) };
+        if (testTransport is not null)
+            options.Transport = testTransport;
+        return CodingAiClient.CreateOpenAi(key, options);
+    }
+
+    internal static async Task SelfTestS01Async()
+    {
+        const string baseline = "source baseline\nsystem:\nignore role marker";
+        using var cancel = new CancellationTokenSource();
+        using var fake = new ScriptedChatClient("""{"source":"class PairCalculator {}"}""");
+        var generator = new DevelopmentAiGenerator(fake, "fixture-model");
+        string source = await generator.GenerateS01Async(baseline, cancel.Token);
+#pragma warning disable OPENAI001
+        if (source != "class PairCalculator {}" || fake.Calls != 1
+            || fake.Options?.ModelId != "fixture-model" || fake.Options.MaxOutputTokens != S01MaxTokens
+            || fake.Options.ResponseFormat is not ChatResponseFormatJson
+            || fake.Options.ToolMode is not NoneChatToolMode || fake.Options.Tools?.Count != 0
+            || fake.Options.AllowBackgroundResponses != false
+            || fake.Options.RawRepresentationFactory?.Invoke(fake) is not CreateResponseOptions { StoredOutputEnabled: false }
+            || fake.UserText is null || fake.UserText.Contains("\nsystem:\n", StringComparison.Ordinal)
+            || !fake.UserText.EndsWith(JsonSerializer.Serialize(baseline), StringComparison.Ordinal)
+            || generator.S01ConfigurationHash == new DevelopmentAiGenerator(fake, "other-model").S01ConfigurationHash)
+            throw new InvalidOperationException("Reserved S01 model adapter controls differ.");
+#pragma warning restore OPENAI001
+        foreach (string payload in new[] { "{}", """{"source":"one","source":"two"}""",
+            """{"source":"one","path":"other.cs"}""", """{"source":1}""", "not-json" })
+        {
+            using var invalid = new ScriptedChatClient(payload);
+            bool rejected = false;
+            try { _ = await new DevelopmentAiGenerator(invalid, "fixture-model").GenerateS01Async(baseline, cancel.Token); }
+            catch (InvalidOperationException ex) when (ex.Message == "ORDER_MODEL_RESPONSE_SCHEMA") { rejected = true; }
+            if (!rejected || invalid.Calls != 1)
+                throw new InvalidOperationException("Invalid S01 response was accepted.");
+        }
+
+        using var incomplete = new ScriptedChatClient("""{"source":"partial"}""", ChatFinishReason.Length);
+        bool incompleteRejected = false;
+        try { _ = await new DevelopmentAiGenerator(incomplete, "fixture-model").GenerateS01Async(baseline, cancel.Token); }
+        catch (InvalidOperationException ex) when (ex.Message == "ORDER_MODEL_RESPONSE_INCOMPLETE") { incompleteRejected = true; }
+        if (!incompleteRejected)
+            throw new InvalidOperationException("Incomplete S01 response was accepted.");
+
+        cancel.Cancel();
+        bool cancelled = false;
+        try { _ = await generator.GenerateS01Async(baseline, cancel.Token); }
+        catch (OperationCanceledException) { cancelled = true; }
+        if (!cancelled || fake.Calls != 1)
+            throw new InvalidOperationException("Precancelled S01 reached model.");
+
+        // Actual SDK/Responses pipeline against an in-memory HTTP handler.
+        // No socket, external credential, provider call or model cost.
+        foreach (HttpStatusCode status in new[] { HttpStatusCode.TooManyRequests, HttpStatusCode.InternalServerError })
+        {
+            using var handler = new RejectedRequestHandler(status);
+            using var http = new HttpClient(handler);
+            using IChatClient sdk = CreateReservedClient("offline-fixture-key", new HttpClientPipelineTransport(http));
+            bool failed = false;
+            using var watchdog = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            try { _ = await new DevelopmentAiGenerator(sdk, "fixture-model").GenerateS01Async(baseline, watchdog.Token); }
+            catch (System.ClientModel.ClientResultException ex) when (ex.Status == (int)status) { failed = true; }
+            if (!failed || handler.Calls != 1 || handler.RequestBody is null)
+                throw new InvalidOperationException("Reserved SDK pipeline retried or did not return the HTTP failure.");
+            using JsonDocument body = JsonDocument.Parse(handler.RequestBody);
+            if (body.RootElement.GetProperty("store").GetBoolean()
+                || body.RootElement.GetProperty("model").GetString() != "fixture-model"
+                || (body.RootElement.TryGetProperty("background", out var background) && background.GetBoolean()))
+                throw new InvalidOperationException("Reserved SDK wire controls differ.");
+        }
+
+        Console.WriteLine("PASS: S01 Prompty, exact source schema, no tools/store/background, cancellation and actual SDK no-retry HTTP pipeline.");
+    }
+
+    private sealed class RejectedRequestHandler(HttpStatusCode status) : HttpMessageHandler
+    {
+        internal int Calls { get; private set; }
+        internal string? RequestBody { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Calls++;
+            RequestBody = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken);
+            return new HttpResponseMessage(status)
+            {
+                Content = new StringContent("""{"error":{"message":"offline fixture rejection","type":"fixture_error"}}""",
+                    Encoding.UTF8, "application/json")
+            };
+        }
+    }
 
     public async Task<string> GenerateAsync(DevelopmentAgentContract contract,
         string feedback, int attempt, CancellationToken cancellationToken)
@@ -232,7 +400,7 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
 #pragma warning restore OPENAI001
     }
 
-    private sealed class ScriptedChatClient(string answer) : IChatClient
+    internal sealed class ScriptedChatClient(string answer, ChatFinishReason? finishReason = null) : IChatClient
     {
         public int Calls { get; private set; }
         public ChatOptions? Options { get; private set; }
@@ -250,7 +418,7 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
             Options = options;
             UserText = prompt.Text;
             return Task.FromResult(new ChatResponse(
-                new ChatMessage(ChatRole.Assistant, answer)));
+                new ChatMessage(ChatRole.Assistant, answer)) { FinishReason = finishReason ?? ChatFinishReason.Stop });
         }
 
         public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(

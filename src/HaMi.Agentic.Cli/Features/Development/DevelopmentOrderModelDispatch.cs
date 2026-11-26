@@ -9,6 +9,35 @@ internal static class DevelopmentOrderModelDispatch
 {
     private static readonly UTF8Encoding Utf8 = new(false, true);
 
+    // Real composition fixes the retry-disabled provider factory. The
+    // injected core below is used only by the controlled offline probe.
+    internal static async Task<OrderCandidateCheckpoint> RunS01Async(
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
+        OrderOperationReservation reservation, DevelopmentOrderApproval approval,
+        OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, byte[] baseline,
+        string apiKey, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var client = DevelopmentAiGenerator.CreateReservedClient(apiKey);
+        var generator = new DevelopmentAiGenerator(client, assignment.Agent.Model);
+        return await RunS01CoreAsync(owner, acknowledged, reservation, approval, assignment, catalog,
+            baseline, generator, cancellationToken);
+    }
+
+    internal static Task<OrderCandidateCheckpoint> RunS01CoreAsync(
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
+        OrderOperationReservation reservation, DevelopmentOrderApproval approval,
+        OrderAssignment assignment, IReadOnlyList<OrderAgentProfile> catalog, byte[] baseline,
+        DevelopmentAiGenerator generator, CancellationToken cancellationToken = default)
+    {
+        OrderCheck.Require(assignment.Agent.Provider == "openai"
+            && assignment.Agent.Model == generator.ModelId
+            && assignment.Agent.ConfigurationHash == generator.S01ConfigurationHash,
+            "ORDER_MODEL_CONFIGURATION");
+        return RunAsync(owner, acknowledged, reservation, approval, assignment, catalog,
+            baseline, generator.GenerateS01Async, cancellationToken);
+    }
+
     internal static async Task<OrderCandidateCheckpoint> RunAsync(
         DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
         OrderOperationReservation reservation, DevelopmentOrderApproval approval,

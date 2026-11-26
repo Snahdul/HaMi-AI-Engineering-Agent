@@ -528,7 +528,7 @@ internal static class PersistenceBridgeProbe
     {
         byte[] baseline = Encoding.UTF8.GetBytes("internal static class PairCalculator { }");
         const string candidate = "internal static class PairCalculator { /* generated */ }";
-        foreach (string scenario in new[] { "success", "wrong-input", "wrong-assignment", "cancelled", "unknown", "invalid-source" })
+        foreach (string scenario in new[] { "success", "adapter-success", "wrong-config", "wrong-input", "wrong-assignment", "cancelled", "unknown", "invalid-source" })
         {
             string root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
             var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
@@ -541,6 +541,20 @@ internal static class PersistenceBridgeProbe
                 DevelopmentOrderClaim claim = owner.CurrentOrder ?? throw new InvalidOperationException("Claim missing.");
                 var archive = owner.RequireArchivedOrder();
                 var assignment = FixtureAssignment(claim, archive, "S01");
+                using var scripted = new DevelopmentAiGenerator.ScriptedChatClient(
+                    System.Text.Json.JsonSerializer.Serialize(new { source = candidate }));
+                var generator = new DevelopmentAiGenerator(scripted, "fixture-model");
+                bool adapter = scenario is "adapter-success" or "wrong-config";
+                if (adapter)
+                    assignment = assignment with
+                    {
+                        Agent = assignment.Agent with
+                        {
+                            Provider = "openai",
+                            Model = generator.ModelId,
+                            ConfigurationHash = scenario == "wrong-config" ? new string('A', 64) : generator.S01ConfigurationHash
+                        }
+                    };
                 OrderAgentProfile[] catalog = [new(assignment.Agent, true, ["csharp"])];
                 long now = DateTime.UtcNow.Ticks;
                 var ledger = new DevelopmentOrderOperationLedger().Start(new(1, claim.ArchiveHash, now),
@@ -566,21 +580,25 @@ internal static class PersistenceBridgeProbe
                 bool rejected = false;
                 try
                 {
-                    checkpoint = await DevelopmentOrderModelDispatch.RunAsync(owner, ledger, operation, approval,
-                        scenario == "wrong-assignment" ? assignment with { Revision = 2 } : assignment,
-                        catalog, scenario == "wrong-input" ? [1] : baseline, Generate, cancel.Token);
+                    if (adapter)
+                        checkpoint = await DevelopmentOrderModelDispatch.RunS01CoreAsync(owner, ledger, operation, approval,
+                            assignment, catalog, baseline, generator, cancel.Token);
+                    else
+                        checkpoint = await DevelopmentOrderModelDispatch.RunAsync(owner, ledger, operation, approval,
+                            scenario == "wrong-assignment" ? assignment with { Revision = 2 } : assignment,
+                            catalog, scenario == "wrong-input" ? [1] : baseline, Generate, cancel.Token);
                 }
-                catch (InvalidOperationException) when (scenario is "wrong-input" or "wrong-assignment" or "invalid-source")
+                catch (InvalidOperationException) when (scenario is "wrong-input" or "wrong-assignment" or "invalid-source" or "wrong-config")
                 { rejected = true; }
                 catch (OperationCanceledException) when (scenario == "cancelled") { rejected = true; }
                 catch (IOException) when (scenario == "unknown") { rejected = true; }
 
-                bool dispatched = scenario is not ("wrong-input" or "wrong-assignment");
-                bool success = scenario == "success";
+                bool dispatched = scenario is not ("wrong-input" or "wrong-assignment" or "wrong-config");
+                bool success = scenario is "success" or "adapter-success";
                 string receipt = journal + ".model-dispatch-1";
                 string artifact = journal + ".candidate-1";
                 if (rejected == success || (checkpoint is not null) != success
-                    || calls != (dispatched ? 1 : 0) || File.Exists(receipt) != dispatched
+                    || calls + scripted.Calls != (dispatched ? 1 : 0) || File.Exists(receipt) != dispatched
                     || File.Exists(artifact) != success || ledger.Pending != operation || ledger.Models != 1)
                     throw new InvalidOperationException("Model dispatch outcome differs: " + scenario);
                 if (dispatched)
@@ -615,6 +633,7 @@ internal static class PersistenceBridgeProbe
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
         Func<string, string, Task> expectOwnership)
     {
+        await DevelopmentAiGenerator.SelfTestS01Async();
         await TestModelDispatchAsync(prefix);
         await TestLiveGuestCaptureAsync(prefix);
         foreach (string scenario in new[] { "accepted", "unknown", "failed", "guest", "guest-unknown", "guest-orphan" })
