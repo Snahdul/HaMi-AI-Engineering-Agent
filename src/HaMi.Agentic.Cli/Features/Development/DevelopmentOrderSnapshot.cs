@@ -8,13 +8,50 @@ namespace HaMi.Agentic.Cli.Features.Development;
 internal static class DevelopmentOrderSnapshot
 {
     private const int MaxFileBytes = 16 * 1024 * 1024;
-    private const int MaxManifestBytes = 1024 * 1024;
+    internal const int MaxManifestBytes = 1024 * 1024;
 
     private sealed record SnapshotFile(string Path, long Bytes, string Sha256);
     private sealed record SnapshotManifest(int Version, SnapshotFile[] Files);
 
     internal static string Capture(string source, string project) =>
-        ManifestHash(CaptureManifest(source, project));
+        DevelopmentJobState.Hash(CaptureBytes(source, project));
+
+    internal static byte[] CaptureBytes(string source, string project) =>
+        OrderStorageJson.Encode(CaptureManifest(source, project), MaxManifestBytes);
+
+    internal static void ValidateBytes(byte[] bytes, string project, string? expectedHash)
+    {
+        OrderCheck.Require(OrderCheck.Hash(expectedHash) && bytes.Length is > 0 and <= MaxManifestBytes
+            && DevelopmentJobState.Hash(bytes) == expectedHash, "ORDER_SNAPSHOT_MISMATCH");
+        var manifest = OrderStorageJson.Decode<SnapshotManifest>(bytes, MaxManifestBytes);
+        ValidateManifest(manifest, project);
+    }
+
+    private static void ValidateManifest(SnapshotManifest manifest, string project)
+    {
+        OrderCheck.Require(manifest.Version == 1 && manifest.Files is { Length: > 0 and <= 512 },
+            "ORDER_SNAPSHOT_MANIFEST");
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string? previous = null;
+        long total = 0;
+        foreach (var entry in manifest.Files)
+        {
+            if (entry is null || entry.Path is not { Length: > 0 and <= 1024 } path)
+                throw new InvalidOperationException("ORDER_SNAPSHOT_PATH");
+            OrderCheck.Require(!path.Contains('\\') && !path.Contains(':') && !path.Contains('\uFFFD')
+                && !path.Any(char.IsControl) && path.Split('/').All(part => part is not ("" or "." or ".."))
+                && paths.Add(path) && (previous is null || string.CompareOrdinal(previous, path) < 0),
+                "ORDER_SNAPSHOT_PATH");
+            OrderCheck.Require(entry.Bytes >= 0 && entry.Bytes <= MaxFileBytes - total
+                && OrderCheck.Hash(entry.Sha256), "ORDER_SNAPSHOT_SIZE");
+            total += entry.Bytes;
+            previous = path;
+        }
+        foreach (string path in paths)
+            for (int separator = path.IndexOf('/'); separator >= 0; separator = path.IndexOf('/', separator + 1))
+                OrderCheck.Require(!paths.Contains(path[..separator]), "ORDER_SNAPSHOT_PATH");
+        OrderCheck.Require(manifest.Files.Any(entry => entry.Path == project), "ORDER_SNAPSHOT_PROJECT");
+    }
 
     private static string ManifestHash(SnapshotManifest manifest) =>
         DevelopmentJobState.Hash(OrderStorageJson.Encode(manifest, MaxManifestBytes));
@@ -42,7 +79,9 @@ internal static class DevelopmentOrderSnapshot
             total += length;
             entries.Add(new(normalized, length, Convert.ToHexString(SHA256.HashData(bytes))));
         }
-        return new SnapshotManifest(1, entries.OrderBy(entry => entry.Path, StringComparer.Ordinal).ToArray());
+        var manifest = new SnapshotManifest(1, entries.OrderBy(entry => entry.Path, StringComparer.Ordinal).ToArray());
+        ValidateManifest(manifest, project);
+        return manifest;
     }
 
     internal static void Require(string source, string project, string? expectedHash)
@@ -79,8 +118,25 @@ internal static class DevelopmentOrderSnapshot
     internal static void SelfTest(string source)
     {
         const string project = "Demo.csproj";
-        string original = Capture(source, project);
+        byte[] manifestBytes = CaptureBytes(source, project);
+        string original = DevelopmentJobState.Hash(manifestBytes);
+        ValidateBytes(manifestBytes, project, original);
         Require(source, project, original);
+        void RejectManifest(byte[] candidate, string digest)
+        {
+            try { ValidateBytes(candidate, project, digest); }
+            catch (InvalidOperationException) { return; }
+            throw new InvalidOperationException("Invalid manifest bytes were accepted.");
+        }
+
+        RejectManifest([.. manifestBytes, 0x20], original);
+        byte[] alternateEncoding = [.. manifestBytes, 0x20];
+        RejectManifest(alternateEncoding, DevelopmentJobState.Hash(alternateEncoding));
+        var manifest = CaptureManifest(source, project);
+        byte[] reversed = OrderStorageJson.Encode(manifest with { Files = manifest.Files.Reverse().ToArray() }, MaxManifestBytes);
+        RejectManifest(reversed, DevelopmentJobState.Hash(reversed));
+        byte[] duplicate = OrderStorageJson.Encode(manifest with { Files = [.. manifest.Files, manifest.Files[0]] }, MaxManifestBytes);
+        RejectManifest(duplicate, DevelopmentJobState.Hash(duplicate));
         string file = Path.Combine(source, "Program.cs");
         byte[] bytes = File.ReadAllBytes(file);
         string extra = Path.Combine(source, "Added.cs");

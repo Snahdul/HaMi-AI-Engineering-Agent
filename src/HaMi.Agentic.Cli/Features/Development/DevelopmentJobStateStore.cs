@@ -250,7 +250,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 ArtifactPath("S01"), ArtifactPath("S02") }.Any(RegularFileExists)
             || Enumerable.Range(1, OrderCandidateCheckpoint.MaxSequence)
                 .Any(sequence => RegularFileExists(CandidatePath(sequence)) || RegularFileExists(OperationEvidencePath(sequence))
-                    || RegularFileExists(GuestReportPath(sequence)));
+                    || RegularFileExists(GuestReportPath(sequence)) || RegularFileExists(SnapshotManifestPath(sequence)));
 
         // Fixed, host-owned path; only the same lease that made the claim
         // can initialize an empty file. Never recreate a missing journal.
@@ -418,11 +418,14 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
             return journalPath + ".guest-report-" + sequence.ToString(CultureInfo.InvariantCulture);
         }
 
-        private string BoundGuestReportPath(OrderGuestOutcome outcome, OrderOperationReservation reservation)
+        private string SnapshotManifestPath(int sequence) =>
+            journalPath + ".snapshot-" + sequence.ToString(CultureInfo.InvariantCulture);
+
+        private int BoundGuestSequence(OrderOperationReservation reservation)
         {
             RequireOrderStorage();
             DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
-            outcome.Validate(claim.ArchiveHash, reservation);
+            _ = DevelopmentOrderGuestReconciliation.RunId(reservation);
             string prefix = claim.JobId + ":";
             string id = reservation.OperationId;
             if (!id.StartsWith(prefix, StringComparison.Ordinal)
@@ -430,6 +433,38 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
                 || sequence is < 1 or > OrderCandidateCheckpoint.MaxSequence
                 || id != prefix + sequence.ToString(CultureInfo.InvariantCulture))
                 throw new InvalidOperationException("ORDER_GUEST_REPORT_SEQUENCE");
+            return sequence;
+        }
+
+        // Store before the fresh reservation is acknowledged. An orphan file
+        // is not permission to dispatch or to replace a reserved identity.
+        internal void StoreOrderSnapshotManifest(OrderOperationReservation reservation, byte[] bytes)
+        {
+            string path = SnapshotManifestPath(BoundGuestSequence(reservation));
+            DevelopmentOrderSnapshot.ValidateBytes(bytes, "Demo.csproj", reservation.SnapshotHash);
+            if (RegularFileExists(path))
+                throw new InvalidOperationException("Order snapshot manifest already exists.");
+            WriteNew(path, bytes);
+            _ = RequireOrderSnapshotManifest(reservation);
+        }
+
+        internal byte[] RequireOrderSnapshotManifest(OrderOperationReservation reservation)
+        {
+            string path = SnapshotManifestPath(BoundGuestSequence(reservation));
+            if (!RegularFileExists(path))
+                throw new InvalidOperationException("Order snapshot manifest missing.");
+            validatePrivateEntry!(path, false);
+            byte[] bytes = DevelopmentJobEvidence.ReadBoundedFile(path, DevelopmentOrderSnapshot.MaxManifestBytes);
+            DevelopmentOrderSnapshot.ValidateBytes(bytes, "Demo.csproj", reservation.SnapshotHash);
+            return bytes;
+        }
+
+        private string BoundGuestReportPath(OrderGuestOutcome outcome, OrderOperationReservation reservation)
+        {
+            int sequence = BoundGuestSequence(reservation);
+            DevelopmentOrderClaim claim = CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            outcome.Validate(claim.ArchiveHash, reservation);
+            _ = RequireOrderSnapshotManifest(reservation);
             return GuestReportPath(sequence);
         }
 

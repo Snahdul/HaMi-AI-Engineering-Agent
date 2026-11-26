@@ -92,8 +92,47 @@ internal static class PersistenceBridgeProbe
             throw new InvalidOperationException("Fixture failure differs from trusted rejection.");
     }
 
-    private static readonly string FixtureSnapshotHash = DevelopmentJobState.Hash(
-        Encoding.UTF8.GetBytes("reviewed offline snapshot identity"));
+    private static readonly Lazy<byte[]> FixtureSnapshotManifest = new(() =>
+    {
+        string source = Path.Combine(Path.GetTempPath(), "hami-order-snapshot-fixture-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(source);
+        try
+        {
+            File.WriteAllText(Path.Combine(source, "Demo.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"/>");
+            File.WriteAllText(Path.Combine(source, "Program.cs"), "Console.WriteLine(42);");
+            return DevelopmentOrderSnapshot.CaptureBytes(source, "Demo.csproj");
+        }
+        finally
+        {
+            Directory.Delete(source, recursive: true);
+        }
+    });
+    private static string FixtureSnapshotHash => DevelopmentJobState.Hash(FixtureSnapshotManifest.Value);
+
+    private static void VerifyFixtureSnapshot(DevelopmentJobStateStore.Lease owner, OrderOperationReservation reservation)
+    {
+        if (reservation.SnapshotHash != FixtureSnapshotHash
+            || !owner.RequireOrderSnapshotManifest(reservation).SequenceEqual(FixtureSnapshotManifest.Value))
+            throw new InvalidOperationException("Protected fixture snapshot differs.");
+    }
+
+    private static void TestFixtureSnapshotFaults(DevelopmentJobStateStore.Lease owner,
+        OrderOperationReservation reservation, string database)
+    {
+        VerifyFixtureSnapshot(owner, reservation);
+        string path = database + ".snapshot-1";
+        byte[] original = owner.RequireOrderSnapshotManifest(reservation);
+        File.WriteAllBytes(path, [.. original, 0x20]);
+        try { Reject(() => VerifyFixtureSnapshot(owner, reservation)); }
+        finally { File.WriteAllBytes(path, original); }
+        File.Move(path, path + ".saved");
+        try { Reject(() => VerifyFixtureSnapshot(owner, reservation)); }
+        finally { File.Move(path + ".saved", path); }
+        Reject(() => owner.RequireOrderSnapshotManifest(reservation with { SnapshotHash = new string('F', 64) }));
+        Reject(() => owner.RequireOrderSnapshotManifest(reservation with { OperationId = new string('f', 32) + ":1" }));
+        Reject(() => owner.StoreOrderSnapshotManifest(reservation, original));
+        VerifyFixtureSnapshot(owner, reservation);
+    }
 
     private static byte[] FixtureGuestReport(OrderOperationReservation reservation)
     {
@@ -120,6 +159,7 @@ internal static class PersistenceBridgeProbe
     private static void VerifyFixtureGuest(DevelopmentJobStateStore.Lease owner,
         DevelopmentOrderClaim claim, OrderGuestOutcome outcome)
     {
+        VerifyFixtureSnapshot(owner, outcome.Reservation);
         byte[] bytes = owner.RequireOrderGuestReport(outcome, outcome.Reservation);
         if (!bytes.SequenceEqual(FixtureGuestReport(outcome.Reservation)))
             throw new InvalidOperationException("Guest report differs from controlled fixture.");
@@ -246,6 +286,7 @@ internal static class PersistenceBridgeProbe
                     string s02 = Path.Combine(root, $"issue-{Issue}.order.db.s02");
                     string candidatePath = Path.Combine(root, $"issue-{Issue}.order.db.candidate-1");
                     if (guestScenario ? File.Exists(artifact) || File.Exists(s02)
+                        || !File.ReadAllBytes(Path.Combine(root, $"issue-{Issue}.order.db.snapshot-1")).SequenceEqual(FixtureSnapshotManifest.Value)
                         || File.Exists(Path.Combine(root, $"issue-{Issue}.order.db.guest-report-1")) == guestUnknown
                         : unknown ? File.Exists(artifact) || File.Exists(s02)
                         || !File.ReadAllBytes(candidatePath).SequenceEqual(PartialBytes)
@@ -284,6 +325,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: protected guest report survives process kill; exact bytes and fresh fixture observation required, no step accepted.");
         Console.WriteLine("PASS: unknown guest reservation survives process kill; absent report or unconfirmed sandbox blocks all new reservations.");
         Console.WriteLine("PASS: orphan guest report alone does not settle reservation; explicit fresh fixture observation and journal acknowledgement required.");
+        Console.WriteLine("PASS: private canonical snapshot manifests survive guest crash windows; missing/changed/foreign/duplicate manifests rejected.");
     }
 
     private static async Task WaitForMarkerAsync(Process child, string expected)
@@ -460,6 +502,10 @@ internal static class PersistenceBridgeProbe
                 if (mode is "bridge-guest" or "bridge-guest-unknown" or "bridge-guest-orphan")
                 {
                     var guestReservation = current.Ledger.Propose(claim.JobId, "S01", "guest", 30, DateTime.UtcNow.Ticks, null, FixtureSnapshotHash);
+                    Reject(() => owner.RequireOrderSnapshotManifest(guestReservation));
+                    owner.StoreOrderSnapshotManifest(guestReservation, FixtureSnapshotManifest.Value);
+                    VerifyFixtureSnapshot(owner, guestReservation);
+                    Reject(() => owner.StoreOrderSnapshotManifest(guestReservation, FixtureSnapshotManifest.Value));
                     current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(guestReservation), 2);
                     if (current.Ledger.Pending != guestReservation || current.Ledger.Guests != 1
                         || current.Ledger.ReservedSeconds != 30)
@@ -589,6 +635,7 @@ internal static class PersistenceBridgeProbe
                     || current.S01 is not null || current.S02 is not null || current.ArtifactHash is not null)
                     throw new InvalidOperationException("Unknown guest reservation changed during replay.");
 
+                TestFixtureSnapshotFaults(owner, pendingGuest, database);
                 string recoveredRunId = DevelopmentOrderGuestReconciliation.RunId(pendingGuest);
                 string absent = "error: sandbox 'hami-code-" + recoveredRunId[..12] + "' not found";
                 string orphanPath = database + ".guest-report-1";
@@ -662,6 +709,7 @@ internal static class PersistenceBridgeProbe
                     || current.Ledger.Models != 0 || current.Ledger.ReservedSeconds != 30
                     || current.S01 is not null || current.S02 is not null || current.ArtifactHash is not null)
                     throw new InvalidOperationException("Guest outcome changed acceptance or budget.");
+                TestFixtureSnapshotFaults(owner, recoveredGuest.Reservation, database);
                 VerifyFixtureGuest(owner, claim, recoveredGuest);
                 string guestPath = database + ".guest-report-1";
                 byte[] originalGuest = owner.RequireOrderGuestReport(recoveredGuest, recoveredGuest.Reservation);
@@ -1033,6 +1081,9 @@ internal static class PersistenceBridgeProbe
                         VerifyFixtureOutcome(owner, claim, observed ?? throw new InvalidOperationException("Outcome missing."));
                     }
                 }
+                if (command.Event.StartsWith("reserve-v4:", StringComparison.Ordinal)
+                    && next.Ledger.Pending is { Kind: "guest" } reservedGuest)
+                    VerifyFixtureSnapshot(owner, reservedGuest);
                 if (command.Event.StartsWith("guest-outcome-v1:", StringComparison.Ordinal))
                     VerifyFixtureGuest(owner, claim, next.Ledger.LatestGuestOutcome
                         ?? throw new InvalidOperationException("Guest outcome missing."));
