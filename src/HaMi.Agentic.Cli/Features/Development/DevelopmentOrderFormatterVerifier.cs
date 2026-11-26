@@ -188,6 +188,27 @@ internal static class DevelopmentOrderFormatterVerifier
             "ORDER_FORMATTER_ACCEPTANCE_BYTES");
     }
 
+    // Proposal only: independently verify the completed guest and the exact
+    // staged pair before constructing a journal acceptance descriptor.
+    internal static OrderS02Accepted ProposeAcceptance(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger acceptedLedger, DevelopmentOrderOperationLedger completedModel,
+        DevelopmentOrderOperationLedger completedGuest, OrderFormatterInputs inputs,
+        OrderGuestOutcome? independentlyObserved, OrderGitBaseline baseline,
+        IReadOnlyDictionary<string, byte[]> stagedPair, long now)
+    {
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var predecessor = acceptedLedger.AcceptedS01 ?? throw new InvalidOperationException("ORDER_FORMATTER_PREDECESSOR");
+        var candidate = RequireCompletedGuest(owner, acceptedLedger, completedModel, completedGuest, inputs, independentlyObserved);
+        RequirePairScope(owner, predecessor, candidate, baseline, stagedPair);
+        var guest = completedGuest.LatestGuestOutcome ?? throw new InvalidOperationException("ORDER_S02_GUEST_REQUIRED");
+        var proposal = new OrderS02Accepted(1, claim.ArchiveHash, predecessor, candidate,
+            guest.Reservation.OperationId, guest.ReportHash, claim.Binding.ScopeHash, now);
+        OrderCheck.Require(independentlyObserved is not null && now >= independentlyObserved.ObservedUtcTicks,
+            "ORDER_FORMATTER_ACCEPTANCE_CLOCK");
+        _ = completedGuest.AcceptS02(claim, proposal);
+        return proposal;
+    }
+
     internal static bool MatchesOutput(string output, string error) =>
         error.Length == 0 && (output == ExpectedStdout + "\n" || output == ExpectedStdout + "\r\n");
 
