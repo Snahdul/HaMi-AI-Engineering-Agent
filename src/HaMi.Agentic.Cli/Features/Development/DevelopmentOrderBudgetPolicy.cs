@@ -9,9 +9,10 @@ internal sealed class DevelopmentOrderBudgetPolicy
 {
     private static readonly UTF8Encoding Utf8 = new(false, true);
     private DevelopmentOrderBudgetPolicy(string source, string hash,
-        OrderOperationLimits defaults, OrderOperationLimits maximums, int finalVerificationSeconds)
+        OrderOperationLimits defaults, OrderOperationLimits maximums, int finalVerificationSeconds, int safetyReserveSeconds)
     {
         FinalVerificationSeconds = finalVerificationSeconds;
+        SafetyReserveSeconds = safetyReserveSeconds;
         Source = source;
         Sha256 = hash;
         Defaults = defaults;
@@ -23,6 +24,7 @@ internal sealed class DevelopmentOrderBudgetPolicy
     internal OrderOperationLimits Defaults { get; }
     internal OrderOperationLimits Maximums { get; }
     internal int FinalVerificationSeconds { get; }
+    internal int SafetyReserveSeconds { get; }
 
     internal static DevelopmentOrderBudgetPolicy Parse(byte[] bytes)
     {
@@ -31,8 +33,8 @@ internal sealed class DevelopmentOrderBudgetPolicy
         string source = Utf8.GetString(bytes);
         using var json = JsonDocument.Parse(source, new JsonDocumentOptions { MaxDepth = 4 });
         var root = json.RootElement;
-        RequireFields(root, ["version", "defaults", "maximums", "finalVerificationSeconds"]);
-        OrderCheck.Require(Read(root, "version") == 1, "ORDER_BUDGET_POLICY_VERSION");
+        RequireFields(root, ["version", "defaults", "maximums", "finalVerificationSeconds", "safetyReserveSeconds"]);
+        OrderCheck.Require(Read(root, "version") == 2, "ORDER_BUDGET_POLICY_VERSION");
         OrderOperationLimits defaults = ReadLimits(root.GetProperty("defaults"));
         OrderOperationLimits maximums = ReadLimits(root.GetProperty("maximums"));
         // Existing reviewed pair contract is still the outer safety envelope.
@@ -41,7 +43,11 @@ internal sealed class DevelopmentOrderBudgetPolicy
         Validate(defaults, maximums);
         int finalSeconds = Read(root, "finalVerificationSeconds");
         OrderCheck.Require(finalSeconds > 0 && finalSeconds <= defaults.Seconds, "ORDER_BUDGET_FINAL_TIME");
-        return new(source, DevelopmentJobState.Hash(bytes), defaults, maximums, finalSeconds);
+        // Fixture ceiling: existing reserved inspect/remove/inspect caps (30+90+30).
+        // This is a separate safety-only envelope, not extra execution time.
+        int safetySeconds = Read(root, "safetyReserveSeconds");
+        OrderCheck.Require(safetySeconds is > 0 and <= 150, "ORDER_BUDGET_SAFETY_TIME");
+        return new(source, DevelopmentJobState.Hash(bytes), defaults, maximums, finalSeconds, safetySeconds);
     }
 
     internal OrderOperationLimits Resolve(DevelopmentOrder order)

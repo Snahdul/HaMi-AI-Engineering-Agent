@@ -79,6 +79,8 @@ internal static class DevelopmentSandboxRunner
         CancellationToken cancellationToken = default)
     {
         using var deadline = DevelopmentOrderDispatchDeadline.Start(acknowledged, reservation, cancellationToken);
+        var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(owner.RequireArchivedOrder().BudgetPolicy));
+        using var safety = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(policy.SafetyReserveSeconds));
         // Lock order: issue lease first, account-wide backend lease second.
         // Fail before dispatch consumption if another owner is active.
         using var backend = owner.AcquireOrderSandboxBackend();
@@ -87,21 +89,22 @@ internal static class DevelopmentSandboxRunner
         _ = deadline.Limit(TimeSpan.FromSeconds(1));
         owner.ConsumeOrderGuestDispatch(acknowledged, reservation);
         return await RunCoreAsync(repo, source, "Demo.csproj", "run", resultsDirectory, phaseObserver, reservation,
-            SbxWithCancellationAsync, deadline);
+            (limit, token, arguments) => SbxWithCancellationAsync(limit, token, arguments, safety), deadline, safety);
     }
 
     private static async Task<int> RunCoreAsync(
         string repo, string source, string project, string mode, string resultsDirectory,
         Action<string, string, long, int>? phaseObserver, OrderOperationReservation? reservation,
         Func<TimeSpan, CancellationToken, string[], Task<SandboxProcess>> transport,
-        DevelopmentOrderDispatchDeadline? deadline = null)
+        DevelopmentOrderDispatchDeadline? deadline = null, DevelopmentOrderSafetyWindow? safety = null)
     {
+        OrderCheck.Require((reservation is null) == (safety is null), "ORDER_SAFETY_WINDOW_REQUIRED");
         Task<SandboxProcess> InvokeAsync(TimeSpan limit, params string[] arguments) =>
             transport(deadline?.Limit(limit) ?? limit, deadline?.Token ?? CancellationToken.None, arguments);
-        // Mandatory cleanup cannot inherit the expired regular-work token.
-        // A separately policy-bounded total safety window is a follow-up.
+        // The safety window is independent of the business cancellation,
+        // but shared by process termination and every cleanup phase.
         Task<SandboxProcess> CleanupAsync(TimeSpan limit, params string[] arguments) =>
-            transport(limit, CancellationToken.None, arguments);
+            transport(safety?.Limit(limit) ?? limit, safety?.Token ?? CancellationToken.None, arguments);
         void CheckDeadline()
         {
             if (deadline is not null)
@@ -145,6 +148,7 @@ internal static class DevelopmentSandboxRunner
         bool createConfirmed = false;
         string? backendIdentity = null;
         bool sandboxRemovalSucceeded = false;
+        bool transportTerminationUnconfirmed = false;
         bool timedOut = false;
         int restore = -1, build = -1, execution = -1;
         long createMs = 0, copyMs = 0, restoreMs = 0, buildMs = 0, executionMs = 0;
@@ -320,6 +324,12 @@ internal static class DevelopmentSandboxRunner
             }
             CheckDeadline();
         }
+        catch (SandboxProcessTerminationUnconfirmedException)
+        {
+            transportTerminationUnconfirmed = true;
+            error = "ORDER_SANDBOX_PROCESS_TERMINATION_UNCONFIRMED";
+            ProgressMessage(error, "OPERATION_FAULT", -1);
+        }
         catch (OperationCanceledException) when (deadline is not null)
         {
             timedOut = deadline.Remaining == TimeSpan.Zero;
@@ -341,10 +351,11 @@ internal static class DevelopmentSandboxRunner
         {
             ProgressMessage($"Bereinige MicroVM {sandbox} und lokale Staging-Dateien ...");
             Stopwatch cleanup = Stopwatch.StartNew();
+            safety?.Check();
             // V1 preserves its existing cleanup behavior. For an order,
             // an ambiguous create may refer to a competing name: leave it
             // pending for reconciliation instead of deleting by name.
-            if (reservation is null ? createAttempted : createConfirmed)
+            if (!transportTerminationUnconfirmed && (reservation is null ? createAttempted : createConfirmed))
             {
                 try
                 {
@@ -372,8 +383,13 @@ internal static class DevelopmentSandboxRunner
                 }
             }
             cleanupMs = cleanup.ElapsedMilliseconds;
-            if (Directory.Exists(stage))
+            safety?.Check();
+            // Local synchronous filesystem calls are not forcibly cancellable.
+            // If they exhaust the reserve, do not return success. Preserve
+            // staging when a potentially active local process still owns it.
+            if (!transportTerminationUnconfirmed && Directory.Exists(stage))
                 Directory.Delete(stage, recursive: true);
+            safety?.Check();
             ProgressMessage(sandboxRemovalSucceeded
                 ? $"MicroVM entfernt ({cleanupMs / 1000.0:F2} s)."
                 : $"ACHTUNG: MicroVM-Entfernung nicht bestätigt ({cleanupMs / 1000.0:F2} s).",
@@ -389,7 +405,8 @@ internal static class DevelopmentSandboxRunner
             JsonSerializer.Serialize(report, new JsonSerializerOptions(JsonSerializerDefaults.Web)
             {
                 WriteIndented = true
-            }));
+            }), safety?.Token ?? CancellationToken.None);
+        safety?.Check();
         ProgressMessage($"Auftrag beendet ({report.TotalMilliseconds / 1000.0:F2} s), Bericht erstellt.");
         if (phaseObserver is null)
         {
@@ -763,8 +780,16 @@ internal static class DevelopmentSandboxRunner
     private static Task<SandboxProcess> SbxAsync(TimeSpan limit, params string[] arguments) =>
         SbxWithCancellationAsync(limit, CancellationToken.None, arguments);
 
+    private static Task<SandboxProcess> SbxWithCancellationAsync(TimeSpan limit,
+        CancellationToken cancellationToken, string[] arguments) =>
+        SbxWithCancellationAsync(limit, cancellationToken, arguments, null);
+
+    private sealed class SandboxProcessTerminationUnconfirmedException : InvalidOperationException
+    {
+    }
+
     private static async Task<SandboxProcess> SbxWithCancellationAsync(TimeSpan limit,
-        CancellationToken cancellationToken, string[] arguments)
+        CancellationToken cancellationToken, string[] arguments, DevelopmentOrderSafetyWindow? safety)
     {
         cancellationToken.ThrowIfCancellationRequested();
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -787,12 +812,36 @@ internal static class DevelopmentSandboxRunner
         try
         {
             await process.WaitForExitAsync(cts.Token);
+            if (safety is not null)
+                await Task.WhenAll(stdout, stderr).WaitAsync(cts.Token);
             return new SandboxProcess(process.ExitCode, await stdout, await stderr);
         }
         catch (OperationCanceledException)
         {
-            if (!process.HasExited) process.Kill(entireProcessTree: true);
-            await process.WaitForExitAsync();
+            if (safety is null)
+            {
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync();
+            }
+            else
+            {
+                // One best-effort local kill. The OS Kill call itself is not
+                // cancellable; waiting for exit must not open another window.
+                try
+                {
+                    safety.Start();
+                    if (!process.HasExited)
+                        process.Kill(entireProcessTree: true);
+                    await process.WaitForExitAsync(safety.Token);
+                    safety.Check();
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception
+                    or OperationCanceledException or TimeoutException or NotSupportedException)
+                {
+                    throw new SandboxProcessTerminationUnconfirmedException();
+                }
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
             throw new TimeoutException("sbx operation timed out: " + arguments[0]);
         }
@@ -903,11 +952,12 @@ internal static class DevelopmentSandboxRunner
             string rejectedResults = Path.Combine(root, "wrong-snapshot");
             Directory.CreateDirectory(rejectedResults);
             bool snapshotRejected = false;
+            using var rejectedSafety = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(150));
             try
             {
                 _ = await RunCoreAsync(repo, source, "Demo.csproj", "run", rejectedResults,
                     (_, _, _, _) => { }, reservation with { SnapshotHash = new string('F', 64) },
-                    (_, _, _) => throw new InvalidOperationException("Unexpected transport invocation."));
+                    (_, _, _) => throw new InvalidOperationException("Unexpected transport invocation."), safety: rejectedSafety);
             }
             catch (InvalidOperationException ex) when (ex.Message == "ORDER_SNAPSHOT_MISMATCH") { snapshotRejected = true; }
             if (!snapshotRejected || Directory.EnumerateFileSystemEntries(rejectedResults).Any())
@@ -932,7 +982,8 @@ internal static class DevelopmentSandboxRunner
                 "guest-missing", "guest-link", "guest-truncated", "guest-stderr",
                 "identity-missing", "identity-duplicate", "identity-changed", "identity-backend",
                 "removal-unconfirmed", "cancel-after-identity", "cancel-during-create",
-                "deadline-before-restore", "cancel-during-restore", "success"
+                "deadline-before-restore", "cancel-during-restore", "cleanup-reserve-shortened",
+                "cleanup-reserve-exhausted", "termination-unconfirmed", "success"
             })
             {
                 string results = Path.Combine(root, scenario);
@@ -952,6 +1003,8 @@ internal static class DevelopmentSandboxRunner
                 using var deadline = interrupted
                     ? DevelopmentOrderDispatchDeadline.Start(acknowledged, reservation, stop.Token, clock)
                     : null;
+                using var safety = new DevelopmentOrderSafetyWindow(
+                    TimeSpan.FromSeconds(scenario.StartsWith("cleanup-reserve-", StringComparison.Ordinal) ? 40 : 150), clock);
                 var callLimits = new List<TimeSpan>();
                 var callTokens = new List<CancellationToken>();
                 string Identity(string identity) => JsonSerializer.Serialize(new { name, id = identity });
@@ -969,6 +1022,8 @@ internal static class DevelopmentSandboxRunner
                         stop.Cancel();
                         token.ThrowIfCancellationRequested();
                     }
+                    if (scenario == "termination-unconfirmed" && args.Contains("restore", StringComparer.Ordinal))
+                        throw new SandboxProcessTerminationUnconfirmedException();
                     SandboxProcess response = new(0, "", "");
                     switch (args[0])
                     {
@@ -1028,11 +1083,45 @@ internal static class DevelopmentSandboxRunner
                         stop.Cancel();
                     if (scenario == "deadline-before-restore" && args.Contains(GuestSnapshotCheckScript, StringComparer.Ordinal))
                         clock.Timestamp += TimeSpan.FromSeconds(25).Ticks;
+                    if (scenario.StartsWith("cleanup-reserve-", StringComparison.Ordinal)
+                        && identityChecks == 2 && args.Contains("--json", StringComparer.Ordinal))
+                        clock.Timestamp += TimeSpan.FromSeconds(25).Ticks;
+                    if (scenario.StartsWith("cleanup-reserve-", StringComparison.Ordinal) && args[0] == "rm")
+                        clock.Timestamp += TimeSpan.FromSeconds(scenario == "cleanup-reserve-exhausted" ? 15 : 10).Ticks;
                     return Task.FromResult(response);
                 }
 
-                int exit = await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
-                    (_, _, _, _) => { }, reservation, FakeTransport, deadline);
+                int exit;
+                try
+                {
+                    exit = await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
+                        (_, _, _, _) => { }, reservation, FakeTransport, deadline, safety);
+                }
+                catch (TimeoutException ex) when (scenario == "cleanup-reserve-exhausted"
+                    && ex.Message == "ORDER_SAFETY_RESERVE_EXHAUSTED")
+                {
+                    if (calls[^1][0] != "rm" || callLimits[^1] != TimeSpan.FromSeconds(15)
+                        || File.Exists(Path.Combine(results, "reports", "hami-code-" + id, "report.json")))
+                        throw new InvalidOperationException("Exhausted safety reserve permitted more work.");
+                    continue;
+                }
+
+                if (scenario == "cleanup-reserve-exhausted")
+                    throw new InvalidOperationException("Exhausted safety reserve accepted.");
+                if (scenario == "termination-unconfirmed")
+                {
+                    if (exit == 0 || calls.Any(a => a[0] == "rm") || identityChecks != 1
+                        || calls.Any(a => a.Contains("build", StringComparer.Ordinal))
+                        || !Directory.Exists(Path.Combine(results, "staging", "hami-code-" + id)))
+                        throw new InvalidOperationException("Unconfirmed transport termination allowed another effect.");
+                    continue;
+                }
+
+                if (scenario == "cleanup-reserve-shortened"
+                    && (callLimits[^3] != TimeSpan.FromSeconds(30) || callLimits[^2] != TimeSpan.FromSeconds(15)
+                        || callLimits[^1] != TimeSpan.FromSeconds(5) || callTokens[^3] != callTokens[^2]
+                        || callTokens[^2] != callTokens[^1] || !callTokens[^1].CanBeCanceled))
+                    throw new InvalidOperationException("Cleanup phases reset the safety reserve.");
                 if (interrupted)
                 {
                     string interruptedReportPath = Path.Combine(results, "reports", "hami-code-" + id, "report.json");
@@ -1050,7 +1139,7 @@ internal static class DevelopmentSandboxRunner
                         || calls.Any(a => a.Contains("build", StringComparer.Ordinal))
                         || calls.Any(a => a.Contains("restore", StringComparer.Ordinal)) != restoreStarted
                         || regularCalls < 2 || callTokens.Take(regularCalls).Any(t => t != deadline!.Token)
-                        || callTokens.Skip(regularCalls).Any(t => t.CanBeCanceled)
+                        || callTokens.Skip(regularCalls).Any(t => t != safety.Token || !t.CanBeCanceled)
                         || (!unknownCreate && (calls[^2][0] != "rm" || calls[^1][0] != "inspect"))
                         || (expired && callLimits[1] != TimeSpan.FromSeconds(25))
                         || DevelopmentOrderGuestReconciliation.Observe(new string('A', 64), reservation,
@@ -1058,7 +1147,7 @@ internal static class DevelopmentSandboxRunner
                         throw new InvalidOperationException("Interrupted reserved runner escaped deadline or cleanup guard.");
                     continue;
                 }
-                bool success = scenario == "success";
+                bool success = scenario is "success" or "cleanup-reserve-shortened";
                 bool guestMismatch = scenario.StartsWith("guest-", StringComparison.Ordinal);
                 bool ownershipUnknown = scenario is "identity-missing" or "identity-duplicate";
                 bool ownershipChanged = scenario is "identity-changed" or "identity-backend";
@@ -1102,7 +1191,7 @@ internal static class DevelopmentSandboxRunner
                 try
                 {
                     _ = await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
-                        (_, _, _, _) => { }, reservation, FakeTransport);
+                        (_, _, _, _) => { }, reservation, FakeTransport, safety: safety);
                 }
                 catch (IOException) { rejected = true; }
                 if (!rejected || calls.Count != before)
@@ -1112,6 +1201,7 @@ internal static class DevelopmentSandboxRunner
             Console.WriteLine("PASS: guest snapshot observation precedes restore; changed/extra/missing/nonregular/truncated/diagnostic evidence blocks execution.");
             Console.WriteLine("PASS: reserved cleanup checks backend identity before removal and fresh absence after removal; unknown/changed identity blocks rm.");
             Console.WriteLine("PASS: reserved deadline and caller cancellation stop regular work; cleanup retains independent token and ownership gates.");
+            Console.WriteLine("PASS: shared safety reserve limits cleanup phases without reset; exhaustion and unknown transport termination block further effects.");
         }
         finally
         {

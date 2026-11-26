@@ -79,6 +79,22 @@ internal static class DevelopmentOrderHandoverTests
         Reject(() => DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes("{}")), "ORDER_BUDGET_POLICY_FIELDS");
         tighter["defaults"]!["elapsedSeconds"] = 121;
         Reject(() => DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(tighter.ToJsonString())), "ORDER_BUDGET_MAXIMUM");
+        JsonObject safety = JsonNode.Parse(policy.Source)!.AsObject();
+        safety.Remove("safetyReserveSeconds");
+        Reject(() => DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(safety.ToJsonString())), "ORDER_BUDGET_POLICY_FIELDS");
+        foreach (int invalid in new[] { -1, 0, 151 })
+        {
+            safety["safetyReserveSeconds"] = invalid;
+            Reject(() => DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(safety.ToJsonString())), "ORDER_BUDGET_SAFETY_TIME");
+        }
+        safety["safetyReserveSeconds"] = 40;
+        var shorterSafety = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(safety.ToJsonString()));
+        if (shorterSafety.SafetyReserveSeconds != 40 || shorterSafety.Sha256 == policy.Sha256
+            || shorterSafety.Defaults != policy.Defaults || shorterSafety.FinalVerificationSeconds != policy.FinalVerificationSeconds)
+            throw new InvalidOperationException("Safety reserve changed business budget.");
+        Reject(() => DevelopmentOrderApproval.Observe(issue, profile, shorterSafety), "ORDER_BUDGET_POLICY_BINDING");
+        safety["version"] = 1;
+        Reject(() => DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(safety.ToJsonString())), "ORDER_BUDGET_POLICY_VERSION");
         Console.WriteLine("PASS: omitted budget resolved from reviewed policy; exact policy binding and immutable effective limits.");
 
         Reject(() => Approve(issue with { IsOpen = false }), "ORDER_ISSUE_AUTHORITY");
