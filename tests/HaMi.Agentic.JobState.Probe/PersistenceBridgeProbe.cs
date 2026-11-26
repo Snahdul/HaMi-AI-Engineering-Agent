@@ -133,7 +133,7 @@ internal static class PersistenceBridgeProbe
     private static void VerifyModelFixtureAssignment(DevelopmentOrderClaim claim, DevelopmentOrderArchive archive,
         OrderOperationReservation reservation) =>
         (reservation.Assignment ?? throw new InvalidOperationException("Missing model assignment."))
-            .RequireAssignment(ModelFixtureAssignment(claim, archive));
+            .RequireAssignment(ModelFixtureAssignment(claim, archive, reservation.Step));
 
     // Fixed reviewed offline catalog; not runtime agent selection. Construct
     // the historical decision from immutable archived inputs, never from a
@@ -1218,6 +1218,35 @@ internal static class PersistenceBridgeProbe
                     ? calculatorSlots.Select(slot => File.ReadAllBytes(calculatorPrefix + slot)).ToArray()
                     : [];
 
+                string[] formatterSlots = ["model-dispatch-3", "candidate-3", "evidence-3"];
+                byte[][] formatterEvidence = [];
+                if (calculatorScenario)
+                {
+                    using Process formatterChild = start(resumeMode, root);
+                    Task<string> formatterErrors = formatterChild.StandardError.ReadToEndAsync();
+                    try
+                    {
+                        await WaitForMarkerAsync(formatterChild, "BRIDGE_FORMATTER_CAPTURED").WaitAsync(Deadline);
+                        if (formatterChild.HasExited)
+                            throw new InvalidOperationException("Formatter owner stopped before process kill.");
+                        await expectOwnership(root, "BUSY");
+                        formatterEvidence = formatterSlots.Select(slot => File.ReadAllBytes(calculatorPrefix + slot)).ToArray();
+                    }
+                    finally
+                    {
+                        if (!formatterChild.HasExited)
+                            formatterChild.Kill(entireProcessTree: true);
+                        await formatterChild.WaitForExitAsync().WaitAsync(Deadline);
+                        string diagnostics = await formatterErrors.WaitAsync(Deadline);
+                        if (diagnostics.Length > 0)
+                            Console.Error.WriteLine(diagnostics[^Math.Min(diagnostics.Length, 16 * 1024)..]);
+                    }
+
+                    if (formatterChild.ExitCode == 0)
+                        throw new InvalidOperationException("Formatter owner did not terminate abnormally.");
+                    await expectOwnership(root, "ACQUIRED:order");
+                }
+
                 using Process resumed = start(resumeMode, root);
                 Task<string> output = resumed.StandardOutput.ReadToEndAsync();
                 Task<string> errors = resumed.StandardError.ReadToEndAsync();
@@ -1262,7 +1291,9 @@ internal static class PersistenceBridgeProbe
                         || !File.Exists(calculatorPrefix + "model-dispatch-3")
                         || !File.Exists(calculatorPrefix + "evidence-3")
                         || !File.ReadAllBytes(calculatorPrefix + "candidate-3").SequenceEqual(Encoding.UTF8.GetBytes("class PairFormatter {}"))
-                        || File.Exists(calculatorPrefix + "model-dispatch-4")))
+                        || File.Exists(calculatorPrefix + "model-dispatch-4")
+                        || formatterSlots.Where((slot, i) =>
+                            !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(formatterEvidence[i])).Any()))
                         throw new InvalidOperationException("Calculator evidence changed or formatter capture differs.");
                 }
                 finally
@@ -1286,6 +1317,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: S02 input handover from actual recovered S01 acceptance; unaccepted or tampered history and input bytes rejected.");
         Console.WriteLine("PASS: S02 versioned candidate fold from recovered S01 acceptance; exact predecessor input hash and source scope enforced.");
         Console.WriteLine("PASS: S02 private model dispatch from recovered S01 acceptance, exact receipt and evidence readback, duplicate dispatch and tampering blocked.");
+        Console.WriteLine("PASS: S02 admitted reservation, checkpoint and completion persisted before ack; real process kill recovers generated formatter without redispatch or budget reset.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -1816,7 +1848,7 @@ internal static class PersistenceBridgeProbe
 
             if (calculatorScenario)
             {
-                if (mode == "bridge-model-resume-verified")
+                if (mode == "bridge-model-resume-verified" && current.Stage == 6)
                 {
                     if (current.Stage != 6 || current.Ledger.AcceptedS01 is not null
                         || current.Ledger.Pending is not null || current.Ledger.Sequence != 2
@@ -1883,6 +1915,39 @@ internal static class PersistenceBridgeProbe
                     OrderGitBaseline baseline, IReadOnlyDictionary<string, byte[]> pair) =>
                     DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state,
                         ObserveCalculatorFixture(owner, claim, outcome), baseline, pair);
+
+                if (current.Stage == 10)
+                {
+                    var beforeFormatter = current.FormatterInputState
+                        ?? throw new InvalidOperationException("Accepted input history missing.");
+                    var recoveredInputs = ReadFormatterInputs(beforeFormatter,
+                        ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root));
+                    var recovered = DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger);
+                    var candidate = recovered.Candidate ?? throw new InvalidOperationException("Recovered formatter missing.");
+                    if (recovered.Status != OrderModelRecoveryStatus.Generated || candidate.Step != "S02"
+                        || candidate.InputHash != DevelopmentOrderFormatterVerifier.RequireInputHash(claim, accepted, recoveredInputs)
+                        || !owner.RequireOrderCandidate(candidate).SequenceEqual(Encoding.UTF8.GetBytes("class PairFormatter {}"))
+                        || beforeFormatter.AcceptedS01 != accepted || current.Ledger.Pending is not null
+                        || current.Ledger.Sequence != 3 || current.Ledger.Models != 2 || current.Ledger.Guests != 1
+                        || current.Ledger.ReservedSeconds != 70 || current.Ledger.StartedUtcTicks != beforeFormatter.StartedUtcTicks)
+                        throw new InvalidOperationException("Recovered formatter journal differs.");
+
+                    foreach (string suffix in new[] { ".model-dispatch-3", ".candidate-3", ".evidence-3" })
+                    {
+                        string evidenceFile = database + suffix;
+                        byte[] bytes = File.ReadAllBytes(evidenceFile);
+                        File.WriteAllBytes(evidenceFile, [.. bytes, 0x20]);
+                        try { Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger)); }
+                        finally { File.WriteAllBytes(evidenceFile, bytes); }
+                    }
+
+                    if (DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger) != recovered
+                        || await ReadAsync() != current || File.Exists(database + ".model-dispatch-4"))
+                        throw new InvalidOperationException("Formatter recovery changed history.");
+                    Console.WriteLine("BRIDGE_PHASE: persisted S02 completion recovered after process kill; exact predecessor and private evidence rechecked.");
+                    Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
+                    return 0;
+                }
 
                 void VerifyAccepted()
                 {
@@ -1955,14 +2020,27 @@ internal static class PersistenceBridgeProbe
                 Console.WriteLine("BRIDGE_PHASE: S02 versioned checkpoint binds accepted predecessor; changed input, path, version and missing acceptance rejected.");
                 Console.WriteLine("BRIDGE_PHASE: accepted S01 bytes handed to S02 read-only input gate; missing or changed acceptance, budget, baseline and predecessor rejected.");
 
-                // Exercise the real private S02 dispatch boundary against the
-                // recovered accepted state. The S02 fold is local in this slice.
+                // Admit and acknowledge the S02 operation before dispatch.
+                // All actual model/guest effects in this fixture are controlled.
                 var formatterAssignment = ModelFixtureAssignment(claim, archive, "S02");
                 OrderAgentProfile[] formatterCatalog = [new(formatterAssignment.Agent, true, ["csharp"])];
                 var formatterApproval = await CalculatorRecoveryApprovalAsync(root);
                 var actualRequest = current.Ledger.Propose(claim.JobId, "S02", "model", 10,
                     DateTime.UtcNow.Ticks, OrderOperationAgentBinding.FromAssignment(formatterAssignment));
-                var actualPending = current.Ledger.Reserve(claim.JobId, limits, actualRequest);
+                var acceptedState = current;
+                Task<BridgeState> formatterAdmission = actor.Ask<BridgeState>(new AdmitFormatter(actualRequest), Deadline);
+                await guard.AwaitAsync(formatterAdmission);
+                current = await formatterAdmission;
+                var actualPending = current.Ledger;
+                if (current.Stage != 9 || actualPending.Pending != actualRequest || actualPending.Sequence != 3
+                    || actualPending.ReservedSeconds != 70 || current.FormatterInputState != acceptedState.Ledger)
+                    throw new InvalidOperationException("Formatter admission was not persisted and acknowledged.");
+                async Task<BridgeState> RecordFormatterAsync(string evt)
+                {
+                    Task<BridgeState> ack = actor.Ask<BridgeState>(new RecordFormatter(evt), Deadline);
+                    await guard.AwaitAsync(ack);
+                    return await ack;
+                }
                 using var formatterClient = new DevelopmentAiGenerator.ScriptedChatClient(
                     System.Text.Json.JsonSerializer.Serialize(new { source = "class PairFormatter {}" }));
                 var formatterGenerator = new DevelopmentAiGenerator(formatterClient, ModelName);
@@ -1977,7 +2055,13 @@ internal static class PersistenceBridgeProbe
                 var result = await DispatchFormatter(unchangedInputs);
                 var generated = result.Candidate ?? throw new InvalidOperationException("Formatter candidate missing.");
                 var generatedState = actualPending.Checkpoint(claim, generated);
+                current = await RecordFormatterAsync(DevelopmentOrderOperationLedger.EncodeCandidate(generated));
+                if (current.Stage != 9 || current.Ledger != generatedState)
+                    throw new InvalidOperationException("Formatter checkpoint acknowledgement differs.");
                 var completedState = generatedState.Complete(result.Completion);
+                current = await RecordFormatterAsync(DevelopmentOrderOperationLedger.EncodeCompletion(result.Completion));
+                if (current.Stage != 10 || current.Ledger != completedState)
+                    throw new InvalidOperationException("Formatter completion acknowledgement differs.");
                 var recoveredModel = DevelopmentOrderModelReconciliation.Observe(owner, completedState);
                 if (formatterClient.Calls != 1 || generated.InputHash != inputHash
                     || recoveredModel.Status != OrderModelRecoveryStatus.Generated || recoveredModel.Candidate != generated
@@ -2022,8 +2106,11 @@ internal static class PersistenceBridgeProbe
                 catch (InvalidOperationException ex) when (ex.Message == "Calculator acceptance blocked.") { }
                 if (await ReadAsync() != current)
                     throw new InvalidOperationException("Calculator reentry mutated journal state.");
-                Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
-                return 0;
+                owner.ValidateOrderJournalFiles();
+                Console.WriteLine("BRIDGE_FORMATTER_CAPTURED");
+                Console.Out.Flush();
+                await Task.Delay(Timeout.InfiniteTimeSpan);
+                return 1;
             }
 
             if (modelScenario)
@@ -2506,6 +2593,8 @@ internal static class PersistenceBridgeProbe
     private sealed record Advance(string Event);
     private sealed record Admit(OrderOperationReservation Request);
     private sealed record AcceptCalculator;
+    private sealed record AdmitFormatter(OrderOperationReservation Request);
+    private sealed record RecordFormatter(string Event);
 
     // Reviewed disposable fixture only: the existing synthetic S01/S02
     // completion already represents accepted work. No dynamic estimator or
@@ -2520,7 +2609,8 @@ internal static class PersistenceBridgeProbe
     private sealed record RecordedOperation(OrderOperationReservation Reservation, OrderOperationCompletion Completion);
     private sealed record BridgeState(int Stage, string? ArtifactHash, DevelopmentOrderOperationLedger Ledger,
         RecordedOperation? S01 = null, RecordedOperation? S02 = null, RecordedOperation? FailedS01 = null,
-        DevelopmentOrderOperationLedger? CalculatorModel = null, DevelopmentOrderOperationLedger? CalculatorGuest = null);
+        DevelopmentOrderOperationLedger? CalculatorModel = null, DevelopmentOrderOperationLedger? CalculatorGuest = null,
+        DevelopmentOrderOperationLedger? FormatterInputState = null);
 
     private sealed class BridgeActor : ReceivePersistentActor
     {
@@ -2617,10 +2707,71 @@ internal static class PersistenceBridgeProbe
                     Sender.Tell(new Status.Failure(ex));
                 }
             });
+            Command<AdmitFormatter>(command =>
+            {
+                try
+                {
+                    if (!recovered || !calculatorScenario || state.Stage != 8
+                        || command.Request is not { Step: "S02", Kind: "model" })
+                        throw new InvalidOperationException("Formatter admission blocked.");
+                    var model = state.CalculatorModel ?? throw new InvalidOperationException("Model history missing.");
+                    var guest = state.CalculatorGuest ?? throw new InvalidOperationException("Guest history missing.");
+                    var outcome = guest.LatestGuestOutcome ?? throw new InvalidOperationException("Guest outcome missing.");
+                    _ = DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state.Ledger,
+                        ObserveCalculatorFixture(owner, claim, outcome), ObserveCalculatorBaseline(root, claim.Binding),
+                        CalculatorRecoveryPair(root));
+                    string evt = DevelopmentOrderOperationLedger.EncodeReservation(command.Request);
+                    BridgeState next = Next(state, evt);
+                    IActorRef reply = Sender;
+                    Persist(evt, _ =>
+                    {
+                        state = next;
+                        reply.Tell(state);
+                    });
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException or System.Text.Json.JsonException)
+                {
+                    Sender.Tell(new Status.Failure(ex));
+                }
+            });
+            Command<RecordFormatter>(command =>
+            {
+                try
+                {
+                    if (!recovered || !calculatorScenario || state.Stage != 9)
+                        throw new InvalidOperationException("Formatter recording blocked.");
+                    BridgeState next = Next(state, command.Event);
+                    var reservation = state.Ledger.Pending ?? throw new InvalidOperationException("Formatter reservation missing.");
+                    var accepted = state.Ledger.AcceptedS01 ?? throw new InvalidOperationException("Calculator acceptance missing.");
+                    owner.RequireOrderModelDispatch(reservation, accepted);
+                    if (command.Event.StartsWith("candidate-v2:", StringComparison.Ordinal))
+                        _ = owner.RequireOrderCandidate(next.Ledger.LatestCandidate
+                            ?? throw new InvalidOperationException("Formatter candidate missing."));
+                    else if (DevelopmentOrderModelReconciliation.Observe(owner, next.Ledger).Status
+                        == OrderModelRecoveryStatus.PendingBlocked)
+                        throw new InvalidOperationException("Formatter completion has no verified evidence.");
+
+                    IActorRef reply = Sender;
+                    Persist(command.Event, _ =>
+                    {
+                        state = next;
+                        reply.Tell(state);
+                    });
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException or System.Text.Json.JsonException)
+                {
+                    Sender.Tell(new Status.Failure(ex));
+                }
+            });
             Command<Advance>(command =>
             {
                 if (!recovered)
                     throw new InvalidOperationException("Recovery incomplete.");
+                if (calculatorScenario && state.Stage >= 8)
+                {
+                    Sender.Tell(new Status.Failure(new InvalidOperationException("Use formatter commands.")));
+                    return;
+                }
                 if (command.Event.StartsWith("s01-accepted-v1:", StringComparison.Ordinal))
                 {
                     Sender.Tell(new Status.Failure(new InvalidOperationException("Use calculator acceptance command.")));
@@ -2707,6 +2858,36 @@ internal static class PersistenceBridgeProbe
                     Stage = 1,
                     Ledger = previous.Ledger.Start(DevelopmentOrderOperationLedger.DecodeStart(evt), claim.ArchiveHash, limits, policy)
                 };
+            if (calculatorScenario && previous.Stage == 8)
+            {
+                var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
+                if (reservation is not { Step: "S02", Kind: "model" })
+                    throw new InvalidOperationException("Formatter model reservation required.");
+                VerifyModelFixtureAssignment(claim, archive, reservation);
+                var effective = previous.Ledger.CurrentLimits ?? throw new InvalidOperationException("Effective budget missing.");
+                return previous with
+                {
+                    Stage = 9,
+                    FormatterInputState = previous.Ledger,
+                    Ledger = previous.Ledger.ReserveWithRequiredWork(claim.JobId, effective, reservation,
+                        [new("S02", "guest", 10), new("FINAL", "guest", policy.FinalVerificationSeconds)])
+                };
+            }
+            if (calculatorScenario && previous.Stage == 9)
+            {
+                var reservation = previous.Ledger.Pending ?? throw new InvalidOperationException("Formatter reservation missing.");
+                if (reservation is not { Step: "S02", Kind: "model" })
+                    throw new InvalidOperationException("Unexpected formatter operation.");
+                if (evt.StartsWith("candidate-v2:", StringComparison.Ordinal))
+                    return previous with
+                    {
+                        Ledger = previous.Ledger.Checkpoint(claim, DevelopmentOrderOperationLedger.DecodeCandidate(evt))
+                    };
+                var completion = DevelopmentOrderOperationLedger.DecodeCompletion(evt);
+                if ((completion.Outcome == "succeeded") != (previous.Ledger.LatestCandidate?.OperationId == reservation.OperationId))
+                    throw new InvalidOperationException("Unexpected formatter completion.");
+                return previous with { Stage = 10, Ledger = previous.Ledger.Complete(completion) };
+            }
             if (calculatorScenario && previous.Stage == 7)
             {
                 var reservation = DevelopmentOrderOperationLedger.DecodeReservation(evt);
