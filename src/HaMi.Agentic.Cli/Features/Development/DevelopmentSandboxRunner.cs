@@ -122,6 +122,7 @@ internal static class DevelopmentSandboxRunner
         string[]? expectedGuestRecords = null;
         bool createAttempted = false;
         bool createConfirmed = false;
+        string? backendIdentity = null;
         bool sandboxRemovalSucceeded = false;
         bool timedOut = false;
         int restore = -1, build = -1, execution = -1;
@@ -182,6 +183,14 @@ internal static class DevelopmentSandboxRunner
                 "--env", "AWS_SECRET_ACCESS_KEY=", "--env", "SSH_AUTH_SOCK=",
                 "shell"), "Create sandbox");
             createConfirmed = true;
+            if (reservation is not null)
+            {
+                // Capture backend identity before any guest work. The local
+                // backend is a trusted dependency; exclusive management of
+                // this namespace is required (inspect/create is not atomic).
+                backendIdentity = RequireBackendIdentity(sandbox,
+                    await InvokeAsync(TimeSpan.FromSeconds(30), "inspect", sandbox, "--json"));
+            }
             createMs = watch.ElapsedMilliseconds;
             ProgressMessage($"MicroVM bereit ({createMs / 1000.0:F2} s).", "MICROVM_READY");
 
@@ -310,8 +319,22 @@ internal static class DevelopmentSandboxRunner
             {
                 try
                 {
+                    if (reservation is not null)
+                    {
+                        if (backendIdentity is null)
+                            throw new InvalidOperationException("ORDER_SANDBOX_OWNERSHIP_UNKNOWN");
+                        string currentIdentity = RequireBackendIdentity(sandbox,
+                            await InvokeAsync(TimeSpan.FromSeconds(30), "inspect", sandbox, "--json"));
+                        OrderCheck.Require(currentIdentity == backendIdentity, "ORDER_SANDBOX_IDENTITY_CHANGED");
+                    }
                     EnsureSuccess(await InvokeAsync(TimeSpan.FromSeconds(90),
                         "rm", "--force", sandbox), "Remove ephemeral sandbox");
+                    if (reservation is not null)
+                    {
+                        SandboxProcess removed = await InvokeAsync(TimeSpan.FromSeconds(30), "inspect", sandbox);
+                        OrderCheck.Require(IsConfirmedAbsent(id, removed.ExitCode, removed.Output, removed.Error),
+                            "ORDER_SANDBOX_REMOVAL_UNCONFIRMED");
+                    }
                     sandboxRemovalSucceeded = true;
                 }
                 catch (Exception ex)
@@ -323,13 +346,13 @@ internal static class DevelopmentSandboxRunner
             if (Directory.Exists(stage))
                 Directory.Delete(stage, recursive: true);
             ProgressMessage(sandboxRemovalSucceeded
-                ? $"MicroVM entfernt: sbx rm Exitcode 0 ({cleanupMs / 1000.0:F2} s)."
+                ? $"MicroVM entfernt ({cleanupMs / 1000.0:F2} s)."
                 : $"ACHTUNG: MicroVM-Entfernung nicht bestätigt ({cleanupMs / 1000.0:F2} s).",
                 sandboxRemovalSucceeded ? "CLEANUP_CONFIRMED" : "CLEANUP_UNCONFIRMED",
                 sandboxRemovalSucceeded ? 0 : 1);
         }
 
-        var report = new SandboxRunReport(reservation is null ? 1 : 3, id, guestProject, mode, restore, build,
+        var report = new SandboxRunReport(reservation is null ? 1 : 4, id, guestProject, mode, restore, build,
             execution, timedOut, createMs, copyMs, restoreMs, buildMs, executionMs, cleanupMs, lifecycle.ElapsedMilliseconds,
             sandboxRemovalSucceeded, error, verifiedSnapshotHash);
         string reportPath = Path.Combine(reportDir, "report.json");
@@ -604,6 +627,39 @@ internal static class DevelopmentSandboxRunner
             RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
     }
 
+    // The local CLI documents JSON inspection, but name-based removal
+    // is not an atomic compare-and-delete. Never infer ownership from a name
+    // or fall back to removal when the identity is missing or changed.
+    private static string RequireBackendIdentity(string sandbox, SandboxProcess result)
+    {
+        OrderCheck.Require(result.ExitCode == 0 && result.Error.Length == 0
+            && result.Output.Length is > 0 and < MaxOutputChars, "ORDER_SANDBOX_IDENTITY_UNKNOWN");
+        try
+        {
+            using var document = JsonDocument.Parse(result.Output);
+            JsonElement root = document.RootElement;
+            OrderCheck.Require(root.ValueKind == JsonValueKind.Object, "ORDER_SANDBOX_IDENTITY_UNKNOWN");
+            var fields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (JsonProperty property in root.EnumerateObject())
+                OrderCheck.Require(fields.Add(property.Name), "ORDER_SANDBOX_IDENTITY_UNKNOWN");
+            OrderCheck.Require(root.TryGetProperty("name", out JsonElement name)
+                && name.ValueKind == JsonValueKind.String && name.GetString() == sandbox,
+                "ORDER_SANDBOX_IDENTITY_UNKNOWN");
+            if (!root.TryGetProperty("id", out JsonElement id) || id.ValueKind != JsonValueKind.String)
+                throw new InvalidOperationException("ORDER_SANDBOX_IDENTITY_UNKNOWN");
+            string? identity = id.GetString();
+            if (identity is not { Length: >= 8 and <= 128 }
+                || !identity.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_')
+                || identity == sandbox)
+                throw new InvalidOperationException("ORDER_SANDBOX_IDENTITY_UNKNOWN");
+            return identity;
+        }
+        catch (JsonException)
+        {
+            throw new InvalidOperationException("ORDER_SANDBOX_IDENTITY_UNKNOWN");
+        }
+    }
+
     private static void ValidateInspect(SandboxProcess result, string sandbox)
     {
         EnsureSuccess(result, "Inspect sandbox");
@@ -835,12 +891,17 @@ internal static class DevelopmentSandboxRunner
             foreach (string scenario in new[]
             {
                 "existing", "backend", "ambiguous-create", "guest-modified", "guest-extra",
-                "guest-missing", "guest-link", "guest-truncated", "guest-stderr", "success"
+                "guest-missing", "guest-link", "guest-truncated", "guest-stderr",
+                "identity-missing", "identity-duplicate", "identity-changed", "identity-backend",
+                "removal-unconfirmed", "success"
             })
             {
                 string results = Path.Combine(root, scenario);
                 Directory.CreateDirectory(results);
                 var calls = new List<string[]>();
+                int identityChecks = 0;
+                bool removed = false;
+                string Identity(string identity) => JsonSerializer.Serialize(new { name, id = identity });
                 Task<SandboxProcess> FakeTransport(TimeSpan _, string[] args)
                 {
                     calls.Add(args);
@@ -848,15 +909,31 @@ internal static class DevelopmentSandboxRunner
                     switch (args[0])
                     {
                         case "inspect":
-                            response = calls.Count == 1
-                                ? scenario == "existing" ? new(0, healthy, "")
-                                    : scenario == "backend" ? new(1, "", "backend unavailable")
-                                    : new(1, "", absent)
-                                : new(0, healthy, "");
+                            if (args.Contains("--json", StringComparer.Ordinal))
+                            {
+                                identityChecks++;
+                                response = scenario switch
+                                {
+                                    "identity-missing" => new(0, JsonSerializer.Serialize(new { name }), ""),
+                                    "identity-duplicate" => new(0, Identity("sandbox-id-original")[..^1] + ",\"id\":\"sandbox-id-other\"}", ""),
+                                    "identity-changed" when identityChecks > 1 => new(0, Identity("sandbox-id-other"), ""),
+                                    "identity-backend" when identityChecks > 1 => new(1, "", "backend unavailable"),
+                                    _ => new(0, Identity("sandbox-id-original"), "")
+                                };
+                            }
+                            else
+                                response = calls.Count == 1
+                                    ? scenario == "existing" ? new(0, healthy, "")
+                                        : scenario == "backend" ? new(1, "", "backend unavailable")
+                                        : new(1, "", absent)
+                                    : removed && scenario != "removal-unconfirmed" ? new(1, "", absent) : new(0, healthy, "");
                             break;
                         case "create":
                             if (scenario == "ambiguous-create")
                                 response = new(1, "", "unconfirmed create");
+                            break;
+                        case "rm":
+                            removed = true;
                             break;
                         case "policy":
                             response = new(1, "Denied: " + args[^1] + " default deny", "");
@@ -888,15 +965,23 @@ internal static class DevelopmentSandboxRunner
                 int exit = await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
                     (_, _, _, _) => { }, reservation, FakeTransport);
                 bool success = scenario == "success";
-                bool guestChecked = success || scenario.StartsWith("guest-", StringComparison.Ordinal);
+                bool guestMismatch = scenario.StartsWith("guest-", StringComparison.Ordinal);
+                bool ownershipUnknown = scenario is "identity-missing" or "identity-duplicate";
+                bool ownershipChanged = scenario is "identity-changed" or "identity-backend";
+                bool guestChecked = success || guestMismatch || ownershipChanged || scenario == "removal-unconfirmed";
+                bool guestVerified = guestChecked && !guestMismatch;
+                bool removalExpected = guestChecked && !ownershipChanged;
+                bool removalConfirmed = removalExpected && scenario != "removal-unconfirmed";
                 int creates = calls.Count(a => a[0] == "create");
                 int removes = calls.Count(a => a[0] == "rm");
                 int checkIndex = calls.FindIndex(a => a.Contains(GuestSnapshotCheckScript, StringComparer.Ordinal));
                 int restoreIndex = calls.FindIndex(a => a.Contains("restore", StringComparer.Ordinal));
-                if ((exit == 0) != success || creates != (guestChecked || scenario == "ambiguous-create" ? 1 : 0)
-                    || removes != (guestChecked ? 1 : 0)
+                if ((exit == 0) != success || creates != (guestChecked || ownershipUnknown || scenario == "ambiguous-create" ? 1 : 0)
+                    || removes != (removalExpected ? 1 : 0)
+                    || identityChecks != (guestChecked ? 2 : ownershipUnknown ? 1 : 0)
                     || (checkIndex >= 0) != guestChecked
-                    || (success ? restoreIndex <= checkIndex : restoreIndex != -1)
+                    || (guestVerified ? restoreIndex <= checkIndex : restoreIndex != -1)
+                    || (removalExpected && (calls[^1][0] != "inspect" || calls[^1][1] != name))
                     || calls[0][0] != "inspect" || calls[0][1] != name
                     || calls.Any(a => a[0] == "create" && a[2] != name)
                     || calls.Any(a => a[0] == "rm" && a[^1] != name))
@@ -906,9 +991,9 @@ internal static class DevelopmentSandboxRunner
                 byte[] bytes = File.ReadAllBytes(reportPath);
                 var report = JsonSerializer.Deserialize<SandboxRunReport>(bytes, new JsonSerializerOptions(JsonSerializerDefaults.Web))
                     ?? throw new InvalidOperationException("Reserved runner report missing.");
-                if (report.SchemaVersion != 3 || report.RunId != id
-                    || report.SnapshotHash != (success ? snapshotHash : null)
-                    || report.SandboxRemovalSucceeded != guestChecked)
+                if (report.SchemaVersion != 4 || report.RunId != id
+                    || report.SnapshotHash != (guestVerified ? snapshotHash : null)
+                    || report.SandboxRemovalSucceeded != removalConfirmed)
                     throw new InvalidOperationException("Reserved report identity or cleanup differs.");
                 var observed = DevelopmentOrderGuestReconciliation.Observe(new string('A', 64),
                     reservation, bytes, 1, "", absent, DateTime.UtcNow.Ticks);
@@ -931,6 +1016,7 @@ internal static class DevelopmentSandboxRunner
             }
             Console.WriteLine("PASS: reserved sandbox runner uses pre-bound identity, rejects collisions and ambiguous create, retains one-shot slot.");
             Console.WriteLine("PASS: guest snapshot observation precedes restore; changed/extra/missing/nonregular/truncated/diagnostic evidence blocks execution.");
+            Console.WriteLine("PASS: reserved cleanup checks backend identity before removal and fresh absence after removal; unknown/changed identity blocks rm.");
         }
         finally
         {

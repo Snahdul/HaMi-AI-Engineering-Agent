@@ -285,7 +285,7 @@ internal static class DevelopmentOrderOperationLedgerTests
         Reject(() => guestPending.Reserve(job, limits, Propose(guestPending, "S01", "guest", 30, now)));
         Reject(() => DevelopmentOrderGuestReconciliation.RunId(reserve));
         string absent = "error: sandbox 'hami-code-" + runId[..12] + "' not found";
-        var report = new DevelopmentSandboxRunner.SandboxRunReport(3, runId, "Demo.csproj", "run",
+        var report = new DevelopmentSandboxRunner.SandboxRunReport(4, runId, "Demo.csproj", "run",
             0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null, hash);
         var legacyReport = report with { SchemaVersion = 1, SnapshotHash = null };
         if (System.Text.Json.JsonSerializer.Serialize(legacyReport, new System.Text.Json.JsonSerializerOptions(
@@ -305,6 +305,7 @@ internal static class DevelopmentOrderOperationLedgerTests
         {
             legacyReport,
             report with { SchemaVersion = 2 },
+            report with { SchemaVersion = 3 },
             report with { SnapshotHash = null },
             report with { SnapshotHash = new string('B', 64) },
             report with { RunId = new string('f', 32) },

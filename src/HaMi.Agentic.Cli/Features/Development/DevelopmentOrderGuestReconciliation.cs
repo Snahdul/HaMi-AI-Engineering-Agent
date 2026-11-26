@@ -87,7 +87,7 @@ internal static class DevelopmentOrderGuestReconciliation
         // Exact canonical runner format rejects duplicate/unknown/missing
         // fields, alternate encodings, and trailing or truncated data.
         if (report is null || !reportBytes.AsSpan().SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(report, ReportOptions))
-            || report.SchemaVersion != 3 || report.RunId != runId || report.Project != "Demo.csproj"
+            || report.SchemaVersion != 4 || report.RunId != runId || report.Project != "Demo.csproj"
             || report.SnapshotHash != reservation.SnapshotHash
             || report.Mode != "run" || report.TimedOut || !report.SandboxRemovalSucceeded || report.Error is not null
             || report.RestoreExitCode != 0 || report.BuildExitCode != 0 || report.ExecutionExitCode != 0
