@@ -31,7 +31,7 @@ internal static class DevelopmentOrderCalculatorVerifier
     {
         using Stream stream = typeof(DevelopmentOrderCalculatorVerifier).Assembly.GetManifestResourceStream(
             "HaMi.DevelopmentOrder.CalculatorVerifier." + name)
-            ?? throw new InvalidOperationException("ORDER_CALCULATOR_VERIFIER_ASSET");
+            ?? throw new InvalidOperationException("ORDER_CALCULATOR_VERIFIER_ASSET: " + name);
         using var buffer = new MemoryStream();
         stream.CopyTo(buffer);
         return buffer.ToArray();
