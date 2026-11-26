@@ -16,12 +16,13 @@ internal static class DevelopmentOrderCalculatorVerifier
     {
         var observation = DevelopmentOrderModelReconciliation.Observe(owner, recovered);
         if (observation.Status != OrderModelRecoveryStatus.Generated
-            || observation.Candidate is not { Quality: "Generated" } candidate)
+            || observation.Reservation.Step != "S01"
+            || observation.Candidate is not { Quality: "Generated", Step: "S01" } candidate)
             throw new InvalidOperationException("ORDER_CALCULATOR_VERIFIER_CANDIDATE");
 
         return new(StringComparer.Ordinal)
         {
-            ["Demo.csproj"] = ReadAsset("Project"),
+            ["Demo.csproj"] = ReadProjectAsset(),
             ["Program.cs"] = ReadAsset("Program"),
             ["PairCalculatorVerifier.cs"] = ReadAsset("Checks"),
             ["PairCalculator.cs"] = owner.RequireOrderCandidate(candidate)
@@ -189,6 +190,8 @@ internal static class DevelopmentOrderCalculatorVerifier
     // but no trimming, extra lines, whitespace or stderr diagnostics.
     internal static bool MatchesOutput(string output, string error) =>
         error.Length == 0 && (output == ExpectedStdout + "\n" || output == ExpectedStdout + "\r\n");
+
+    internal static byte[] ReadProjectAsset() => ReadAsset("Project");
 
     private static byte[] ReadAsset(string name)
     {

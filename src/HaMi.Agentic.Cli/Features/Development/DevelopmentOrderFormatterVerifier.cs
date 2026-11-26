@@ -47,6 +47,87 @@ internal static class DevelopmentOrderFormatterVerifier
         return OrderCandidateCheckpoint.FormatterInputHash(claim, accepted);
     }
 
+    // Require the actual accepted S01 view, independently validated input
+    // copies from RequireInputs, and the adjacent completed S02 model view.
+    // The host must obtain those views from the journal, not synthesize them.
+    internal static Dictionary<string, byte[]> Prepare(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger acceptedLedger, DevelopmentOrderOperationLedger completedModel,
+        OrderFormatterInputs inputs)
+    {
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var accepted = acceptedLedger.AcceptedS01 ?? throw new InvalidOperationException("ORDER_FORMATTER_PREDECESSOR");
+        var observed = DevelopmentOrderModelReconciliation.Observe(owner, completedModel);
+        if (observed.Status != OrderModelRecoveryStatus.Generated || observed.Reservation.Step != "S02"
+            || observed.Candidate is not { Step: "S02", Quality: "Generated" } candidate
+            || observed.Completion is not { } completion)
+            throw new InvalidOperationException("ORDER_FORMATTER_VERIFIER_CANDIDATE");
+        var limits = acceptedLedger.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+        OrderCheck.Require(candidate.InputHash == RequireInputHash(claim, accepted, inputs)
+            && completedModel == acceptedLedger.Reserve(claim.JobId, limits, observed.Reservation)
+                .Checkpoint(claim, candidate).Complete(completion),
+            "ORDER_FORMATTER_VERIFIER_HISTORY");
+        byte[] calculator = owner.RequireOrderCandidate(accepted.Candidate);
+        OrderCheck.Require(calculator.AsSpan().SequenceEqual(inputs.Calculator),
+            "ORDER_FORMATTER_VERIFIER_PREDECESSOR");
+        return new(StringComparer.Ordinal)
+        {
+            ["Demo.csproj"] = DevelopmentOrderCalculatorVerifier.ReadProjectAsset(),
+            ["Program.cs"] = ReadAsset("Program"),
+            ["PairFormatterVerifier.cs"] = ReadAsset("Checks"),
+            ["PairCalculator.cs"] = calculator,
+            ["PairFormatter.cs"] = owner.RequireOrderCandidate(candidate)
+        };
+    }
+
+    internal static OrderOperationReservation ProposeGuest(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger acceptedLedger, DevelopmentOrderOperationLedger completedModel,
+        OrderFormatterInputs inputs, int seconds, long now)
+    {
+        byte[] manifest = ExpectedManifest(owner, acceptedLedger, completedModel, inputs);
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        return completedModel.Propose(claim.JobId, "S02", "guest", seconds, now, null,
+            DevelopmentJobState.Hash(manifest));
+    }
+
+    // Same immutable manifest slot and directory checks as S01; no guest
+    // dispatch or acceptance. The source must be exclusively host controlled.
+    internal static void StoreGuestSnapshot(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger acceptedLedger, DevelopmentOrderOperationLedger completedModel,
+        OrderFormatterInputs inputs, OrderOperationReservation proposal, string source)
+    {
+        byte[] manifest = RequireExpectedSnapshot(owner, acceptedLedger, completedModel, inputs, proposal, source);
+        owner.StoreOrderSnapshotManifest(proposal, manifest);
+        RequireGuestSnapshot(owner, acceptedLedger, completedModel, inputs, proposal, source);
+    }
+
+    internal static void RequireGuestSnapshot(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger acceptedLedger, DevelopmentOrderOperationLedger completedModel,
+        OrderFormatterInputs inputs, OrderOperationReservation proposal, string source)
+    {
+        byte[] manifest = RequireExpectedSnapshot(owner, acceptedLedger, completedModel, inputs, proposal, source);
+        OrderCheck.Require(owner.RequireOrderSnapshotManifest(proposal).AsSpan().SequenceEqual(manifest),
+            "ORDER_FORMATTER_VERIFIER_MANIFEST");
+    }
+
+    private static byte[] ExpectedManifest(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger acceptedLedger, DevelopmentOrderOperationLedger completedModel,
+        OrderFormatterInputs inputs) =>
+        DevelopmentOrderSnapshot.CaptureBytes(Prepare(owner, acceptedLedger, completedModel, inputs), "Demo.csproj");
+
+    private static byte[] RequireExpectedSnapshot(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger acceptedLedger, DevelopmentOrderOperationLedger completedModel,
+        OrderFormatterInputs inputs, OrderOperationReservation proposal, string source)
+    {
+        byte[] manifest = ExpectedManifest(owner, acceptedLedger, completedModel, inputs);
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        OrderCheck.Require(proposal == completedModel.Propose(claim.JobId, "S02", "guest",
+            proposal.ReservedSeconds, proposal.ObservedUtcTicks, null, DevelopmentJobState.Hash(manifest)),
+            "ORDER_FORMATTER_VERIFIER_RESERVATION");
+        OrderCheck.Require(DevelopmentOrderSnapshot.CaptureBytes(source, "Demo.csproj").AsSpan().SequenceEqual(manifest),
+            "ORDER_FORMATTER_VERIFIER_SNAPSHOT");
+        return manifest;
+    }
+
     internal static bool MatchesOutput(string output, string error) =>
         error.Length == 0 && (output == ExpectedStdout + "\n" || output == ExpectedStdout + "\r\n");
 

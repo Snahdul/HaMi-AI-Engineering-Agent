@@ -1089,6 +1089,84 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: calculator guest proposal binds exactly four trusted input files and protected candidate bytes; substituted, missing, extra and tampered snapshots rejected.");
     }
 
+    private static void TestFormatterSnapshot(DevelopmentJobStateStore.Lease owner,
+        DevelopmentOrderOperationLedger accepted, DevelopmentOrderOperationLedger completed,
+        OrderFormatterInputs inputs, string root, string journal)
+    {
+        var files = DevelopmentOrderFormatterVerifier.Prepare(owner, accepted, completed, inputs);
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        var candidate = completed.LatestCandidate ?? throw new InvalidOperationException("Formatter candidate missing.");
+        string[] names = ["Demo.csproj", "PairCalculator.cs", "PairFormatter.cs", "PairFormatterVerifier.cs", "Program.cs"];
+        if (!files.Keys.OrderBy(name => name, StringComparer.Ordinal).SequenceEqual(names)
+            || !files["PairCalculator.cs"].SequenceEqual(owner.RequireOrderCandidate(inputs.CalculatorAcceptance.Candidate))
+            || !files["PairFormatter.cs"].SequenceEqual(owner.RequireOrderCandidate(candidate))
+            || !Encoding.UTF8.GetString(files["Program.cs"]).Contains(
+                DevelopmentOrderFormatterVerifier.ExpectedStdout, StringComparison.Ordinal))
+            throw new InvalidOperationException("Formatter verifier input differs.");
+        Reject(() => DevelopmentOrderCalculatorVerifier.Prepare(owner, completed));
+        Reject(() => DevelopmentOrderFormatterVerifier.Prepare(owner, accepted, accepted, inputs));
+        Reject(() => DevelopmentOrderFormatterVerifier.Prepare(owner, accepted with { AcceptedS01 = null }, completed, inputs));
+        Reject(() => DevelopmentOrderFormatterVerifier.Prepare(owner, accepted, completed with { ReservedSeconds = 0 }, inputs));
+        Reject(() => DevelopmentOrderFormatterVerifier.Prepare(owner, accepted, completed,
+            inputs with { Calculator = [.. inputs.Calculator, 0x20] }));
+        Reject(() => DevelopmentOrderFormatterVerifier.Prepare(owner, accepted, completed,
+            inputs with { FormatterBaseline = [.. inputs.FormatterBaseline, 0x20] }));
+
+        string source = Path.Combine(root, "formatter-verification");
+        Directory.CreateDirectory(source);
+        foreach (var file in files)
+            File.WriteAllBytes(Path.Combine(source, file.Key), file.Value);
+        var proposal = DevelopmentOrderFormatterVerifier.ProposeGuest(owner, accepted, completed, inputs, 10, DateTime.UtcNow.Ticks);
+        var limits = completed.CurrentLimits ?? throw new InvalidOperationException("Missing limits.");
+        var admitted = completed.ReserveWithRequiredWork(claim.JobId, limits, proposal,
+            [new("FINAL", "guest", completed.FinalReserveSeconds)]);
+        string slot = journal + ".snapshot-4";
+        if (proposal.Step != "S02" || proposal.Kind != "guest" || admitted.Pending != proposal
+            || proposal.SnapshotHash != DevelopmentOrderSnapshot.Capture(source, "Demo.csproj")
+            || completed.Pending is not null || completed.Guests != 1 || admitted.Guests != 2
+            || admitted.ReservedSeconds != completed.ReservedSeconds + 10 || File.Exists(slot))
+            throw new InvalidOperationException("Formatter guest proposal differs.");
+
+        Reject(() => DevelopmentOrderFormatterVerifier.RequireGuestSnapshot(owner, accepted, completed, inputs, proposal, source));
+        Reject(() => DevelopmentOrderFormatterVerifier.StoreGuestSnapshot(owner, accepted, completed, inputs,
+            proposal with { Step = "S01" }, source));
+        Reject(() => DevelopmentOrderFormatterVerifier.StoreGuestSnapshot(owner, accepted, completed, inputs,
+            proposal with { SnapshotHash = new string('A', 64) }, source));
+        Reject(() => DevelopmentOrderFormatterVerifier.StoreGuestSnapshot(owner, accepted, completed, inputs,
+            proposal with { OperationId = claim.JobId + ":5" }, source));
+        foreach (var file in files)
+        {
+            string path = Path.Combine(source, file.Key);
+            byte[] changed = file.Value.ToArray();
+            changed[0] ^= 1;
+            File.WriteAllBytes(path, changed);
+            try { Reject(() => DevelopmentOrderFormatterVerifier.StoreGuestSnapshot(owner, accepted, completed, inputs, proposal, source)); }
+            finally { File.WriteAllBytes(path, file.Value); }
+        }
+        string extra = Path.Combine(source, "Extra.cs");
+        File.WriteAllText(extra, "// forbidden extra");
+        try { Reject(() => DevelopmentOrderFormatterVerifier.StoreGuestSnapshot(owner, accepted, completed, inputs, proposal, source)); }
+        finally { File.Delete(extra); }
+        string predecessor = Path.Combine(source, "PairCalculator.cs");
+        File.Delete(predecessor);
+        try { Reject(() => DevelopmentOrderFormatterVerifier.StoreGuestSnapshot(owner, accepted, completed, inputs, proposal, source)); }
+        finally { File.WriteAllBytes(predecessor, files["PairCalculator.cs"]); }
+        if (File.Exists(slot))
+            throw new InvalidOperationException("Rejected formatter snapshot created protected evidence.");
+
+        DevelopmentOrderFormatterVerifier.StoreGuestSnapshot(owner, accepted, completed, inputs, proposal, source);
+        DevelopmentOrderFormatterVerifier.RequireGuestSnapshot(owner, accepted, completed, inputs, proposal, source);
+        Reject(() => DevelopmentOrderFormatterVerifier.StoreGuestSnapshot(owner, accepted, completed, inputs, proposal, source));
+        byte[] manifest = File.ReadAllBytes(slot);
+        File.WriteAllBytes(slot, [.. manifest, 0x20]);
+        try { Reject(() => DevelopmentOrderFormatterVerifier.RequireGuestSnapshot(owner, accepted, completed, inputs, proposal, source)); }
+        finally { File.WriteAllBytes(slot, manifest); }
+        DevelopmentOrderFormatterVerifier.RequireGuestSnapshot(owner, accepted, completed, inputs, proposal, source);
+        if (File.Exists(journal + ".guest-dispatch-4") || File.Exists(journal + ".s02"))
+            throw new InvalidOperationException("Formatter snapshot dispatched or accepted work.");
+        Console.WriteLine("BRIDGE_PHASE: exact five-file S02 verifier snapshot binds accepted predecessor and generated formatter; substitutions rejected.");
+    }
+
     internal static async Task RunAsync(string prefix, Func<string, string, Process> start,
         Func<string, string, Task> expectOwnership)
     {
@@ -1301,6 +1379,8 @@ internal static class PersistenceBridgeProbe
                         !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(calculatorEvidence[i])).Any()
                         || File.Exists(calculatorPrefix + "guest-dispatch-3")
                         || File.Exists(calculatorPrefix + "model-dispatch-4")
+                        || File.Exists(calculatorPrefix + "guest-dispatch-4")
+                        || File.Exists(calculatorPrefix + "snapshot-4") != !formatterScenario
                         || formatterSlots.Where((slot, i) => File.Exists(calculatorPrefix + slot) != expectedFormatterSlots[i]
                             || expectedFormatterSlots[i] && !File.ReadAllBytes(calculatorPrefix + slot).SequenceEqual(formatterEvidence[i])).Any()
                         || formatterHasCandidate && !File.ReadAllBytes(calculatorPrefix + "candidate-3")
@@ -1984,6 +2064,15 @@ internal static class PersistenceBridgeProbe
                             try { Reject(() => DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger)); }
                             finally { File.WriteAllBytes(evidenceFile, bytes); }
                         }
+                    }
+
+                    if (candidate is null)
+                    {
+                        Reject(() => DevelopmentOrderFormatterVerifier.Prepare(owner, beforeFormatter, current.Ledger, recoveredInputs));
+                    }
+                    else
+                    {
+                        TestFormatterSnapshot(owner, beforeFormatter, current.Ledger, recoveredInputs, root, database);
                     }
 
                     if (DevelopmentOrderModelReconciliation.Observe(owner, current.Ledger) != recovered
