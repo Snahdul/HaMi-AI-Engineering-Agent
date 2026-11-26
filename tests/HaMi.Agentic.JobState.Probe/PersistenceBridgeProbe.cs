@@ -2027,6 +2027,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: terminal order acceptance persisted before ack and recovered after process kill; exact evidence, original budget and no further effects.");
         Console.WriteLine("PASS: FINAL pre-dispatch, wrong-output and orphan-report process kills recover pending blocked without redispatch, adoption or budget reset.");
         Console.WriteLine("PASS: journal-derived workflow obligations select pair reentry routes, block pending effects and distinguish rejected models, budget stops and terminal inspection.");
+        Console.WriteLine("PASS: bounded workflow admission checks mandatory work and actual journal acknowledgements for S02 model, S02 guest and FINAL; stale and repeated admissions rejected.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2865,7 +2866,7 @@ internal static class PersistenceBridgeProbe
                     var pairObservation = new OrderPairObservation(ObserveCalculatorFixture(owner, claim, outcome),
                         freshFormatterObservation, ObserveCalculatorBaseline(root, claim.Binding), CalculatorRecoveryPair(root),
                         DevelopmentOrderCalculatorVerifier.ReadStagedPair(Path.Combine(root, "formatter-stage")));
-                    async Task<DevelopmentOrderOperationLedger> AdmitIntegration(OrderOperationReservation request)
+                    async Task<DevelopmentOrderOperationLedger> PersistIntegration(OrderOperationReservation request)
                     {
                         Task<BridgeState> ack = actor.Ask<BridgeState>(new AdmitIntegrationGuest(request), Deadline);
                         await guard.AwaitAsync(ack);
@@ -2886,7 +2887,8 @@ internal static class PersistenceBridgeProbe
                     }
 
                     await TestIntegrationSnapshotAsync(owner, pairHistory, pairObservation, root, database, finalCrash,
-                        AdmitIntegration, CompleteIntegration);
+                        request => DevelopmentOrderAdmission.AdmitAsync(claim, current.Ledger, request, [], PersistIntegration),
+                        CompleteIntegration);
                     bool completedIntegration = finalCrash == "completed";
                     if (await ReadAsync() != current || current.Stage != (completedIntegration ? 15 : 14)
                         || File.Exists(database + ".guest-dispatch-6"))
@@ -3077,7 +3079,7 @@ internal static class PersistenceBridgeProbe
                     else
                     {
                         var completedFormatter = current;
-                        async Task<DevelopmentOrderOperationLedger> AdmitGuest(OrderOperationReservation request)
+                        async Task<DevelopmentOrderOperationLedger> PersistGuest(OrderOperationReservation request)
                         {
                             Task<BridgeState> ack = actor.Ask<BridgeState>(new AdmitFormatterGuest(request), Deadline);
                             await guard.AwaitAsync(ack);
@@ -3098,7 +3100,10 @@ internal static class PersistenceBridgeProbe
                         }
 
                         await TestFormatterSnapshotAsync(owner, beforeFormatter, completedFormatter.Ledger, recoveredInputs,
-                            root, database, successfulFormatter, AdmitGuest, CompleteGuest);
+                            root, database, successfulFormatter,
+                            request => DevelopmentOrderAdmission.AdmitAsync(claim, current.Ledger, request,
+                                [new("FINAL", "guest", current.Ledger.FinalReserveSeconds)], PersistGuest),
+                            CompleteGuest);
                         if (await ReadAsync() != current || current.Stage != (successfulFormatter ? 12 : 11))
                             throw new InvalidOperationException("Formatter guest journal differs before kill.");
                         owner.ValidateOrderJournalFiles();
@@ -3196,10 +3201,46 @@ internal static class PersistenceBridgeProbe
                 var actualRequest = current.Ledger.Propose(claim.JobId, "S02", "model", 10,
                     DateTime.UtcNow.Ticks, OrderOperationAgentBinding.FromAssignment(formatterAssignment));
                 var acceptedState = current;
-                Task<BridgeState> formatterAdmission = actor.Ask<BridgeState>(new AdmitFormatter(actualRequest), Deadline);
-                await guard.AwaitAsync(formatterAdmission);
-                current = await formatterAdmission;
-                var actualPending = current.Ledger;
+                OrderRequiredOperation[] formatterRequired =
+                    [new("S02", "guest", 10), new("FINAL", "guest", current.Ledger.FinalReserveSeconds)];
+                int syntheticAdmissionCalls = 0;
+                Task<DevelopmentOrderOperationLedger> StaleAck(OrderOperationReservation request)
+                {
+                    syntheticAdmissionCalls++;
+                    return Task.FromResult(acceptedState.Ledger);
+                }
+
+                async Task RejectWorkflowAdmissionAsync(DevelopmentOrderOperationLedger before,
+                    OrderOperationReservation request, IReadOnlyList<OrderRequiredOperation> required)
+                {
+                    bool rejected = false;
+                    try { _ = await DevelopmentOrderAdmission.AdmitAsync(claim, before, request, required, StaleAck); }
+                    catch (InvalidOperationException) { rejected = true; }
+                    if (!rejected)
+                        throw new InvalidOperationException("Invalid workflow admission accepted.");
+                }
+
+                await RejectWorkflowAdmissionAsync(acceptedState.Ledger, actualRequest with { Step = "S01" }, formatterRequired);
+                await RejectWorkflowAdmissionAsync(acceptedState.Ledger, actualRequest, [formatterRequired[1]]);
+                if (syntheticAdmissionCalls != 0)
+                    throw new InvalidOperationException("Invalid action or incomplete plan reached persistence.");
+                await RejectWorkflowAdmissionAsync(acceptedState.Ledger, actualRequest, formatterRequired);
+                if (syntheticAdmissionCalls != 1 || await ReadAsync() != acceptedState)
+                    throw new InvalidOperationException("Stale admission acknowledgement changed history.");
+
+                async Task<DevelopmentOrderOperationLedger> PersistFormatter(OrderOperationReservation request)
+                {
+                    Task<BridgeState> ack = actor.Ask<BridgeState>(new AdmitFormatter(request), Deadline);
+                    await guard.AwaitAsync(ack);
+                    current = await ack;
+                    return current.Ledger;
+                }
+
+                var actualPending = await DevelopmentOrderAdmission.AdmitAsync(claim, acceptedState.Ledger,
+                    actualRequest, formatterRequired, PersistFormatter);
+                await RejectWorkflowAdmissionAsync(actualPending, actualRequest, formatterRequired);
+                if (syntheticAdmissionCalls != 1 || await ReadAsync() != current)
+                    throw new InvalidOperationException("Pending operation reached persistence again.");
                 if (current.Stage != 9 || actualPending.Pending != actualRequest || actualPending.Sequence != 3
                     || actualPending.ReservedSeconds != 70 || current.FormatterInputState != acceptedState.Ledger)
                     throw new InvalidOperationException("Formatter admission was not persisted and acknowledged.");
