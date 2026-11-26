@@ -2026,6 +2026,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: FINAL guest reservation and successful outcome persisted before ack; process kill recovers all three guest proofs and both acceptances without redispatch or budget reset.");
         Console.WriteLine("PASS: terminal order acceptance persisted before ack and recovered after process kill; exact evidence, original budget and no further effects.");
         Console.WriteLine("PASS: FINAL pre-dispatch, wrong-output and orphan-report process kills recover pending blocked without redispatch, adoption or budget reset.");
+        Console.WriteLine("PASS: journal-derived workflow obligations select pair reentry routes, block pending effects and distinguish rejected models, budget stops and terminal inspection.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2275,6 +2276,8 @@ internal static class PersistenceBridgeProbe
                 Console.WriteLine("BRIDGE_PHASE: order accepted.");
                 if (modelScenario)
                 {
+                    if (DevelopmentOrderWorkflow.Select(claim, current.Ledger) != OrderWorkflowAction.GenerateCalculator)
+                        throw new InvalidOperationException("Initial workflow action differs.");
                     var assignment = ModelFixtureAssignment(claim, archive);
                     var approval = calculatorScenario ? await CalculatorRecoveryApprovalAsync(root) : FixtureApproval();
                     OrderAgentProfile[] catalog = [new(assignment.Agent, true, ["csharp"])];
@@ -2309,6 +2312,8 @@ internal static class PersistenceBridgeProbe
                     if (calculatorScenario)
                     {
                         var model = current.Ledger;
+                        if (DevelopmentOrderWorkflow.Select(claim, model) != OrderWorkflowAction.VerifyCalculator)
+                            throw new InvalidOperationException("Calculator workflow action differs.");
                         CreateCalculatorStage(root, owner, model);
                         var guest = DevelopmentOrderCalculatorVerifier.ProposeGuest(owner, model, 30, DateTime.UtcNow.Ticks);
                         string source = Path.Combine(Path.GetTempPath(), "hami-calculator-recovery-" + Guid.NewGuid().ToString("N"));
@@ -2333,7 +2338,8 @@ internal static class PersistenceBridgeProbe
                             ?? throw new InvalidOperationException("Calculator fixture guest outcome missing.");
                         owner.StoreOrderGuestReport(outcome, guest, bytes);
                         current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeGuestOutcome(outcome), 6);
-                        if (current.Ledger.AcceptedS01 is not null)
+                        if (current.Ledger.AcceptedS01 is not null
+                            || DevelopmentOrderWorkflow.Select(claim, current.Ledger) != OrderWorkflowAction.AcceptCalculator)
                             throw new InvalidOperationException("Guest completion accepted calculator prematurely.");
                         if (mode == "bridge-model-verified")
                         {
@@ -2520,6 +2526,8 @@ internal static class PersistenceBridgeProbe
 
             if (softScenario)
             {
+                if (DevelopmentOrderWorkflow.Select(claim, current.Ledger) != OrderWorkflowAction.AwaitBudgetExtension)
+                    throw new InvalidOperationException("Soft stop workflow action differs.");
                 var recoveredStop = current.Ledger.SoftStop ?? throw new InvalidOperationException("Soft stop not replayed.");
                 var accepted = current.S01 ?? throw new InvalidOperationException("Accepted fixture S01 missing.");
                 VerifyFixtureOutcome(owner, claim, accepted);
@@ -2563,7 +2571,11 @@ internal static class PersistenceBridgeProbe
 
             if (calculatorScenario)
             {
-                if (mode == "bridge-model-resume-verified" && current.Stage == 6)
+                var nextAction = DevelopmentOrderWorkflow.Select(claim, current.Ledger);
+                Console.WriteLine("BRIDGE_PHASE: journal workflow action " + nextAction + ".");
+                Reject(() => DevelopmentOrderWorkflow.Select(claim, current.Ledger with { ArchiveHash = new string('A', 64) }));
+                Reject(() => DevelopmentOrderWorkflow.Select(claim, current.Ledger with { Sequence = current.Ledger.Sequence + 1 }));
+                if (nextAction == OrderWorkflowAction.AcceptCalculator)
                 {
                     if (current.Stage != 6 || current.Ledger.AcceptedS01 is not null
                         || current.Ledger.Pending is not null || current.Ledger.Sequence != 2
@@ -2620,6 +2632,7 @@ internal static class PersistenceBridgeProbe
                         || current.Ledger.Sequence != unaccepted.Ledger.Sequence
                         || current.Ledger.StartedUtcTicks != unaccepted.Ledger.StartedUtcTicks)
                         throw new InvalidOperationException("Recovered acceptance changed history.");
+                    nextAction = DevelopmentOrderWorkflow.Select(claim, current.Ledger);
                 }
                 var accepted = current.Ledger.AcceptedS01
                     ?? throw new InvalidOperationException("Calculator acceptance missing after replay.");
@@ -2631,9 +2644,9 @@ internal static class PersistenceBridgeProbe
                     DevelopmentOrderFormatterVerifier.RequireInputs(owner, model, guest, state,
                         ObserveCalculatorFixture(owner, claim, outcome), baseline, pair);
 
-                if (current.Stage == 14)
+                if (nextAction == OrderWorkflowAction.ReconcilePending && current.Ledger.Pending is { Step: "FINAL", Kind: "guest" })
                 {
-                    if (finalCrash is not ("pre-dispatch" or "wrong-output" or "orphan"))
+                    if (current.Stage != 14 || finalCrash is not ("pre-dispatch" or "wrong-output" or "orphan"))
                         throw new InvalidOperationException("Unexpected pending FINAL fixture.");
                     var pendingHistory = RequirePairHistory(current);
                     var pendingObservations = ObservePairFixture(owner, claim, pendingHistory, root);
@@ -2692,8 +2705,10 @@ internal static class PersistenceBridgeProbe
                     return 0;
                 }
 
-                if (current.Stage == 16)
+                if (nextAction == OrderWorkflowAction.InspectCompletedOrder)
                 {
+                    if (current.Stage != 16)
+                        throw new InvalidOperationException("Terminal replay stage differs.");
                     var terminalHistory = RequirePairHistory(current);
                     var terminalObservations = ObservePairFixture(owner, claim, terminalHistory, root);
                     var completedFinal = current.FinalCompletion ?? throw new InvalidOperationException("Final completion history missing.");
@@ -2726,8 +2741,10 @@ internal static class PersistenceBridgeProbe
                     return 0;
                 }
 
-                if (current.Stage == 15)
+                if (nextAction == OrderWorkflowAction.AcceptOrder)
                 {
+                    if (current.Stage != 15)
+                        throw new InvalidOperationException("Final completion replay stage differs.");
                     var history = RequirePairHistory(current);
                     var observations = ObservePairFixture(owner, claim, history, root);
                     var recordedFinal = current.Ledger.LatestGuestOutcome
@@ -2803,8 +2820,10 @@ internal static class PersistenceBridgeProbe
                     return 1;
                 }
 
-                if (current.Stage == 13)
+                if (nextAction == OrderWorkflowAction.VerifyIntegration)
                 {
+                    if (current.Stage != 13)
+                        throw new InvalidOperationException("Pair acceptance replay stage differs.");
                     var beforeFormatterAcceptance = current.FormatterInputState
                         ?? throw new InvalidOperationException("Accepted input history missing.");
                     var historicalFormatterModel = current.FormatterModel
@@ -2880,7 +2899,8 @@ internal static class PersistenceBridgeProbe
                     return 1;
                 }
 
-                if (current.Stage is 11 or 12)
+                if (nextAction == OrderWorkflowAction.AcceptFormatter
+                    || nextAction == OrderWorkflowAction.ReconcilePending && current.Ledger.Pending is { Step: "S02", Kind: "guest" })
                 {
                     var beforeFormatter = current.FormatterInputState
                         ?? throw new InvalidOperationException("Accepted input history missing.");
@@ -2985,7 +3005,8 @@ internal static class PersistenceBridgeProbe
                     return 0;
                 }
 
-                if (current.Stage is 9 or 10)
+                if (nextAction is OrderWorkflowAction.VerifyFormatter or OrderWorkflowAction.ReviewRejectedModel
+                    || nextAction == OrderWorkflowAction.ReconcilePending && current.Ledger.Pending is { Step: "S02", Kind: "model" })
                 {
                     var beforeFormatter = current.FormatterInputState
                         ?? throw new InvalidOperationException("Accepted input history missing.");
@@ -3000,6 +3021,15 @@ internal static class PersistenceBridgeProbe
                         _ => throw new InvalidOperationException("Unknown formatter crash mode.")
                     };
                     bool blocked = expectedStatus == OrderModelRecoveryStatus.PendingBlocked;
+                    var expectedAction = expectedStatus switch
+                    {
+                        OrderModelRecoveryStatus.PendingBlocked => OrderWorkflowAction.ReconcilePending,
+                        OrderModelRecoveryStatus.Generated => OrderWorkflowAction.VerifyFormatter,
+                        OrderModelRecoveryStatus.Rejected => OrderWorkflowAction.ReviewRejectedModel,
+                        _ => throw new InvalidOperationException("Unknown formatter status.")
+                    };
+                    if (nextAction != expectedAction)
+                        throw new InvalidOperationException("Formatter workflow action differs.");
                     bool hasCandidate = formatterCrash is "generated" or "orphan" or "checkpoint";
                     bool hasEvidence = formatterCrash != "receipt";
                     var candidate = recovered.Candidate;
@@ -3096,7 +3126,8 @@ internal static class PersistenceBridgeProbe
                         throw new InvalidOperationException("Replayed calculator acceptance differs.");
                 }
 
-                if (current.Stage != 8 || current.Ledger.Sequence != 2 || current.Ledger.ReservedSeconds != 60
+                if (nextAction != OrderWorkflowAction.GenerateFormatter
+                    || current.Stage != 8 || current.Ledger.Sequence != 2 || current.Ledger.ReservedSeconds != 60
                     || current.Ledger.Pending is not null || current.Ledger.StartedUtcTicks >= processStart)
                     throw new InvalidOperationException("Replayed calculator budget differs.");
                 VerifyAccepted();
@@ -3290,7 +3321,15 @@ internal static class PersistenceBridgeProbe
                     "bridge-model-resume-rejected" => OrderModelRecoveryStatus.Rejected,
                     _ => throw new InvalidOperationException("Unexpected model reentry mode.")
                 };
-                if (observation.Status != expected || current.Ledger.Models != 1
+                var expectedAction = expected switch
+                {
+                    OrderModelRecoveryStatus.PendingBlocked => OrderWorkflowAction.ReconcilePending,
+                    OrderModelRecoveryStatus.Generated => OrderWorkflowAction.VerifyCalculator,
+                    OrderModelRecoveryStatus.Rejected => OrderWorkflowAction.ReviewRejectedModel,
+                    _ => throw new InvalidOperationException("Unknown calculator status.")
+                };
+                if (DevelopmentOrderWorkflow.Select(claim, current.Ledger) != expectedAction
+                    || observation.Status != expected || current.Ledger.Models != 1
                     || current.Ledger.ReservedSeconds != 30 || current.ArtifactHash is not null
                     || current.S01 is not null || File.Exists(artifact)
                     || (observation.Candidate is not null) != (expected == OrderModelRecoveryStatus.Generated)
