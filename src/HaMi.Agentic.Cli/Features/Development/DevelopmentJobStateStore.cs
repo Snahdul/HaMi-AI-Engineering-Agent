@@ -435,7 +435,7 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
 
         private static void ValidateGuestReportBytes(OrderGuestOutcome outcome, byte[] bytes)
         {
-            OrderCheck.Require(DevelopmentOrderGuestReconciliation.IsSuccessfulReport(outcome.RunId, bytes)
+            OrderCheck.Require(DevelopmentOrderGuestReconciliation.IsSuccessfulReport(outcome.Reservation, bytes)
                 && DevelopmentJobState.Hash(bytes) == outcome.ReportHash, "ORDER_GUEST_REPORT_BYTES");
         }
 

@@ -36,7 +36,8 @@ internal static class DevelopmentOrderGuestReconciliation
     // and never retries a previously consumed local dispatch slot.
     internal static string RunId(OrderOperationReservation reservation)
     {
-        OrderCheck.Require(reservation.Version == 3 && reservation.Kind == "guest"
+        OrderCheck.Require(reservation.Version == 4 && reservation.Kind == "guest"
+            && OrderCheck.Hash(reservation.SnapshotHash)
             && reservation.Step is "S01" or "S02" or "FINAL" && reservation.Assignment is null
             && reservation.ReservedSeconds > 0 && reservation.ObservedUtcTicks > 0,
             "ORDER_GUEST_RESERVATION");
@@ -62,15 +63,16 @@ internal static class DevelopmentOrderGuestReconciliation
         string runId = RunId(reservation);
         OrderCheck.Require(OrderCheck.Hash(archiveHash) && now >= reservation.ObservedUtcTicks
             && now <= DateTime.MaxValue.Ticks, "ORDER_GUEST_OBSERVATION");
-        if (reportBytes is null || !IsSuccessfulReport(runId, reportBytes)
+        if (reportBytes is null || !IsSuccessfulReport(reservation, reportBytes)
             || !DevelopmentSandboxRunner.IsConfirmedAbsent(runId, inspectExitCode, inspectOutput, inspectError))
             return null;
 
         return new(1, archiveHash, reservation, runId, DevelopmentJobState.Hash(reportBytes), now);
     }
 
-    internal static bool IsSuccessfulReport(string runId, byte[] reportBytes)
+    internal static bool IsSuccessfulReport(OrderOperationReservation reservation, byte[] reportBytes)
     {
+        string runId = RunId(reservation);
         if (reportBytes.Length is 0 or > MaxReportBytes)
             return false;
         DevelopmentSandboxRunner.SandboxRunReport? report;
@@ -85,7 +87,8 @@ internal static class DevelopmentOrderGuestReconciliation
         // Exact canonical runner format rejects duplicate/unknown/missing
         // fields, alternate encodings, and trailing or truncated data.
         if (report is null || !reportBytes.AsSpan().SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(report, ReportOptions))
-            || report.SchemaVersion != 1 || report.RunId != runId || report.Project != "Demo.csproj"
+            || report.SchemaVersion != 2 || report.RunId != runId || report.Project != "Demo.csproj"
+            || report.SnapshotHash != reservation.SnapshotHash
             || report.Mode != "run" || report.TimedOut || !report.SandboxRemovalSucceeded || report.Error is not null
             || report.RestoreExitCode != 0 || report.BuildExitCode != 0 || report.ExecutionExitCode != 0
             || report.CreateMilliseconds < 0 || report.CopyMilliseconds < 0 || report.RestoreMilliseconds < 0

@@ -14,7 +14,8 @@ internal static class DevelopmentOrderOperationLedgerTests
             agent, "Synthetic reviewed assignment.", approval.ObservedAt);
         OrderOperationReservation Propose(DevelopmentOrderOperationLedger state, string step, string kind, int seconds, long observed) =>
             state.Propose(job, step, kind, seconds, observed,
-                kind == "model" ? OrderOperationAgentBinding.FromAssignment(Assignment(step)) : null);
+                kind == "model" ? OrderOperationAgentBinding.FromAssignment(Assignment(step)) : null,
+                kind == "guest" ? hash : null);
 
         var start = new OrderExecutionStart(1, hash, now);
         var initial = new DevelopmentOrderOperationLedger().Start(
@@ -124,7 +125,7 @@ internal static class DevelopmentOrderOperationLedgerTests
             DevelopmentOrderOperationLedger.DecodeBudgetStop(DevelopmentOrderOperationLedger.EncodeBudgetStop(stop)));
         Reject(() => stopped.Reserve(job, small, Propose(stopped, "S02", "model", 1, now)));
         Reject(() => stopped.Reserve(job, limits, blockedRequest));
-        Reject(() => smallStart.Reserve(job, small, reserve with { Step = "FINAL", Kind = "guest", ReservedSeconds = 1, Assignment = null }));
+        Reject(() => smallStart.Reserve(job, small, reserve with { Step = "FINAL", Kind = "guest", ReservedSeconds = 1, Assignment = null, SnapshotHash = hash }));
         var extension = new OrderBudgetExtensionApproved(1, job, hash, 0, limits, new string('B', 64), afterTen);
         Reject(() => first.Extend(job, policy, extension));
         Reject(() => reserved.Extend(job, policy, extension));
@@ -266,10 +267,13 @@ internal static class DevelopmentOrderOperationLedgerTests
             Reject(() => substituted.ValidateCompletion(claim, reserve, substituted.Completion()));
         }
         Reject(() => observation.ValidateCompletion(claim, retry, observation.Completion()));
-        Reject(() => DevelopmentOrderOperationLedger.DecodeReservation(evt.Replace("reserve-v3:", "reserve-v2:", StringComparison.Ordinal)));
+        Reject(() => DevelopmentOrderOperationLedger.DecodeReservation(evt.Replace("reserve-v4:", "reserve-v3:", StringComparison.Ordinal)));
         Console.WriteLine("PASS: journaled model assignment binds agent version, revision, configuration and attempt; substituted receipts rejected.");
 
         var guestRequest = Propose(initial, "S01", "guest", 30, now);
+        Reject(() => initial.Reserve(job, limits, guestRequest with { SnapshotHash = null }));
+        Reject(() => initial.Reserve(job, limits, guestRequest with { SnapshotHash = "invalid" }));
+        Reject(() => initial.Reserve(job, limits, reserve with { SnapshotHash = hash }));
         var guestPending = initial.Reserve(job, limits, guestRequest);
         string runId = DevelopmentOrderGuestReconciliation.RunId(guestRequest);
         if (runId.Length != 32
@@ -281,8 +285,12 @@ internal static class DevelopmentOrderOperationLedgerTests
         Reject(() => guestPending.Reserve(job, limits, Propose(guestPending, "S01", "guest", 30, now)));
         Reject(() => DevelopmentOrderGuestReconciliation.RunId(reserve));
         string absent = "error: sandbox 'hami-code-" + runId[..12] + "' not found";
-        var report = new DevelopmentSandboxRunner.SandboxRunReport(1, runId, "Demo.csproj", "run",
-            0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null);
+        var report = new DevelopmentSandboxRunner.SandboxRunReport(2, runId, "Demo.csproj", "run",
+            0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null, hash);
+        var legacyReport = report with { SchemaVersion = 1, SnapshotHash = null };
+        if (System.Text.Json.JsonSerializer.Serialize(legacyReport, new System.Text.Json.JsonSerializerOptions(
+            System.Text.Json.JsonSerializerDefaults.Web)).Contains("snapshotHash", StringComparison.Ordinal))
+            throw new InvalidOperationException("Legacy report shape changed.");
         byte[] Report(DevelopmentSandboxRunner.SandboxRunReport value) =>
             System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(value,
                 new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web) { WriteIndented = true });
@@ -295,6 +303,9 @@ internal static class DevelopmentOrderOperationLedgerTests
             throw new InvalidOperationException("Missing/ambiguous guest evidence was accepted.");
         foreach (var invalidReport in new[]
         {
+            legacyReport,
+            report with { SnapshotHash = null },
+            report with { SnapshotHash = new string('B', 64) },
             report with { RunId = new string('f', 32) },
             report with { Project = "Other.csproj" },
             report with { Mode = "build" },

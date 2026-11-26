@@ -20,7 +20,7 @@ internal sealed record OrderOperationEvidence(
         string baseline = operation.Step == "S01" ? claim.Binding.CalculatorBaselineHash : claim.Binding.FormatterBaselineHash;
         (operation.Assignment ?? throw new InvalidOperationException("ORDER_EVIDENCE_ASSIGNMENT")).Validate();
         OrderCheck.Require(Version == 2 && ArchiveHash == claim.ArchiveHash
-            && Observer == FixtureObserver && operation.Version == 3 && operation.Kind == "model"
+            && Observer == FixtureObserver && operation.Version == 4 && operation.Kind == "model" && operation.SnapshotHash is null
             && operation.Step is "S01" or "S02"
             && operation.ReservedSeconds > 0 && operation.ObservedUtcTicks > 0
             && ObservedUtcTicks >= operation.ObservedUtcTicks && ObservedUtcTicks <= DateTime.MaxValue.Ticks

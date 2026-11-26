@@ -92,11 +92,16 @@ internal static class PersistenceBridgeProbe
             throw new InvalidOperationException("Fixture failure differs from trusted rejection.");
     }
 
+    private static readonly string FixtureSnapshotHash = DevelopmentJobState.Hash(
+        Encoding.UTF8.GetBytes("reviewed offline snapshot identity"));
+
     private static byte[] FixtureGuestReport(OrderOperationReservation reservation)
     {
-        var report = new DevelopmentSandboxRunner.SandboxRunReport(1,
+        if (reservation.SnapshotHash != FixtureSnapshotHash)
+            throw new InvalidOperationException("Fixture snapshot identity differs.");
+        var report = new DevelopmentSandboxRunner.SandboxRunReport(2,
             DevelopmentOrderGuestReconciliation.RunId(reservation), "Demo.csproj", "run",
-            0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null);
+            0, 0, 0, false, 1, 1, 1, 1, 1, 1, 6, true, null, FixtureSnapshotHash);
         return System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(report,
             new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web) { WriteIndented = true });
     }
@@ -454,7 +459,7 @@ internal static class PersistenceBridgeProbe
                 Console.WriteLine("BRIDGE_PHASE: order accepted.");
                 if (mode is "bridge-guest" or "bridge-guest-unknown" or "bridge-guest-orphan")
                 {
-                    var guestReservation = current.Ledger.Propose(claim.JobId, "S01", "guest", 30, DateTime.UtcNow.Ticks, null);
+                    var guestReservation = current.Ledger.Propose(claim.JobId, "S01", "guest", 30, DateTime.UtcNow.Ticks, null, FixtureSnapshotHash);
                     current = await AdvanceAsync(DevelopmentOrderOperationLedger.EncodeReservation(guestReservation), 2);
                     if (current.Ledger.Pending != guestReservation || current.Ledger.Guests != 1
                         || current.Ledger.ReservedSeconds != 30)
@@ -596,7 +601,7 @@ internal static class PersistenceBridgeProbe
                 Reject(() => current.Ledger.Complete(new(2, pendingGuest.OperationId,
                     expectedOutcome.ReportHash, "failed", observedAt)));
                 Reject(() => current.Ledger.Reserve(claim.JobId, limits,
-                    current.Ledger.Propose(claim.JobId, "S01", "guest", 1, observedAt, null)));
+                    current.Ledger.Propose(claim.JobId, "S01", "guest", 1, observedAt, null, FixtureSnapshotHash)));
                 Reject(() => current.Ledger.Reserve(claim.JobId, limits,
                     ProposeModel(current.Ledger, "S02", 1, observedAt)));
 

@@ -50,7 +50,9 @@ internal static class DevelopmentSandboxRunner
         int RestoreExitCode, int BuildExitCode, int ExecutionExitCode,
         bool TimedOut, long CreateMilliseconds, long CopyMilliseconds,
         long RestoreMilliseconds, long BuildMilliseconds, long ExecutionMilliseconds,
-        long CleanupMilliseconds, long TotalMilliseconds, bool SandboxRemovalSucceeded, string? Error);
+        long CleanupMilliseconds, long TotalMilliseconds, bool SandboxRemovalSucceeded, string? Error,
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        string? SnapshotHash = null);
 
     public static Task<int> RunAsync(
         string repo, string source, string project, string mode, string resultsDirectory,
@@ -89,6 +91,8 @@ internal static class DevelopmentSandboxRunner
         string[] sourceFiles = InspectSnapshot(source, project);
         string id = reservation is null ? Guid.NewGuid().ToString("N")
             : DevelopmentOrderGuestReconciliation.RunId(reservation);
+        if (reservation is not null)
+            DevelopmentOrderSnapshot.Require(source, project, reservation.SnapshotHash);
         string sandbox = RecoverySandboxName(id);
         string stage = Path.Combine(resultsDirectory, "staging", "hami-code-" + id);
         string reportDir = Path.Combine(resultsDirectory, "reports", "hami-code-" + id);
@@ -99,6 +103,7 @@ internal static class DevelopmentSandboxRunner
         Directory.CreateDirectory(stage);
         Directory.CreateDirectory(reportDir);
 
+        string? verifiedSnapshotHash = null;
         bool createAttempted = false;
         bool createConfirmed = false;
         bool sandboxRemovalSucceeded = false;
@@ -130,6 +135,14 @@ internal static class DevelopmentSandboxRunner
                 string to = Path.Combine(stage, relative);
                 Directory.CreateDirectory(Path.GetDirectoryName(to)!);
                 File.Copy(from, to);
+            }
+
+            if (reservation is not null)
+            {
+                // Hash the actual copied files, not just the input directory.
+                // Never label a mismatched staging snapshot as verified.
+                DevelopmentOrderSnapshot.Require(stage, project, reservation.SnapshotHash);
+                verifiedSnapshotHash = reservation.SnapshotHash;
             }
 
             Stopwatch watch = Stopwatch.StartNew();
@@ -290,9 +303,9 @@ internal static class DevelopmentSandboxRunner
                 sandboxRemovalSucceeded ? 0 : 1);
         }
 
-        var report = new SandboxRunReport(1, id, guestProject, mode, restore, build,
+        var report = new SandboxRunReport(reservation is null ? 1 : 2, id, guestProject, mode, restore, build,
             execution, timedOut, createMs, copyMs, restoreMs, buildMs, executionMs, cleanupMs, lifecycle.ElapsedMilliseconds,
-            sandboxRemovalSucceeded, error);
+            sandboxRemovalSucceeded, error, verifiedSnapshotHash);
         string reportPath = Path.Combine(reportDir, "report.json");
         await File.WriteAllTextAsync(reportPath,
             JsonSerializer.Serialize(report, new JsonSerializerOptions(JsonSerializerDefaults.Web)
@@ -739,8 +752,22 @@ internal static class DevelopmentSandboxRunner
             File.WriteAllText(Path.Combine(source, "Demo.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"/>");
             File.WriteAllText(Path.Combine(source, "Program.cs"), "Console.WriteLine(42);");
             long now = DateTime.UtcNow.Ticks;
-            var reservation = new OrderOperationReservation(3, new string('a', 32) + ":1",
-                "S01", "guest", 30, now, null);
+            string snapshotHash = DevelopmentOrderSnapshot.Capture(source, "Demo.csproj");
+            var reservation = new OrderOperationReservation(4, new string('a', 32) + ":1",
+                "S01", "guest", 30, now, null, snapshotHash);
+            DevelopmentOrderSnapshot.SelfTest(source);
+            string rejectedResults = Path.Combine(root, "wrong-snapshot");
+            Directory.CreateDirectory(rejectedResults);
+            bool snapshotRejected = false;
+            try
+            {
+                _ = await RunCoreAsync(repo, source, "Demo.csproj", "run", rejectedResults,
+                    (_, _, _, _) => { }, reservation with { SnapshotHash = new string('F', 64) },
+                    (_, _) => throw new InvalidOperationException("Unexpected transport invocation."));
+            }
+            catch (InvalidOperationException ex) when (ex.Message == "ORDER_SNAPSHOT_MISMATCH") { snapshotRejected = true; }
+            if (!snapshotRejected || Directory.EnumerateFileSystemEntries(rejectedResults).Any())
+                throw new InvalidOperationException("Wrong snapshot reached dispatch.");
             string id = DevelopmentOrderGuestReconciliation.RunId(reservation);
             string name = RecoverySandboxName(id);
             string absent = "error: sandbox '" + name + "' not found";
@@ -803,7 +830,8 @@ internal static class DevelopmentSandboxRunner
                 byte[] bytes = File.ReadAllBytes(reportPath);
                 var report = JsonSerializer.Deserialize<SandboxRunReport>(bytes, new JsonSerializerOptions(JsonSerializerDefaults.Web))
                     ?? throw new InvalidOperationException("Reserved runner report missing.");
-                if (report.RunId != id || report.SandboxRemovalSucceeded != success)
+                if (report.SchemaVersion != 2 || report.RunId != id || report.SnapshotHash != snapshotHash
+                    || report.SandboxRemovalSucceeded != success)
                     throw new InvalidOperationException("Reserved report identity or cleanup differs.");
                 var observed = DevelopmentOrderGuestReconciliation.Observe(new string('A', 64),
                     reservation, bytes, 1, "", absent, DateTime.UtcNow.Ticks);

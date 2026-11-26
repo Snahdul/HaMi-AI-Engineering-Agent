@@ -40,7 +40,7 @@ internal sealed record OrderOperationAgentBinding(int Revision, OrderAgentIdenti
 
 internal sealed record OrderOperationReservation(
     int Version, string OperationId, string Step, string Kind, int ReservedSeconds, long ObservedUtcTicks,
-    OrderOperationAgentBinding? Assignment);
+    OrderOperationAgentBinding? Assignment, string? SnapshotHash = null);
 
 internal sealed record OrderOperationCompletion(
     int Version, string OperationId, string EvidenceHash, string Outcome, long ObservedUtcTicks);
@@ -88,8 +88,8 @@ internal sealed record DevelopmentOrderOperationLedger(
     }
 
     internal OrderOperationReservation Propose(string jobId, string step, string kind, int seconds, long now,
-        OrderOperationAgentBinding? assignment) =>
-        new(3, OperationId(jobId, checked(Sequence + 1)), step, kind, seconds, now, assignment);
+        OrderOperationAgentBinding? assignment, string? snapshotHash = null) =>
+        new(4, OperationId(jobId, checked(Sequence + 1)), step, kind, seconds, now, assignment, snapshotHash);
 
     // The persisted UTC window includes downtime. Never reset it on reentry.
     // Trust the designated host clock; reject observed rollback, and use a
@@ -127,13 +127,16 @@ internal sealed record DevelopmentOrderOperationLedger(
     internal string? BudgetDenial(string jobId, OrderOperationLimits limits, OrderOperationReservation reservation)
     {
         OrderCheck.Require(Pending is null, "ORDER_OPERATION_PENDING");
-        OrderCheck.Require(reservation.Version == 3
+        OrderCheck.Require(reservation.Version == 4
             && reservation.OperationId == OperationId(jobId, checked(Sequence + 1))
             && reservation.ReservedSeconds > 0, "ORDER_OPERATION_ID");
         OrderCheck.Require((reservation.Step, reservation.Kind) is
             ("S01" or "S02", "model" or "guest") or ("FINAL", "guest"), "ORDER_OPERATION_KIND");
         if (reservation.Kind == "model")
+        {
+            OrderCheck.Require(reservation.SnapshotHash is null, "ORDER_MODEL_SNAPSHOT");
             (reservation.Assignment ?? throw new InvalidOperationException("ORDER_OPERATION_ASSIGNMENT")).Validate();
+        }
         else
             _ = DevelopmentOrderGuestReconciliation.RunId(reservation);
         OrderCheck.Require(FinalGuests == 0 || reservation.Step == "FINAL", "ORDER_FINAL_ALREADY_RESERVED");
@@ -292,10 +295,10 @@ internal sealed record DevelopmentOrderOperationLedger(
         OrderStorageJson.Decode<OrderExecutionStart>(EventBytes(evt, "start-v1:"), EventMaxBytes);
 
     internal static string EncodeReservation(OrderOperationReservation reservation) =>
-        "reserve-v3:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(reservation, EventMaxBytes));
+        "reserve-v4:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(reservation, EventMaxBytes));
 
     internal static OrderOperationReservation DecodeReservation(string evt) =>
-        OrderStorageJson.Decode<OrderOperationReservation>(EventBytes(evt, "reserve-v3:"), EventMaxBytes);
+        OrderStorageJson.Decode<OrderOperationReservation>(EventBytes(evt, "reserve-v4:"), EventMaxBytes);
 
     internal static string EncodeCompletion(OrderOperationCompletion completion) =>
         "complete-v2:" + Encoding.UTF8.GetString(OrderStorageJson.Encode(completion, EventMaxBytes));
