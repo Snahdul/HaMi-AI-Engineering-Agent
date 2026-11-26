@@ -2288,16 +2288,32 @@ internal static class PersistenceBridgeProbe
             await expectOwnership(resumeRoot, "ACQUIRED:order");
             string evidencePrefix = $"issue-{Issue}.order.db.";
             string[] acceptedSlots = ["candidate-1", "evidence-1", "model-dispatch-1", "snapshot-2", "guest-dispatch-2", "guest-report-2"];
+            string[] terminalSlots = [.. acceptedSlots, "candidate-3", "evidence-3", "model-dispatch-3",
+                "snapshot-4", "guest-dispatch-4", "guest-report-4", "snapshot-5", "guest-dispatch-5", "guest-report-5"];
+
+            void RequireEvidenceSlots(string root, string[] expected)
+            {
+                // Win32-compatible glob matching can include the journal itself
+                // for a trailing dot-star. Match the literal evidence prefix.
+                var actual = Directory.EnumerateFiles(root)
+                    .Select(path => Path.GetFileName(path))
+                    .Where(name => name.StartsWith(evidencePrefix, StringComparison.Ordinal))
+                    .Select(name => name[evidencePrefix.Length..])
+                    .ToHashSet(StringComparer.Ordinal);
+                if (!actual.SetEquals(expected))
+                    throw new InvalidOperationException("Measurement evidence slots differ: "
+                        + string.Join(", ", actual.OrderBy(slot => slot, StringComparer.Ordinal)));
+            }
+
             byte[][] accepted = acceptedSlots.Select(slot => File.ReadAllBytes(Path.Combine(resumeRoot, evidencePrefix + slot))).ToArray();
-            if (Directory.GetFiles(resumeRoot, evidencePrefix + "*").Length != acceptedSlots.Length)
-                throw new InvalidOperationException("Measurement interruption was not at accepted S01.");
+            RequireEvidenceSlots(resumeRoot, acceptedSlots);
             TimeSpan interruption = Stopwatch.GetElapsedTime(interruptedAt);
             var resumed = await MeasureAsync("bridge-model-resume-continuous", resumeRoot);
+            RequireEvidenceSlots(resumeRoot, terminalSlots);
+            RequireEvidenceSlots(freshRoot, terminalSlots);
             if (acceptedSlots.Where((slot, i) =>
-                    !File.ReadAllBytes(Path.Combine(resumeRoot, evidencePrefix + slot)).SequenceEqual(accepted[i])).Any()
-                || Directory.GetFiles(resumeRoot, evidencePrefix + "*").Length != 15
-                || Directory.GetFiles(freshRoot, evidencePrefix + "*").Length != 15)
-                throw new InvalidOperationException("Measurement changed accepted work or evidence count.");
+                    !File.ReadAllBytes(Path.Combine(resumeRoot, evidencePrefix + slot)).SequenceEqual(accepted[i])).Any())
+                throw new InvalidOperationException("Measurement changed accepted work.");
             foreach (string slot in new[] { "candidate-1", "candidate-3" })
                 if (!File.ReadAllBytes(Path.Combine(freshRoot, evidencePrefix + slot))
                     .SequenceEqual(File.ReadAllBytes(Path.Combine(resumeRoot, evidencePrefix + slot))))
