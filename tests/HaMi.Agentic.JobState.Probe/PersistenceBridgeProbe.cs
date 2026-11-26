@@ -1647,7 +1647,7 @@ internal static class PersistenceBridgeProbe
             "model-receipt", "model-orphan", "model-checkpoint", "model-generated", "model-rejected", "model-rejected-orphan", "model-accepted", "model-verified", "soft-stop",
             "model-formatter-receipt", "model-formatter-orphan", "model-formatter-checkpoint",
             "model-formatter-rejected", "model-formatter-rejected-orphan",
-            "model-formatter-budget-hard", "model-formatter-budget-soft",
+            "model-formatter-budget-hard", "model-formatter-budget-soft", "model-formatter-budget-hard-generated",
             "model-final-pre-dispatch", "model-final-wrong-output", "model-final-orphan" })
         {
             bool unknown = scenario == "unknown";
@@ -1662,7 +1662,8 @@ internal static class PersistenceBridgeProbe
             bool finalScenario = scenario.StartsWith("model-final-", StringComparison.Ordinal);
             bool successfulFormatter = scenario == "model-accepted" || finalScenario;
             bool calculatorScenario = formatterScenario || successfulFormatter || scenario == "model-verified";
-            bool formatterBudgetStop = scenario is "model-formatter-budget-hard" or "model-formatter-budget-soft";
+            bool budgetGenerated = scenario == "model-formatter-budget-hard-generated";
+            bool formatterBudgetStop = budgetGenerated || scenario is "model-formatter-budget-hard" or "model-formatter-budget-soft";
             bool formatterHasCandidate = !formatterBudgetStop
                 && scenario is not ("model-formatter-receipt" or "model-formatter-rejected" or "model-formatter-rejected-orphan");
             bool formatterHasEvidence = !formatterBudgetStop && scenario != "model-formatter-receipt";
@@ -1821,8 +1822,16 @@ internal static class PersistenceBridgeProbe
                     try
                     {
                         await WaitForMarkerAsync(extensionChild, "BRIDGE_PAIR_BUDGET_RESUMED").WaitAsync(Deadline);
-                        if (extensionChild.HasExited || formatterSlots.Any(slot => File.Exists(calculatorPrefix + slot)))
-                            throw new InvalidOperationException("Pair extension unexpectedly dispatched.");
+                        if (extensionChild.HasExited || formatterSlots.Any(slot =>
+                            File.Exists(calculatorPrefix + slot) != budgetGenerated))
+                            throw new InvalidOperationException("Pair extension effect slots differ.");
+                        if (budgetGenerated)
+                        {
+                            expectedFormatterSlots = [true, true, true];
+                            formatterHasCandidate = true;
+                            formatterEvidence = formatterSlots.Select(slot => File.ReadAllBytes(calculatorPrefix + slot)).ToArray();
+                        }
+
                         await expectOwnership(root, "BUSY");
                     }
                     finally
@@ -2063,6 +2072,7 @@ internal static class PersistenceBridgeProbe
         Console.WriteLine("PASS: actual pair S02 hard and soft stops persisted before ACK and replayed after process kill; exact predecessor and charges retained, no dispatch.");
         Console.WriteLine("PASS: pair budget extensions persisted; insufficient and unreviewed extension blocked, sufficient extension permits one fresh reservation; process kill recovers pending without dispatch.");
         Console.WriteLine("PASS: S02 verifier handover validates exact replayed stop and extension history; omitted, reordered or substituted events and changed charges rejected.");
+        Console.WriteLine("PASS: fresh S02 model dispatch after budget extension completes once; process kill recovers exact verifier preparation, original acceptance and cumulative charges.");
         Console.WriteLine("PASS: Akka SQL journal survives process kill; ownership, accepted artifact reuse and unknown-effect block.");
         Console.WriteLine("PASS: protected artifacts, journal identity, guarded SQL commands and live rollback sidecar recovery.");
         Console.WriteLine("PASS: operation identity and consumed reservation budgets survive journal replay.");
@@ -2157,6 +2167,9 @@ internal static class PersistenceBridgeProbe
         const string formatterModePrefix = "bridge-model-resume-formatter-";
         string formatterCrash = mode.StartsWith(formatterModePrefix, StringComparison.Ordinal)
             ? mode[formatterModePrefix.Length..] : "generated";
+        bool generateAfterExtension = formatterCrash == "budget-hard-generated";
+        if (generateAfterExtension)
+            formatterCrash = "budget-hard";
         const string finalModePrefix = "bridge-model-resume-final-";
         string finalCrash = mode.StartsWith(finalModePrefix, StringComparison.Ordinal)
             ? mode[finalModePrefix.Length..] : "completed";
@@ -2808,11 +2821,96 @@ internal static class PersistenceBridgeProbe
                         || resumedPairLedger.Sequence != 3 || resumedPairLedger.ReservedSeconds != 60 + resumedPairRequest.ReservedSeconds
                         || current.PairBudgetOrigin != beforeStop || File.Exists(database + ".model-dispatch-3"))
                         throw new InvalidOperationException("Pair extension did not admit exactly one fresh reservation.");
+                    if (generateAfterExtension)
+                    {
+                        var budgetHistory = current.PairBudgetEvents
+                            ?? throw new InvalidOperationException("Pair budget history missing.");
+                        var resumedInputState = current.FormatterInputState
+                            ?? throw new InvalidOperationException("Resumed input state missing.");
+                        var resumedInputs = DevelopmentOrderFormatterVerifier.RequireInputsAfterBudgetContinuation(owner,
+                            model, guest, beforeStop, resumedInputState, budgetHistory, required,
+                            ObserveCalculatorFixture(owner, claim, outcome), ObserveCalculatorBaseline(root, claim.Binding),
+                            CalculatorRecoveryPair(root));
+                        var resumedAssignment = ModelFixtureAssignment(claim, archive, "S02");
+                        OrderAgentProfile[] resumedCatalog = [new(resumedAssignment.Agent, true, ["csharp"])];
+                        var resumedApproval = await CalculatorRecoveryApprovalAsync(root);
+                        using var resumedClient = new DevelopmentAiGenerator.ScriptedChatClient(
+                            System.Text.Json.JsonSerializer.Serialize(new { source = "class PairFormatter {}" }));
+                        var resumedGenerator = new DevelopmentAiGenerator(resumedClient, ModelName);
+                        var resumedResult = await DevelopmentOrderModelDispatch.RunS02CoreAsync(owner, resumedPairLedger,
+                            resumedPairRequest, resumedApproval, resumedAssignment, resumedCatalog, resumedInputs, resumedGenerator);
+                        var resumedCandidate = resumedResult.Candidate
+                            ?? throw new InvalidOperationException("Resumed formatter candidate missing.");
+                        Task<BridgeState> checkpointAck = actor.Ask<BridgeState>(new RecordFormatter(
+                            DevelopmentOrderOperationLedger.EncodeCandidate(resumedCandidate)), Deadline);
+                        await guard.AwaitAsync(checkpointAck);
+                        current = await checkpointAck;
+                        if (current.Ledger != resumedPairLedger.Checkpoint(claim, resumedCandidate))
+                            throw new InvalidOperationException("Resumed checkpoint acknowledgement differs.");
+
+                        async Task<DevelopmentOrderOperationLedger> RecordResumedCompletion(OrderOperationCompletion completion)
+                        {
+                            Task<BridgeState> completedAck = actor.Ask<BridgeState>(new RecordFormatter(
+                                DevelopmentOrderOperationLedger.EncodeCompletion(completion)), Deadline);
+                            await guard.AwaitAsync(completedAck);
+                            current = await completedAck;
+                            return current.Ledger;
+                        }
+
+                        var completedAfterExtension = await DevelopmentOrderCompletion.RecordModelAsync(owner, current.Ledger,
+                            resumedResult.Completion, RecordResumedCompletion);
+                        if (current.Stage != 10 || resumedClient.Calls != 1
+                            || completedAfterExtension.BudgetRevision != 2 || completedAfterExtension.AcceptedS01 != accepted
+                            || completedAfterExtension.ReservedSeconds != resumedPairLedger.ReservedSeconds
+                            || DevelopmentOrderWorkflow.Select(claim, completedAfterExtension) != OrderWorkflowAction.VerifyFormatter)
+                            throw new InvalidOperationException("Resumed model completion differs.");
+                        _ = DevelopmentOrderFormatterVerifier.Prepare(owner, resumedInputState, completedAfterExtension, resumedInputs);
+                        Reject(() => DevelopmentOrderFormatterVerifier.Prepare(owner, beforeStop, completedAfterExtension, resumedInputs));
+                        bool repeatedResumedDispatch = false;
+                        try
+                        {
+                            _ = await DevelopmentOrderModelDispatch.RunS02CoreAsync(owner, resumedPairLedger, resumedPairRequest,
+                                resumedApproval, resumedAssignment, resumedCatalog, resumedInputs, resumedGenerator);
+                        }
+                        catch (InvalidOperationException) { repeatedResumedDispatch = true; }
+                        if (!repeatedResumedDispatch || resumedClient.Calls != 1 || await ReadAsync() != current)
+                            throw new InvalidOperationException("Resumed model dispatched twice.");
+                    }
+
                     owner.ValidateOrderJournalFiles();
                     Console.WriteLine("BRIDGE_PAIR_BUDGET_RESUMED");
                     Console.Out.Flush();
                     await Task.Delay(Timeout.InfiniteTimeSpan);
                     return 1;
+                }
+
+                if (generateAfterExtension && nextAction == OrderWorkflowAction.VerifyFormatter)
+                {
+                    var originalAcceptance = current.PairBudgetOrigin
+                        ?? throw new InvalidOperationException("Original pair acceptance missing.");
+                    var resumedInput = current.FormatterInputState
+                        ?? throw new InvalidOperationException("Resumed input state missing.");
+                    var resumedEvents = current.PairBudgetEvents
+                        ?? throw new InvalidOperationException("Pair budget events missing.");
+                    var afterExtensionInputs = DevelopmentOrderFormatterVerifier.RequireInputsAfterBudgetContinuation(owner,
+                        model, guest, originalAcceptance, resumedInput, resumedEvents,
+                        [new("S02", "guest", 10), new("FINAL", "guest", resumedInput.FinalReserveSeconds)],
+                        ObserveCalculatorFixture(owner, claim, outcome), ObserveCalculatorBaseline(root, claim.Binding),
+                        CalculatorRecoveryPair(root));
+                    var resumedObservation = DevelopmentOrderCompletion.ObserveModel(owner, current.Ledger);
+                    var prepared = DevelopmentOrderFormatterVerifier.Prepare(owner, resumedInput, current.Ledger, afterExtensionInputs);
+                    if (current.Stage != 10 || current.Ledger.BudgetRevision != 2 || current.Ledger.Sequence != 3
+                        || current.Ledger.ReservedSeconds != 160 || current.Ledger.Models != 2 || current.Ledger.Guests != 1
+                        || current.Ledger.StartedUtcTicks != originalAcceptance.StartedUtcTicks
+                        || current.Ledger.AcceptedS01 != accepted || resumedObservation.Status != OrderModelRecoveryStatus.Generated
+                        || !prepared["PairCalculator.cs"].AsSpan().SequenceEqual(owner.RequireOrderCandidate(accepted.Candidate))
+                        || !prepared["PairFormatter.cs"].AsSpan().SequenceEqual(Encoding.UTF8.GetBytes("class PairFormatter {}"))
+                        || await ReadAsync() != current || File.Exists(database + ".snapshot-4"))
+                        throw new InvalidOperationException("Resumed formatter verification history differs.");
+                    Reject(() => DevelopmentOrderFormatterVerifier.Prepare(owner, originalAcceptance, current.Ledger, afterExtensionInputs));
+                    Console.WriteLine("BRIDGE_PHASE: completed S02 model after extension recovered; verifier uses exact resumed history and original S01 evidence.");
+                    Console.WriteLine("BRIDGE_CALCULATOR_RECOVERED");
+                    return 0;
                 }
 
                 // The initial budget fixture must reach GenerateFormatter and
