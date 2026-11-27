@@ -79,6 +79,60 @@ internal sealed class PairAcceptanceProfile
             && binding.FormatterBaselineHash == FormatterHash, "ACCEPTANCE_ORDER_BINDING");
     }
 
+    private static OrderAgentIdentity AgentFor(string step)
+    {
+        OrderCheck.Require(step is "S01" or "S02", "ACCEPTANCE_ASSIGNMENT_STEP");
+        string profileHash = DevelopmentJobState.Hash(OrderStorageJson.Encode(new
+        {
+            Version = 1,
+            IssueId,
+            OrderHash,
+            PolicyHash,
+            Step = step,
+            Competency = "csharp",
+            Provider = "openai",
+            Model
+        }, DevelopmentJobState.MaxBytes));
+        return new("pair-acceptance-" + step, "1", profileHash, "openai", Model,
+            DevelopmentAiGenerator.ReservedConfigurationHash(step, Model));
+    }
+
+    internal static OrderAgentProfile[] Catalog() =>
+        [new(AgentFor("S01"), true, ["csharp"]), new(AgentFor("S02"), true, ["csharp"])];
+
+    private OrderAssignment AssignmentFor(DevelopmentOrderClaim claim, string step, long observedUtcTicks)
+    {
+        RequireBinding(claim.Binding);
+        OrderCheck.Require(observedUtcTicks > 0 && observedUtcTicks <= DateTime.MaxValue.Ticks,
+            "ACCEPTANCE_ASSIGNMENT_TIME");
+        return new(claim.Binding, Guid.ParseExact(claim.JobId, "N"), step, 1, AgentFor(step),
+            "Reviewed isolated pair acceptance C# assignment.", new DateTimeOffset(observedUtcTicks, TimeSpan.Zero));
+    }
+
+    // The approval observed before reservation is the one used to validate
+    // this assignment at dispatch. A subsequent current-authority check
+    // must independently confirm the identical binding before any effect.
+    internal OrderAssignment Assign(DevelopmentOrderClaim claim, DevelopmentOrderApproval approval,
+        string step, long observedUtcTicks)
+    {
+        OrderCheck.Require(approval.Binding == claim.Binding && approval.EffectiveLimits == Limits,
+            "ACCEPTANCE_ASSIGNMENT_AUTHORITY");
+        var assignment = AssignmentFor(claim, step, observedUtcTicks);
+        DevelopmentOrderHandover.ValidateAssignment(approval, Guid.ParseExact(claim.JobId, "N"), assignment, Catalog());
+        return assignment;
+    }
+
+    // Replay reconstructs the exact original assignment from the immutable
+    // claim and reservation timestamp, not today's approval observation.
+    internal OrderAssignment RequireAssignment(DevelopmentOrderClaim claim, OrderOperationReservation request)
+    {
+        OrderCheck.Require(request.Kind == "model", "ACCEPTANCE_ASSIGNMENT_KIND");
+        var assignment = AssignmentFor(claim, request.Step, request.ObservedUtcTicks);
+        (request.Assignment ?? throw new InvalidOperationException("ACCEPTANCE_MODEL_ASSIGNMENT"))
+            .RequireAssignment(assignment);
+        return assignment;
+    }
+
     // The same reviewed schedule must be used by both the admission caller
     // and the journal actor, including replay of admission decisions.
     internal OrderRequiredOperation[] RequiredAfter(DevelopmentOrderClaim claim,
@@ -95,11 +149,7 @@ internal sealed class PairAcceptanceProfile
             && ledger.ReservedSeconds == Operations.Take(ledger.Sequence).Sum(operation => operation.Seconds),
             "ACCEPTANCE_OPERATION_PLAN");
         if (request.Kind == "model")
-        {
-            var assignment = request.Assignment ?? throw new InvalidOperationException("ACCEPTANCE_MODEL_ASSIGNMENT");
-            OrderCheck.Require(assignment.Agent.Provider == "openai" && assignment.Agent.Model == Model,
-                "ACCEPTANCE_MODEL_ASSIGNMENT");
-        }
+            _ = RequireAssignment(claim, request);
         return Operations[(ledger.Sequence + 1)..];
     }
 
@@ -118,16 +168,30 @@ internal sealed class PairAcceptanceProfile
         long now = DateTimeOffset.UtcNow.UtcTicks;
         var ledger = new DevelopmentOrderOperationLedger().Start(new OrderExecutionStart(1, claim.ArchiveHash, now),
             claim.ArchiveHash, Limits, profile.Policy);
-        var agent = new OrderAgentIdentity("test", "1", new string('B', 64), "openai", Model, new string('C', 64));
-        var assignment = new OrderOperationAgentBinding(1, agent, new string('D', 64));
+        var assigned = profile.AssignmentFor(claim, "S01", now);
+        var agent = assigned.Agent;
+        var assignment = OrderOperationAgentBinding.FromAssignment(assigned);
         var request = ledger.Propose(claim.JobId, "S01", "model", 90, now, assignment);
+        var reloaded = Load().RequireAssignment(claim, request);
+        var formatter = profile.AssignmentFor(claim, "S02", now);
+        if (reloaded != assigned || assigned.DecidedAt.UtcTicks != now
+            || assigned.Agent.ConfigurationHash == formatter.Agent.ConfigurationHash
+            || assigned.Agent.ProfileHash == formatter.Agent.ProfileHash
+            || Catalog().Count(item => item.Identity == assigned.Agent) != 1
+            || Catalog().Count(item => item.Identity == formatter.Agent) != 1)
+            throw new InvalidOperationException("Acceptance assignment cannot be reconstructed exactly.");
         var decision = profile.Decide(claim, ledger, request);
         var remaining = profile.RequiredAfter(claim, ledger, request);
         if (decision.Ledger.Pending != request || decision.Ledger.ReservedSeconds != 90
             || remaining.Length != 4 || remaining.Sum(operation => operation.Seconds) != 1350
             || remaining[^1] != new OrderRequiredOperation("FINAL", "guest", 420))
             throw new InvalidOperationException("Acceptance reservation lost mandatory work.");
-        var late = profile.Decide(claim, ledger, request with { ObservedUtcTicks = now + TimeSpan.FromSeconds(361).Ticks });
+        long lateTicks = now + TimeSpan.FromSeconds(361).Ticks;
+        var late = profile.Decide(claim, ledger, request with
+        {
+            ObservedUtcTicks = lateTicks,
+            Assignment = OrderOperationAgentBinding.FromAssignment(profile.AssignmentFor(claim, "S01", lateTicks))
+        });
         if (late.Ledger.SoftStop?.Reason != "time" || late.Ledger.Pending is not null || late.Ledger.ReservedSeconds != 0)
             throw new InvalidOperationException("Acceptance admission did not preserve the mandatory rest budget.");
 
@@ -150,6 +214,16 @@ internal sealed class PairAcceptanceProfile
         {
             Assignment = assignment with { Agent = agent with { Model = "other-model" } }
         }));
+        Reject(() => profile.RequireAssignment(claim, request with { ObservedUtcTicks = now + 1 }));
+        Reject(() => profile.RequireAssignment(claim, request with
+        {
+            Assignment = assignment with { Agent = agent with { ConfigurationHash = new string('0', 64) } }
+        }));
+        Reject(() => profile.RequireAssignment(claim, request with
+        {
+            Assignment = assignment with { AssignmentHash = new string('0', 64) }
+        }));
         Console.WriteLine("PASS: Issue 73 acceptance profile pins order, baseline and budget; exact five-operation plan preserves FINAL reserve and rejects altered bindings, extensions and model substitutions.");
+        Console.WriteLine("PASS: Issue 73 model assignments reconstruct exact reserved identity without a client; timestamp, configuration and assignment hash substitutions rejected.");
     }
 }

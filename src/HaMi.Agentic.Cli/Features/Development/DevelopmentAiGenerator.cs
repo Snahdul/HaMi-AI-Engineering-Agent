@@ -90,33 +90,35 @@ internal sealed class DevelopmentAiGenerator(IChatClient client, string model)
 
     internal string ModelId => model;
 
-    internal string S01ConfigurationHash => DevelopmentJobState.Hash(OrderStorageJson.Encode(new
-    {
-        Version = 1,
-        Provider = "openai",
-        Model = model,
-        PromptHash = S01Prompt.Value.Sha256,
-        MaxOutputTokens = S01MaxTokens,
-        MaxRetries = 0,
-        Store = false,
-        Background = false,
-        Tools = false,
-        Schema = SourceSchema
-    }, DevelopmentJobState.MaxBytes));
+    internal string S01ConfigurationHash => ReservedConfigurationHash("S01", model);
 
-    internal string S02ConfigurationHash => DevelopmentJobState.Hash(OrderStorageJson.Encode(new
+    internal string S02ConfigurationHash => ReservedConfigurationHash("S02", model);
+
+    // Reconstruct the reviewed configuration identity during journal replay
+    // without constructing a client or requiring a provider credential.
+    internal static string ReservedConfigurationHash(string step, string model)
     {
-        Version = 1,
-        Provider = "openai",
-        Model = model,
-        PromptHash = S02Prompt.Value.Sha256,
-        MaxOutputTokens = S01MaxTokens,
-        MaxRetries = 0,
-        Store = false,
-        Background = false,
-        Tools = false,
-        Schema = SourceSchema
-    }, DevelopmentJobState.MaxBytes));
+        ArgumentException.ThrowIfNullOrWhiteSpace(model);
+        string promptHash = step switch
+        {
+            "S01" => S01Prompt.Value.Sha256,
+            "S02" => S02Prompt.Value.Sha256,
+            _ => throw new InvalidOperationException("ORDER_MODEL_CONFIGURATION_STEP")
+        };
+        return DevelopmentJobState.Hash(OrderStorageJson.Encode(new
+        {
+            Version = 1,
+            Provider = "openai",
+            Model = model,
+            PromptHash = promptHash,
+            MaxOutputTokens = S01MaxTokens,
+            MaxRetries = 0,
+            Store = false,
+            Background = false,
+            Tools = false,
+            Schema = SourceSchema
+        }, DevelopmentJobState.MaxBytes));
+    }
 
     // The host chooses the model from the verified assignment. The reserved
     // dispatch supplies its existing deadline; no independent retry or timer.
