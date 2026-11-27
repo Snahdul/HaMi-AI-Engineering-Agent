@@ -53,7 +53,7 @@ internal static partial class PersistenceBridgeProbe
             async Task<BridgeState> AskAsync(object command)
             {
                 ct.ThrowIfCancellationRequested();
-                Task<BridgeState> pending = actor.Ask<BridgeState>(command, Deadline);
+                Task<BridgeState> pending = actor.Ask<BridgeState>(command, Deadline, CancellationToken.None);
                 await host.Guard.AwaitAsync(pending);
                 return await pending;
             }
