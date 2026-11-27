@@ -50,7 +50,7 @@ internal sealed class GitHubIssueGateway : IDevelopmentIssueGateway, IDisposable
     }
 
     private async Task<JsonDocument> SendAsync(
-        HttpMethod method, string path, object? payload, CancellationToken ct)
+        HttpMethod method, string path, object? payload, CancellationToken ct, int? maxResponseBytes = null)
     {
         using var request = new HttpRequestMessage(method,
             "https://api.github.com/repos/" + Repository + "/" + path);
@@ -63,17 +63,114 @@ internal sealed class GitHubIssueGateway : IDevelopmentIssueGateway, IDisposable
             request.Content = new StringContent(JsonSerializer.Serialize(payload),
                 Encoding.UTF8, "application/json");
 
-        using HttpResponseMessage response = await client.SendAsync(request, ct);
+        Uri expectedUri = request.RequestUri!;
+        using HttpResponseMessage response = await client.SendAsync(request,
+            maxResponseBytes is null ? HttpCompletionOption.ResponseContentRead : HttpCompletionOption.ResponseHeadersRead, ct);
         if (!response.IsSuccessStatusCode)
             throw new InvalidOperationException(
                 "GitHub Issues API rejected the request: HTTP " + (int)response.StatusCode
                 + ". No response body or credential is logged.");
+        if (maxResponseBytes is int maximum)
+        {
+            // Order observations never accept a redirected or unbounded response.
+            OrderCheck.Require(response.RequestMessage?.RequestUri == expectedUri
+                && !(response.Content.Headers.ContentLength > maximum), "ORDER_ISSUE_RESPONSE");
+            using Stream stream = await response.Content.ReadAsStreamAsync(ct);
+            using var bytes = new MemoryStream();
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = await stream.ReadAsync(buffer.AsMemory(), ct)) != 0)
+            {
+                OrderCheck.Require(bytes.Length + read <= maximum, "ORDER_ISSUE_RESPONSE_SIZE");
+                bytes.Write(buffer, 0, read);
+            }
+            return JsonDocument.Parse(bytes.ToArray());
+        }
         string json = await response.Content.ReadAsStringAsync(ct);
         return JsonDocument.Parse(json);
     }
 
     public Task<JsonDocument> GetIssueAsync(int issueNumber, CancellationToken ct) =>
         SendAsync(HttpMethod.Get, "issues/" + issueNumber, null, ct);
+
+    // Read-only transport, not approval or a dispatch capability. The caller
+    // must independently bind the reviewed profile and validate current authority.
+    internal async Task<OrderIssueObservation> ObserveOrderAsync(int issueNumber, CancellationToken ct)
+    {
+        OrderCheck.Require(issueNumber > 0 && !string.IsNullOrWhiteSpace(token), "ORDER_ISSUE_CREDENTIAL");
+        const int pageSize = 25;
+        const int maximumComments = 256;
+        const int maximumResponseBytes = 4 * 1024 * 1024;
+        const string repositoryUrl = "https://api.github.com/repos/" + Repository;
+        string path = "issues/" + issueNumber.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        string issueUrl = repositoryUrl + "/" + path;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(TimeSpan.FromSeconds(20));
+
+        Task<JsonDocument> ReadAsync(string relative) =>
+            SendAsync(HttpMethod.Get, relative, null, deadline.Token, maximumResponseBytes);
+
+        (long Id, int Number, string Title, long AuthorId, string AuthorLogin, bool IsOpen,
+            bool IsActive, string Body, DateTimeOffset UpdatedAt, int Count) Header(JsonElement issue)
+        {
+            OrderCheck.Require(issue.ValueKind == JsonValueKind.Object
+                && !issue.TryGetProperty("pull_request", out _)
+                && issue.GetProperty("repository_url").GetString() == repositoryUrl
+                && issue.GetProperty("url").GetString() == issueUrl
+                && issue.GetProperty("number").GetInt32() == issueNumber, "ORDER_ISSUE_IDENTITY");
+            string body = issue.GetProperty("body").GetString() ?? "";
+            int count = issue.GetProperty("comments").GetInt32();
+            OrderCheck.Require(new UTF8Encoding(false, true).GetByteCount(body) <= 64 * 1024
+                && count is >= 0 and <= maximumComments, "ORDER_ISSUE_HISTORY_SIZE");
+            var user = issue.GetProperty("user");
+            string?[] labels = issue.GetProperty("labels").EnumerateArray()
+                .Select(label => label.GetProperty("name").GetString()).ToArray();
+            bool active = labels.Count(label => label == ApprovedDevelopmentIssue.ActiveLabel) == 1
+                && labels.Count(label => label?.StartsWith("workflow:", StringComparison.Ordinal) == true) == 1;
+            return (issue.GetProperty("id").GetInt64(), issueNumber,
+                issue.GetProperty("title").GetString() ?? "", user.GetProperty("id").GetInt64(),
+                user.GetProperty("login").GetString() ?? "", issue.GetProperty("state").GetString() == "open",
+                active, body, issue.GetProperty("updated_at").GetDateTimeOffset(), count);
+        }
+
+        using JsonDocument before = await ReadAsync(path);
+        var first = Header(before.RootElement);
+        var comments = new List<OrderCommentObservation>();
+        var ids = new HashSet<long>();
+        bool complete = false;
+        for (int page = 1; page <= maximumComments / pageSize + 1; page++)
+        {
+            using JsonDocument result = await ReadAsync(FormattableString.Invariant(
+                $"{path}/comments?per_page={pageSize}&page={page}"));
+            JsonElement array = result.RootElement;
+            OrderCheck.Require(array.ValueKind == JsonValueKind.Array
+                && array.GetArrayLength() <= pageSize, "ORDER_ISSUE_COMMENT_PAGE");
+            foreach (JsonElement entry in array.EnumerateArray())
+            {
+                long id = entry.GetProperty("id").GetInt64();
+                string body = entry.GetProperty("body").GetString() ?? "";
+                OrderCheck.Require(entry.GetProperty("issue_url").GetString() == issueUrl
+                    && id > 0 && ids.Add(id) && comments.Count < maximumComments
+                    && body.Length <= 64 * 1024, "ORDER_ISSUE_COMMENT_IDENTITY");
+                var user = entry.GetProperty("user");
+                comments.Add(new(id, user.GetProperty("id").GetInt64(), user.GetProperty("login").GetString() ?? "",
+                    body, entry.GetProperty("created_at").GetDateTimeOffset(), entry.GetProperty("updated_at").GetDateTimeOffset()));
+            }
+            if (array.GetArrayLength() < pageSize)
+            {
+                complete = true;
+                break;
+            }
+        }
+
+        using JsonDocument after = await ReadAsync(path);
+        DateTimeOffset observed = DateTimeOffset.UtcNow;
+        OrderCheck.Require(complete && comments.Count == first.Count && first == Header(after.RootElement)
+            && first.UpdatedAt <= observed, "ORDER_ISSUE_OBSERVATION_CHANGED");
+        return new(Repository, first.Id, first.Number, first.Title, first.AuthorId, first.AuthorLogin,
+            first.IsOpen, first.IsActive, new UTF8Encoding(false, true).GetBytes(first.Body), observed,
+            true, comments.ToArray());
+    }
 
     public async Task<long?> FindJobCommentAsync(int issueNumber, string marker, CancellationToken ct)
     {

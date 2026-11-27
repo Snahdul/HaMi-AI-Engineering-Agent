@@ -76,6 +76,7 @@ internal static class DevelopmentIssueWorkflowTests
         if (gateway.CreatedFollowUps != 1)
             throw new InvalidOperationException("Follow-up created without authorization.");
         await VerifyHttpAdapterOfflineAsync();
+        await VerifyOrderObservationOfflineAsync();
     }
 
     private static async Task VerifyHttpAdapterOfflineAsync()
@@ -103,6 +104,93 @@ internal static class DevelopmentIssueWorkflowTests
         await adapter.MarkReviewAsync(77, CancellationToken.None);
         using var denied = new GitHubIssueGateway(http, "");
         ExpectRejected(denied.RequireWriteAccess);
+    }
+
+    private static async Task VerifyOrderObservationOfflineAsync()
+    {
+        using var handler = new OrderReadHandler();
+        using var http = new HttpClient(handler);
+        using var adapter = new GitHubIssueGateway(http, "FAKE_TEST_TOKEN");
+        OrderIssueObservation observed = await adapter.ObserveOrderAsync(77, CancellationToken.None);
+        if (observed.IssueId != 6600000077L || observed.Number != 77
+            || observed.Repository != GitHubIssueGateway.Repository || !observed.IsOpen || !observed.IsActive
+            || !observed.CompleteHistory || observed.Comments.Length != 26
+            || observed.Comments[25].Id != 7127452838L + 25
+            || observed.Comments[25].Body != "exact\ncomment"
+            || System.Text.Encoding.UTF8.GetString(observed.Body) != "exact\nissue"
+            || handler.Reads != 4)
+            throw new InvalidOperationException("Order observation lost identity, bytes or complete history.");
+        foreach (string fault in new[] { "duplicate", "changed", "foreign", "incomplete", "redirect", "oversize" })
+        {
+            using var rejectedHttp = new HttpClient(new OrderReadHandler(fault));
+            using var rejected = new GitHubIssueGateway(rejectedHttp, "FAKE_TEST_TOKEN");
+            ExpectRejected(() => rejected.ObserveOrderAsync(77, CancellationToken.None).GetAwaiter().GetResult());
+        }
+        using var denied = new GitHubIssueGateway(http, "");
+        ExpectRejected(() => denied.ObserveOrderAsync(77, CancellationToken.None).GetAwaiter().GetResult());
+        if (handler.Reads != 4)
+            throw new InvalidOperationException("Missing order credential made a network request.");
+        Console.WriteLine("PASS: authenticated read-only order observation binds exact issue, complete paginated history and bytes; missing credential, duplicate, foreign, changed, incomplete and oversized history rejected.");
+    }
+
+    private sealed class OrderReadHandler(string fault = "") : HttpMessageHandler
+    {
+        private const string RepoUrl = "https://api.github.com/repos/" + GitHubIssueGateway.Repository;
+        private const string IssueUrl = RepoUrl + "/issues/77";
+        private int issueReads;
+        internal int Reads { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            if (request.Method != HttpMethod.Get || request.Headers.Authorization?.Parameter != "FAKE_TEST_TOKEN")
+                throw new InvalidOperationException("Order observation attempted a non-read or unauthenticated request.");
+            Reads++;
+            string url = request.RequestUri!.AbsoluteUri;
+            string json;
+            if (url == IssueUrl)
+            {
+                issueReads++;
+                json = JsonSerializer.Serialize(new
+                {
+                    id = 6600000077L,
+                    number = 77,
+                    repository_url = fault == "foreign" ? RepoUrl + "-foreign" : RepoUrl,
+                    url = IssueUrl,
+                    title = "Reviewed order",
+                    body = fault == "changed" && issueReads == 2 ? "changed" : "exact\nissue",
+                    state = "open",
+                    user = new { id = 42L, login = "Snahdul" },
+                    labels = new[] { new { name = ApprovedDevelopmentIssue.ActiveLabel } },
+                    updated_at = "2026-11-25T10:00:00Z",
+                    comments = 26
+                });
+            }
+            else if (url == IssueUrl + "/comments?per_page=25&page=1"
+                || url == IssueUrl + "/comments?per_page=25&page=2")
+            {
+                bool second = url.EndsWith("page=2", StringComparison.Ordinal);
+                int start = second ? 25 : 0;
+                int count = second ? (fault == "incomplete" ? 0 : 1) : 25;
+                json = JsonSerializer.Serialize(Enumerable.Range(start, count).Select(i => new
+                {
+                    id = 7127452838L + (second && fault == "duplicate" ? 0 : i),
+                    issue_url = IssueUrl,
+                    body = "exact\ncomment",
+                    user = new { id = 42L, login = "Snahdul" },
+                    created_at = "2026-11-25T09:00:00Z",
+                    updated_at = "2026-11-25T09:00:00Z"
+                }));
+            }
+            else
+                throw new InvalidOperationException("Unexpected order observation endpoint.");
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                RequestMessage = fault == "redirect"
+                    ? new HttpRequestMessage(HttpMethod.Get, RepoUrl + "-foreign/issues/77")
+                    : request,
+                Content = new StringContent(fault == "oversize" ? new string('x', 4 * 1024 * 1024 + 1) : json)
+            });
+        }
     }
 
     private static JsonElement FakeIssue(int number, string body, string author, bool approved) =>
