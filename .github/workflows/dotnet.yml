@@ -56,7 +56,7 @@ jobs:
         run: dotnet package list --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --include-transitive --no-restore
 
       - name: Build
-        run: dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-restore
+        run: dotnet build tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --no-restore
 
       - name: Verify changed C# formatting and analyzers (production and tests)
         id: format-check
@@ -87,7 +87,7 @@ jobs:
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
 
       - name: Verify exclusive developer job ownership across processes (offline)
-        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --no-restore
+        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --no-build
 
       - name: Verify production-verify CLI dispatch reaches reviewed contract gate (offline)
         shell: bash
@@ -286,7 +286,7 @@ jobs:
         run: dotnet package list --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --include-transitive --no-restore
 
       - name: Release build with warnings as errors
-        run: dotnet build src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-restore
+        run: dotnet build tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --no-restore
 
       - name: Verify changed C# formatting and analyzers (production and tests)
         id: format-check
@@ -314,7 +314,7 @@ jobs:
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --agent-self-test
 
       - name: Verify exclusive developer job ownership across processes (offline)
-        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --no-restore
+        run: dotnet run --project tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --no-build
 
       - name: Validate general C# sandbox runner input isolation on Windows (offline)
         run: dotnet run --project src/HaMi.Agentic.Cli/HaMi.Agentic.Cli.csproj --configuration Release --no-build -- development --repo . --sandbox-run-self-test
