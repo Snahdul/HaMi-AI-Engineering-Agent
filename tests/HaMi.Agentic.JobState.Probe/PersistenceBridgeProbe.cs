@@ -9,7 +9,7 @@ using HaMi.Agentic.Cli.Features.Development;
 using Microsoft.Data.Sqlite;
 
 // Disposable offline experiment, not an execution path or production journal.
-internal static class PersistenceBridgeProbe
+internal static partial class PersistenceBridgeProbe
 {
     internal const int Issue = 900001;
     private static readonly TimeSpan Deadline = TimeSpan.FromSeconds(45);
