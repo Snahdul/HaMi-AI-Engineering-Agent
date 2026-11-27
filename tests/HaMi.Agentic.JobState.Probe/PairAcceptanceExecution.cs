@@ -9,7 +9,8 @@ internal static partial class PersistenceBridgeProbe
     // independently bind the reviewed executable, acquire the canonical
     // account claim/lease, and establish exclusive backend ownership.
     // No default probe/CI path invokes this method.
-    internal static async Task<int> RunPairAcceptanceAsync(string baselineRepository, string root,
+    internal static async Task<int> RunPairAcceptanceAsync(string hostRepository, string hostCommit,
+        string baselineRepository, string root, DevelopmentJobStateStore store,
         DevelopmentJobStateStore.Lease owner, GitHubIssueGateway gateway, string apiKey,
         bool first, CancellationToken ct)
     {
@@ -23,12 +24,21 @@ internal static partial class PersistenceBridgeProbe
             && archive.Binding == claim.Binding, "ACCEPTANCE_ARCHIVE");
         // Stage data has its own existing protected workspace; never use
         // the workspace store to acquire the actual order/backend lease.
-        OrderCheck.Require(root == Path.Combine(Path.GetTempPath(), "hami-job-probe-" + claim.JobId),
+        OrderCheck.Require(root == DevelopmentJobStateRoot.PreparePairAcceptanceWorkspace(claim.JobId, create: false),
             "ACCEPTANCE_WORKSPACE_IDENTITY");
-        _ = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: false);
-        DevelopmentIsolatedRunner.ValidateStoragePaths(baselineRepository, baselineRepository, root);
+        DevelopmentIsolatedRunner.ValidateStoragePaths(hostRepository, baselineRepository, root);
         string results = Path.Combine(root, "results");
-        await profile.ObserveApprovalAsync(baselineRepository, gateway, claim, ct);
+        if (first)
+        {
+            OrderCheck.Require(!Directory.Exists(results) && !File.Exists(results)
+                && new DirectoryInfo(results).LinkTarget is null, "ACCEPTANCE_RESULTS_EXISTS");
+            Directory.CreateDirectory(results);
+        }
+        OrderCheck.Require(Directory.Exists(results) && new DirectoryInfo(results).LinkTarget is null
+            && (File.GetAttributes(results) & FileAttributes.ReparsePoint) == 0, "ACCEPTANCE_RESULTS_ROOT");
+        await PairAcceptanceEntry.RequireHostAsync(hostRepository, hostCommit);
+        store.RequireAcceptanceBackendIdle(PairAcceptanceProfile.IssueNumber);
+        await profile.ObserveApprovalAsync(baselineRepository, gateway, claim, hostCommit, ct);
         if (string.IsNullOrWhiteSpace(apiKey))
             throw new InvalidOperationException("Acceptance model credential missing.");
 
@@ -49,8 +59,14 @@ internal static partial class PersistenceBridgeProbe
             BridgeState current = await AskAsync(new ReadState());
             host.Guard.RequireObserved();
 
-            async Task<DevelopmentOrderApproval> AuthorityAsync() =>
-                await profile.ObserveApprovalAsync(baselineRepository, gateway, claim, ct);
+            async Task<DevelopmentOrderApproval> AuthorityAsync()
+            {
+                ct.ThrowIfCancellationRequested();
+                await PairAcceptanceEntry.RequireHostAsync(hostRepository, hostCommit);
+                _ = DevelopmentJobStateRoot.PreparePairAcceptanceWorkspace(claim.JobId, create: false);
+                store.RequireAcceptanceBackendIdle(PairAcceptanceProfile.IssueNumber);
+                return await profile.ObserveApprovalAsync(baselineRepository, gateway, claim, hostCommit, ct);
+            }
 
             async Task<OrderGitBaseline> BaselineAsync() =>
                 await DevelopmentWorktreeGuard.ObserveOrderBaselineAsync(baselineRepository, claim.Binding);
@@ -63,7 +79,7 @@ internal static partial class PersistenceBridgeProbe
 
             string NewStage(string name, IReadOnlyDictionary<string, byte[]> files)
             {
-                _ = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: false);
+                _ = DevelopmentJobStateRoot.PreparePairAcceptanceWorkspace(claim.JobId, create: false);
                 string target = Path.Combine(root, name);
                 OrderCheck.Require(!Directory.Exists(target) && !File.Exists(target)
                     && new DirectoryInfo(target).LinkTarget is null, "ACCEPTANCE_STAGE_EXISTS");

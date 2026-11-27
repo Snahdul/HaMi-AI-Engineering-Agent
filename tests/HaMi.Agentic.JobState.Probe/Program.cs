@@ -10,6 +10,10 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
+        if (args.Length == 4 && args[0] == "pair-acceptance-73-start"
+            || args.Length == 5 && args[0] == "pair-acceptance-73-resume")
+            return await PairAcceptanceEntry.RunAsync(args);
+
         // Explicit operator acceptance only. The default CI probe stays
         // entirely offline and never accesses the real account state root.
         if (args.Length == 5 && args[0] == "host-check")
@@ -375,10 +379,20 @@ internal static class Program
                 await ExpectProbeAsync(root, "BUSY", "backend-probe");
             }
             await ExpectProbeAsync(root, "BACKEND_ACQUIRED", "backend-probe");
+            store.RequireAcceptanceBackendIdle(PairAcceptanceProfile.IssueNumber);
+            using (var competing = store.Acquire(Issue))
+            {
+                competing.Claim(Initial(root));
+                competing.Commit(competing.Current!.Start());
+                Reject(() => store.RequireAcceptanceBackendIdle(PairAcceptanceProfile.IssueNumber));
+                competing.Commit(competing.Current!.BlockUnknownExecution());
+                Reject(() => store.RequireAcceptanceBackendIdle(PairAcceptanceProfile.IssueNumber));
+            }
             File.WriteAllText(path, "unexpected");
             Reject(() => store.AcquireSandboxBackend().Dispose());
             Reject(() => new DevelopmentJobStateStore(root).AcquireSandboxBackend().Dispose());
             Console.WriteLine("PASS: private account-wide sandbox backend lease excludes cooperating processes and releases on process kill without unlink.");
+            Console.WriteLine("PASS: isolated acceptance registry gate rejects executing and unknown competing issue claims.");
         }
         finally
         {

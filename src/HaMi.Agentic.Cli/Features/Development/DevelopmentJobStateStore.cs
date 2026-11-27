@@ -78,6 +78,46 @@ internal sealed class DevelopmentJobStateStore(string trustedRoot,
         return new Lease(prefix, issue, validatePrivateEntry, orderClaim, validateNativeRollback);
     }
 
+    // Narrow read-only registry gate for the isolated real acceptance.
+    // The backend lease excludes cooperating reserved operations while we
+    // observe the registry; the operator must exclude V1/direct sbx/other
+    // account processes for the entire acceptance window.
+    internal void RequireAcceptanceBackendIdle(int ownIssue)
+    {
+        OrderCheck.Require(ownIssue > 0, "ACCEPTANCE_REGISTRY_ISSUE");
+        using var backend = AcquireSandboxBackend();
+        int count = 0;
+        foreach (string path in Directory.EnumerateFileSystemEntries(root))
+        {
+            OrderCheck.Require(++count <= 8192, "ACCEPTANCE_REGISTRY_SIZE");
+            string name = Path.GetFileName(path);
+            if (!name.StartsWith("issue-", StringComparison.Ordinal))
+                continue;
+            int separator = name.IndexOf('.', 6);
+            if (separator <= 6 || !int.TryParse(name.AsSpan(6, separator - 6),
+                    NumberStyles.None, CultureInfo.InvariantCulture, out int issue)
+                || issue <= 0 || name[..separator] != "issue-" + issue.ToString(CultureInfo.InvariantCulture))
+                throw new InvalidOperationException("ACCEPTANCE_REGISTRY_ENTRY");
+            if (issue == ownIssue)
+                continue; // Caller holds the exact issue lease.
+            string suffix = name[separator..];
+            OrderCheck.Require(RegularFileExists(path), "ACCEPTANCE_REGISTRY_ENTRY");
+            validatePrivateEntry!(path, false);
+            if (suffix == ".lock")
+                continue;
+            // Any other V2 claim, legacy marker, incomplete claim or orphan
+            // evidence is conservatively blocked; never clear it here.
+            OrderCheck.Require(suffix == ".json", "ACCEPTANCE_OTHER_EFFECT_UNKNOWN");
+            byte[] bytes = ReadClaimBytes(path);
+            using var document = JsonDocument.Parse(bytes, new JsonDocumentOptions { MaxDepth = 8 });
+            OrderCheck.Require(document.RootElement.GetProperty("schemaVersion").GetInt32() == DevelopmentJobState.Version,
+                "ACCEPTANCE_OTHER_EFFECT_UNKNOWN");
+            var state = ParseState(bytes, issue);
+            OrderCheck.Require(state.Stage is DevelopmentJobState.Published or DevelopmentJobState.CandidateVerified
+                or DevelopmentJobState.Exhausted, "ACCEPTANCE_OTHER_EFFECT_UNKNOWN");
+        }
+    }
+
     // Locate the original issue through the private registry only. The
     // scan is not authorization: acquire the canonical issue lock and
     // re-read the selected state under that lock before using it.

@@ -52,7 +52,7 @@ internal sealed class PairAcceptanceProfile
     // The future host calls this before initial claim and before every new
     // effect or reentry. A historical archive alone never grants authority.
     internal async Task<DevelopmentOrderApproval> ObserveApprovalAsync(string repository,
-        GitHubIssueGateway gateway, DevelopmentOrderClaim? existing, CancellationToken ct)
+        GitHubIssueGateway gateway, DevelopmentOrderClaim? existing, string hostCommit, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         var baseline = await DevelopmentWorktreeGuard.ObserveOrderBaselineAsync(repository);
@@ -61,11 +61,27 @@ internal sealed class PairAcceptanceProfile
             BaselineCommit, ContractHash, ScopeHash, Policy.Sha256, CalculatorHash, FormatterHash);
         var approval = DevelopmentOrderApproval.Observe(observed, profile, Policy);
         RequireBinding(approval.Binding);
+        RequireHostApproval(observed, approval.Comment, hostCommit);
         baseline.RequireBinding(approval.Binding);
         OrderCheck.Require(approval.EffectiveLimits == Limits
             && (existing is null || existing.Binding == approval.Binding), "ACCEPTANCE_CURRENT_AUTHORITY");
         ct.ThrowIfCancellationRequested();
         return approval;
+    }
+
+    // The final reviewed host commit cannot be embedded in the commit
+    // itself. Require a separate exact, immutable owner decision on #73.
+    private static void RequireHostApproval(OrderIssueObservation observed,
+        OrderCommentObservation orderApproval, string hostCommit)
+    {
+        OrderCheck.Require(OrderCheck.Commit(hostCommit), "ACCEPTANCE_HOST_COMMIT");
+        string expected = $"HaMi-Acceptance-Host: v1 {hostCommit} {OrderHash}";
+        var markers = observed.Comments.Where(comment => comment.AuthorId == OwnerId
+            && comment.AuthorLogin == OwnerLogin
+            && comment.Body.Contains("HaMi-Acceptance-Host", StringComparison.Ordinal)).ToArray();
+        OrderCheck.Require(markers.Length == 1 && markers[0].Body == expected
+            && markers[0].CreatedAt == markers[0].UpdatedAt
+            && markers[0].CreatedAt >= orderApproval.CreatedAt, "ACCEPTANCE_HOST_APPROVAL");
     }
 
     internal void RequireBinding(OrderBinding binding)
@@ -225,5 +241,20 @@ internal sealed class PairAcceptanceProfile
         }));
         Console.WriteLine("PASS: Issue 73 acceptance profile pins order, baseline and budget; exact five-operation plan preserves FINAL reserve and rejects altered bindings, extensions and model substitutions.");
         Console.WriteLine("PASS: Issue 73 model assignments reconstruct exact reserved identity without a client; timestamp, configuration and assignment hash substitutions rejected.");
+        string hostCommit = new('b', 40);
+        var orderApproval = new OrderCommentObservation(1, OwnerId, OwnerLogin, "offline test", new(now, TimeSpan.Zero), new(now, TimeSpan.Zero));
+        var hostApproval = new OrderCommentObservation(2, OwnerId, OwnerLogin,
+            $"HaMi-Acceptance-Host: v1 {hostCommit} {OrderHash}", orderApproval.CreatedAt, orderApproval.CreatedAt);
+        var observed = new OrderIssueObservation(GitHubIssueGateway.Repository, IssueId, IssueNumber,
+            "offline test", OwnerId, OwnerLogin, true, true, [], orderApproval.CreatedAt, true, [hostApproval]);
+        RequireHostApproval(observed, orderApproval, hostCommit);
+        Reject(() => RequireHostApproval(observed with { Comments = [] }, orderApproval, hostCommit));
+        Reject(() => RequireHostApproval(observed with { Comments = [hostApproval, hostApproval] }, orderApproval, hostCommit));
+        Reject(() => RequireHostApproval(observed with
+        {
+            Comments = [hostApproval with { UpdatedAt = hostApproval.CreatedAt.AddSeconds(1) }]
+        }, orderApproval, hostCommit));
+        Reject(() => RequireHostApproval(observed, orderApproval, new string('c', 40)));
+        Console.WriteLine("PASS: Issue 73 exact immutable owner host approval required; missing, duplicate, edited and wrong revision rejected.");
     }
 }

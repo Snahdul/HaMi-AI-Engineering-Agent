@@ -72,6 +72,36 @@ internal static class DevelopmentJobStateRoot
         throw new InvalidOperationException("Recovery storage platform not supported.");
     }
 
+    // Fixed private workspace for the isolated real acceptance, separate
+    // from canonical claim storage. Never create a second state store here.
+    internal static string PreparePairAcceptanceWorkspace(string jobId, bool create)
+    {
+        if (!OperatingSystem.IsWindows())
+            throw new PlatformNotSupportedException("Pair acceptance is restricted to HaMi11.");
+        OrderCheck.Require(jobId.Length == 32
+            && jobId.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f'), "ACCEPTANCE_WORKSPACE_IDENTITY");
+        string parent = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        OrderCheck.Require(Path.IsPathFullyQualified(parent) && Directory.Exists(parent), "ACCEPTANCE_WORKSPACE_PARENT");
+        string root = Path.Combine(parent, "HaMiPairAcceptance73-" + jobId);
+        using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+        SecurityIdentifier user = identity.User ?? throw new InvalidOperationException("Recovery account SID missing.");
+        ValidateWindowsParent(parent, user);
+        for (DirectoryInfo? directory = new(parent); directory is not null; directory = directory.Parent)
+            RejectLink(directory.FullName, true);
+        var drive = new DriveInfo(Path.GetPathRoot(root) ?? throw new InvalidOperationException("Acceptance drive missing."));
+        OrderCheck.Require(drive.DriveType == DriveType.Fixed && drive.DriveFormat is "NTFS" or "ReFS",
+            "ACCEPTANCE_WORKSPACE_VOLUME");
+        if (create)
+        {
+            OrderCheck.Require(!Directory.Exists(root) && !File.Exists(root)
+                && new DirectoryInfo(root).LinkTarget is null, "ACCEPTANCE_WORKSPACE_EXISTS");
+            EnsureWindowsRoot(root, user);
+        }
+        else
+            ValidateWindowsEntry(root, true, user);
+        return root;
+    }
+
     // Only the disposable process probe can select a temporary fixture root.
     // Reuse the actual owner/ACL/mode checks, not the production account path.
     internal static DevelopmentJobStateStore OpenOrderProbeFixture(string root, bool create)
