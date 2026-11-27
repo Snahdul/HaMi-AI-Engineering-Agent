@@ -1,22 +1,12 @@
-using System.Data;
-using System.Data.Common;
 using System.Diagnostics;
-using System.Runtime.CompilerServices;
 using System.Reflection;
 using System.Text;
 using System.Text.Json.Nodes;
 using Akka.Actor;
-using Akka.Hosting;
 using Akka.Pattern;
 using Akka.Persistence;
-using Akka.Persistence.Sql.Hosting;
 using HaMi.Agentic.Cli.Features.Development;
-using LinqToDB;
-using LinqToDB.Common;
-using LinqToDB.Interceptors;
 using Microsoft.Data.Sqlite;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 
 // Disposable offline experiment, not an execution path or production journal.
 internal static class PersistenceBridgeProbe
@@ -2510,50 +2500,29 @@ internal static class PersistenceBridgeProbe
             state.Propose(claim.JobId, step, "model", seconds, now,
                 OrderOperationAgentBinding.FromAssignment(FixtureAssignment(claim, archive, step)));
 
-        string database = first ? owner.CreateOrderJournal() : owner.RequireOrderJournal();
-
-        string connection = new SqliteConnectionStringBuilder
+        using var host = await OrderJournalHost.OpenAsync(owner, first, binding =>
         {
-            DataSource = database,
-            Mode = SqliteOpenMode.ReadWrite,
-            Pooling = false
-        }.ToString();
-        // The binding is immutable metadata, not a second workflow state.
-        // Validate it before the Akka provider can initialize any tables.
-        using (var binding = new SqliteConnection(connection))
-        {
-            binding.Open();
-            CheckDurability(binding);
-            CheckJournalIdentity(binding, claim, first);
-            if (!first)
+            if (first)
+            {
+                using var initialize = binding.CreateCommand();
+                initialize.CommandText = "CREATE TABLE hami_crash_probe (value INTEGER NOT NULL)";
+                initialize.ExecuteNonQuery();
+            }
+            else
             {
                 using var check = binding.CreateCommand();
                 check.CommandText = "SELECT COUNT(*) FROM hami_crash_probe";
                 if (check.ExecuteScalar() is not long count || count != 0)
                     throw new InvalidOperationException("Uncommitted fixture transaction survived recovery.");
-                Reject(() => CheckJournalIdentity(binding, claim with { JobId = new string('f', 32) }, false));
+                Reject(() => OrderJournalHost.CheckJournalIdentity(binding, claim with { JobId = new string('f', 32) }, false));
             }
-            using var version = binding.CreateCommand();
-            version.CommandText = "SELECT sqlite_version()";
-            if (version.ExecuteScalar() is not string nativeVersion || nativeVersion != "3.54.1")
-                throw new InvalidOperationException("Unexpected native SQLite version; reviewed 3.54.1 required.");
-            Console.WriteLine("SQLite native version: " + nativeVersion);
-        }
-
-        Console.WriteLine("BRIDGE_PHASE: identity validated; initializing provider.");
-        var guard = new ProviderConnectionGuard();
-        var options = new DataOptions()
-            .UseConnectionString(ProviderName.SQLiteMS, connection)
-            .UseInterceptor(new ProviderOpenInterceptor(guard))
-            .UseInterceptor(guard);
-        using IHost host = new HostBuilder()
-            .ConfigureServices((_, services) => services.AddAkka("hami-persistence-probe", (builder, provider) =>
-                builder.WithSqlPersistence(options)))
-            .Build();
-        await guard.AwaitAsync(host.StartAsync());
+        });
+        string database = host.Database;
+        string connection = host.Connection;
+        var guard = host.Guard;
         try
         {
-            var system = host.Services.GetRequiredService<ActorSystem>();
+            var system = host.System;
             IActorRef actor = system.ActorOf(Props.Create(() => new BridgeActor(claim, archive, limits, policy, owner, modelScenario, softScenario, calculatorScenario, root)), "bridge");
             async Task<BridgeState> ReadAsync()
             {
@@ -2955,7 +2924,7 @@ internal static class PersistenceBridgeProbe
                     // This table is a test fixture; Akka event rows are untouched.
                     using var crashConnection = new SqliteConnection(connection);
                     crashConnection.Open();
-                    CheckDurability(crashConnection);
+                    OrderJournalHost.CheckDurability(crashConnection);
                     using var transaction = crashConnection.BeginTransaction();
                     using var pending = crashConnection.CreateCommand();
                     pending.Transaction = transaction;
@@ -4565,22 +4534,8 @@ internal static class PersistenceBridgeProbe
         }
         finally
         {
-            await host.StopAsync().WaitAsync(Deadline);
-            owner.ValidateOrderJournalFiles();
+            await host.StopAsync();
         }
-    }
-
-    private static void CheckDurability(DbConnection connection)
-    {
-        using DbCommand command = connection.CreateCommand();
-        command.CommandText = "PRAGMA journal_mode";
-        if (command.ExecuteScalar() is not string mode || !mode.Equals("delete", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("SQLite rollback journal mode required.");
-        command.CommandText = "PRAGMA synchronous=FULL";
-        command.ExecuteNonQuery();
-        command.CommandText = "PRAGMA synchronous";
-        if (command.ExecuteScalar() is not long value || value < 2)
-            throw new InvalidOperationException("SQLite FULL synchronization required.");
     }
 
     private static void Reject(Action action)
@@ -4591,127 +4546,6 @@ internal static class PersistenceBridgeProbe
             return;
         }
         throw new InvalidOperationException("Invalid journal or claim was accepted.");
-    }
-
-    private static void CheckJournalIdentity(SqliteConnection connection, DevelopmentOrderClaim claim, bool first)
-    {
-        if (first)
-        {
-            using var initialize = connection.CreateCommand();
-            initialize.CommandText = "CREATE TABLE hami_order_identity (persistence_id TEXT NOT NULL, archive_hash TEXT NOT NULL); "
-                + "CREATE TABLE hami_crash_probe (value INTEGER NOT NULL); "
-                + "INSERT INTO hami_order_identity VALUES ($id, $hash)";
-            initialize.Parameters.AddWithValue("$id", claim.PersistenceId);
-            initialize.Parameters.AddWithValue("$hash", claim.ArchiveHash);
-            initialize.ExecuteNonQuery();
-        }
-        using var command = connection.CreateCommand();
-        command.CommandText = "SELECT persistence_id, archive_hash FROM hami_order_identity";
-        using var reader = command.ExecuteReader();
-        if (!reader.Read() || reader.GetString(0) != claim.PersistenceId
-            || reader.GetString(1) != claim.ArchiveHash || reader.Read())
-            throw new InvalidOperationException("Journal identity differs from claim.");
-    }
-
-    // LinqToDB 6 creates commands before opening their connection.
-    // Configure at connection-open, then guard the actual execution boundary.
-    // Both interceptors are registered in DataOptions for provider clones.
-    private sealed class ProviderOpenInterceptor(ProviderConnectionGuard guard) : ConnectionInterceptor
-    {
-        public override void ConnectionOpened(ConnectionEventData eventData, DbConnection connection) =>
-            guard.Configure(connection);
-
-        public override Task ConnectionOpenedAsync(ConnectionEventData eventData, DbConnection connection,
-            CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            guard.Configure(connection);
-            return Task.CompletedTask;
-        }
-    }
-
-    private sealed class ProviderConnectionGuard : CommandInterceptor
-    {
-        private readonly ConditionalWeakTable<DbConnection, object> configured = new();
-        private readonly TaskCompletionSource<Exception> failure = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private int commands;
-
-        internal void Configure(DbConnection connection)
-        {
-            try
-            {
-                CheckDurability(connection);
-                _ = configured.GetValue(connection, _ => new object());
-            }
-            catch (Exception ex)
-            {
-                Fail(ex);
-                throw;
-            }
-        }
-
-        private void Fail(Exception error)
-        {
-            if (failure.TrySetResult(error))
-                Console.Error.WriteLine("BRIDGE_GUARD: " + error.Message);
-        }
-
-        private void RequireConfigured(DbCommand command)
-        {
-            if (command.Connection is not DbConnection connection
-                || connection.State != ConnectionState.Open || !configured.TryGetValue(connection, out _))
-            {
-                var error = new InvalidOperationException("Provider attempted SQL execution without an open, configured connection.");
-                Fail(error);
-                throw error;
-            }
-            Interlocked.Increment(ref commands);
-        }
-
-        public override Option<int> ExecuteNonQuery(CommandEventData eventData, DbCommand command, Option<int> result)
-        {
-            RequireConfigured(command);
-            return result;
-        }
-
-        public override Task<Option<int>> ExecuteNonQueryAsync(CommandEventData eventData, DbCommand command,
-            Option<int> result, CancellationToken cancellationToken) =>
-            Task.FromResult(ExecuteNonQuery(eventData, command, result));
-
-        public override Option<object?> ExecuteScalar(CommandEventData eventData, DbCommand command, Option<object?> result)
-        {
-            RequireConfigured(command);
-            return result;
-        }
-
-        public override Task<Option<object?>> ExecuteScalarAsync(CommandEventData eventData, DbCommand command,
-            Option<object?> result, CancellationToken cancellationToken) =>
-            Task.FromResult(ExecuteScalar(eventData, command, result));
-
-        public override Option<DbDataReader> ExecuteReader(CommandEventData eventData, DbCommand command,
-            CommandBehavior commandBehavior, Option<DbDataReader> result)
-        {
-            RequireConfigured(command);
-            return result;
-        }
-
-        public override Task<Option<DbDataReader>> ExecuteReaderAsync(CommandEventData eventData, DbCommand command,
-            CommandBehavior commandBehavior, Option<DbDataReader> result, CancellationToken cancellationToken) =>
-            Task.FromResult(ExecuteReader(eventData, command, commandBehavior, result));
-
-        internal async Task AwaitAsync(Task operation)
-        {
-            await Task.WhenAny(operation, failure.Task).WaitAsync(Deadline);
-            if (failure.Task.IsCompletedSuccessfully)
-                throw new InvalidOperationException("Provider durability guard rejected an operation.", await failure.Task);
-            await operation;
-        }
-
-        internal void RequireObserved()
-        {
-            if (failure.Task.IsCompletedSuccessfully || Volatile.Read(ref commands) == 0)
-                throw new InvalidOperationException("No valid guarded actual provider execution observed.");
-        }
     }
 
     private sealed record ReadState;
