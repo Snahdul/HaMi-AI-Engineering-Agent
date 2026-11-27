@@ -8,6 +8,7 @@
     <EmbeddedResource Include="../../contracts/development/agent-pair.json" LogicalName="HaMi.Probe.PairContract" />
     <EmbeddedResource Include="../../contracts/development/sandbox-pair.json" LogicalName="HaMi.Probe.PairScope" />
     <EmbeddedResource Include="../../policies/development/pair-budget.fixture.policy.json" LogicalName="HaMi.Probe.BudgetPolicy" />
+    <EmbeddedResource Include="../../policies/development/pair-acceptance-73.policy.json" LogicalName="HaMi.Probe.PairAcceptance73Policy" />
     <PackageReference Include="Akka.Persistence" />
     <PackageReference Include="Akka.Persistence.Hosting" />
     <PackageReference Include="Akka.Persistence.Sql.Hosting" />

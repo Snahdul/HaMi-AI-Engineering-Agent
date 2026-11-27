@@ -173,6 +173,7 @@ internal static class Program
 
         if (args.Length != 0)
             return 2;
+        PairAcceptanceProfile.SelfTest();
         string fixture = Path.Combine(Path.GetTempPath(), Prefix + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(fixture);
         try
