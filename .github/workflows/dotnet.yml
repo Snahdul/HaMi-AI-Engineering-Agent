@@ -28,7 +28,7 @@ jobs:
     name: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false && 'build' || (github.event_name == 'workflow_dispatch' && 'Manual Linux build' || 'Draft Linux build') }}
     if: ${{ (github.event_name == 'pull_request' && (github.event.pull_request.draft == false || contains(github.event.pull_request.labels.*.name, 'ci:full') || !contains(github.event.pull_request.labels.*.name, 'ci:windows'))) || (github.event_name == 'workflow_dispatch' && (inputs.platform == 'linux' || inputs.platform == 'both')) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
     steps:
       - name: Checkout source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
