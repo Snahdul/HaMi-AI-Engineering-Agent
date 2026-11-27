@@ -16,6 +16,7 @@ internal static partial class PersistenceBridgeProbe
     {
         OrderCheck.Require(OperatingSystem.IsWindows(), "ACCEPTANCE_HAMI11_ONLY");
         long processStart = DateTime.UtcNow.Ticks;
+        long hostStart = Stopwatch.GetTimestamp();
         var profile = PairAcceptanceProfile.Load();
         var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Acceptance claim missing.");
         profile.RequireBinding(claim.Binding);
@@ -27,6 +28,7 @@ internal static partial class PersistenceBridgeProbe
         OrderCheck.Require(root == DevelopmentJobStateRoot.PreparePairAcceptanceWorkspace(claim.JobId, create: false),
             "ACCEPTANCE_WORKSPACE_IDENTITY");
         DevelopmentIsolatedRunner.ValidateStoragePaths(hostRepository, baselineRepository, root);
+        PairAcceptanceEntry.RequireHostBinding(root, claim, hostCommit, create: false);
         string results = Path.Combine(root, "results");
         if (first)
         {
@@ -58,12 +60,15 @@ internal static partial class PersistenceBridgeProbe
 
             BridgeState current = await AskAsync(new ReadState());
             host.Guard.RequireObserved();
+            Console.WriteLine(FormattableString.Invariant(
+                $"ACCEPTANCE_HOST_READY: job={claim.JobId}; stage={current.Stage}; elapsedMs={Stopwatch.GetElapsedTime(hostStart).TotalMilliseconds:F3}"));
 
             async Task<DevelopmentOrderApproval> AuthorityAsync()
             {
                 ct.ThrowIfCancellationRequested();
                 await PairAcceptanceEntry.RequireHostAsync(hostRepository, hostCommit);
                 _ = DevelopmentJobStateRoot.PreparePairAcceptanceWorkspace(claim.JobId, create: false);
+                PairAcceptanceEntry.RequireHostBinding(root, claim, hostCommit, create: false);
                 store.RequireAcceptanceBackendIdle(PairAcceptanceProfile.IssueNumber);
                 return await profile.ObserveApprovalAsync(baselineRepository, gateway, claim, hostCommit, ct);
             }
@@ -216,7 +221,9 @@ internal static partial class PersistenceBridgeProbe
                 Console.Out.Flush();
                 // Only the designated operator/supervisor terminates this
                 // process after the durable acceptance marker. No S02 here.
-                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                TimeSpan remaining = current.Ledger.Remaining(archive.EffectiveLimits, DateTime.UtcNow.Ticks);
+                OrderCheck.Require(remaining > TimeSpan.Zero, "ACCEPTANCE_RECOVERY_WINDOW");
+                await Task.Delay(remaining, ct);
                 return 1;
             }
 

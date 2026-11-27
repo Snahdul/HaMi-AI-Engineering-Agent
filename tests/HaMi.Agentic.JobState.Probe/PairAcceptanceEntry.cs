@@ -11,6 +11,9 @@ internal static class PairAcceptanceEntry
     {
         OrderCheck.Require(OperatingSystem.IsWindows() && OrderCheck.Commit(hostCommit), "ACCEPTANCE_HOST_COMMIT");
         string repo = Path.GetFullPath(hostRepository);
+        for (DirectoryInfo? directory = new(repo); directory is not null; directory = directory.Parent)
+            OrderCheck.Require(directory.Exists && directory.LinkTarget is null
+                && (directory.Attributes & FileAttributes.ReparsePoint) == 0, "ACCEPTANCE_HOST_LINK");
         await DevelopmentIssueWorkflow.VerifyOriginAsync(repo);
         string root = (await DevelopmentWorktreeGuard.GitAsync(repo, "--no-replace-objects",
             "rev-parse", "--show-toplevel")).Trim();
@@ -24,6 +27,9 @@ internal static class PairAcceptanceEntry
             && tracked.Split('\0')[..^1].All(item => item.StartsWith("H ", StringComparison.Ordinal)),
             "ACCEPTANCE_HOST_CHECKOUT");
         string output = Path.Combine(repo, "tests", "HaMi.Agentic.JobState.Probe", "bin", "Release", "net11.0");
+        for (DirectoryInfo? directory = new(output); directory is not null; directory = directory.Parent)
+            OrderCheck.Require(directory.Exists && directory.LinkTarget is null
+                && (directory.Attributes & FileAttributes.ReparsePoint) == 0, "ACCEPTANCE_HOST_LINK");
         foreach (Assembly assembly in new[] { typeof(PairAcceptanceEntry).Assembly, typeof(DevelopmentAiGenerator).Assembly })
         {
             OrderCheck.Require(string.Equals(Path.GetDirectoryName(assembly.Location), output,
@@ -34,6 +40,33 @@ internal static class PairAcceptanceEntry
         // This verifies the checked-out revision and expected Release
         // assembly location, not a cryptographic attestation of the binary.
         // The operator must build the reviewed clean revision before release.
+    }
+
+    // Immutable host metadata only, never a second workflow checkpoint.
+    // Reentry must not switch to a different host even if another valid
+    // current issue decision names that revision.
+    internal static void RequireHostBinding(string root, DevelopmentOrderClaim claim, string hostCommit, bool create)
+    {
+        if (!OperatingSystem.IsWindows())
+            throw new PlatformNotSupportedException("Pair acceptance is restricted to HaMi11.");
+        OrderCheck.Require(OrderCheck.Commit(hostCommit), "ACCEPTANCE_HOST_COMMIT");
+        string path = Path.Combine(root, "host-binding.json");
+        byte[] expected = OrderStorageJson.Encode(new
+        {
+            Version = 1,
+            claim.JobId,
+            claim.ArchiveHash,
+            claim.Binding.OrderHash,
+            HostCommit = hostCommit
+        }, DevelopmentJobState.MaxBytes);
+        if (create)
+        {
+            using var stream = DevelopmentJobStateRoot.CreateWindowsPrivateFile(path, FileOptions.WriteThrough);
+            stream.Write(expected);
+            stream.Flush(flushToDisk: true);
+        }
+        byte[] actual = DevelopmentJobEvidence.ReadBoundedFile(path, DevelopmentJobState.MaxBytes);
+        OrderCheck.Require(actual.AsSpan().SequenceEqual(expected), "ACCEPTANCE_HOST_BINDING");
     }
 
     internal static async Task<int> RunAsync(string[] args)
@@ -68,6 +101,8 @@ internal static class PairAcceptanceEntry
             owner.ClaimOrder(jobId, approval);
         string root = DevelopmentJobStateRoot.PreparePairAcceptanceWorkspace(jobId, first);
         OrderCheck.Require(root == workspace, "ACCEPTANCE_WORKSPACE_IDENTITY");
+        var claim = owner.CurrentOrder ?? throw new InvalidOperationException("Acceptance claim missing.");
+        RequireHostBinding(root, claim, hostCommit, create: first);
         return await PersistenceBridgeProbe.RunPairAcceptanceAsync(hostRepository, hostCommit, baselineRepository,
             root, store, owner, gateway, apiKey, first, CancellationToken.None);
     }
