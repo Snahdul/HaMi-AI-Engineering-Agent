@@ -37,6 +37,12 @@ internal static class PersistenceBridgeProbe
 
     private static string CalculatorRepository(string root) => Path.Combine(root, "calculator-repo");
 
+    private static string EvidencePrefix => $"issue-{Issue}.order.db.";
+
+    private static IEnumerable<string> EnumerateEvidenceFiles(string root) =>
+        Directory.EnumerateFiles(root)
+            .Where(path => Path.GetFileName(path).StartsWith(EvidencePrefix, StringComparison.Ordinal));
+
     private static void DeleteCalculatorFixture(string root)
     {
         if (OperatingSystem.IsWindows())
@@ -2151,8 +2157,7 @@ internal static class PersistenceBridgeProbe
                     await expectOwnership(root, "ACQUIRED:order");
                 }
 
-                string pattern = $"issue-{Issue}.order.db.*";
-                var evidence = Directory.GetFiles(root, pattern).ToDictionary(path => path, File.ReadAllBytes, StringComparer.Ordinal);
+                var evidence = EnumerateEvidenceFiles(root).ToDictionary(path => path, File.ReadAllBytes, StringComparer.Ordinal);
                 using Process reentry = start(resume, root);
                 Task<string> stdout = reentry.StandardOutput.ReadToEndAsync();
                 Task<string> stderr = reentry.StandardError.ReadToEndAsync();
@@ -2164,7 +2169,7 @@ internal static class PersistenceBridgeProbe
                         Console.WriteLine("[bridge reentry] " + line.TrimEnd('\r'));
                     if (reentry.ExitCode != 0 || !output.Contains("BRIDGE_PAIR_ADMISSION_RECOVERED", StringComparison.Ordinal))
                         throw new InvalidOperationException("Pair boundary reentry failed: " + output + await stderr);
-                    if (Directory.GetFiles(root, pattern).Length != evidence.Count
+                    if (EnumerateEvidenceFiles(root).Count() != evidence.Count
                         || evidence.Any(file => !File.Exists(file.Key) || !File.ReadAllBytes(file.Key).SequenceEqual(file.Value)))
                         throw new InvalidOperationException("Pair boundary recovery changed private evidence.");
                 }
@@ -2244,8 +2249,11 @@ internal static class PersistenceBridgeProbe
         try
         {
             await CreateCalculatorRepositoryAsync(freshRoot);
-            _ = await DevelopmentWorktreeGuard.GitAsync(resumeRoot, "-c", "core.autocrlf=false",
-                "clone", "--no-local", "--no-tags", "--", CalculatorRepository(freshRoot), CalculatorRepository(resumeRoot));
+            _ = await DevelopmentWorktreeGuard.GitAsync(resumeRoot, "clone", "--config", "core.autocrlf=false",
+                "--no-local", "--no-tags", "--", CalculatorRepository(freshRoot), CalculatorRepository(resumeRoot));
+            if ((await DevelopmentWorktreeGuard.GitAsync(CalculatorRepository(resumeRoot),
+                    "config", "--local", "--get", "core.autocrlf")).Trim() != "false")
+                throw new InvalidOperationException("Measurement clone line-ending configuration differs.");
             var freshApproval = await CalculatorRecoveryApprovalAsync(freshRoot);
             var resumeApproval = await CalculatorRecoveryApprovalAsync(resumeRoot);
             if (freshApproval.Binding != resumeApproval.Binding || freshApproval.Order.Plan != resumeApproval.Order.Plan)
@@ -2330,7 +2338,7 @@ internal static class PersistenceBridgeProbe
             }
 
             await expectOwnership(resumeRoot, "ACQUIRED:order");
-            string evidencePrefix = $"issue-{Issue}.order.db.";
+            string evidencePrefix = EvidencePrefix;
             string[] acceptedSlots = ["candidate-1", "evidence-1", "model-dispatch-1", "snapshot-2", "guest-dispatch-2", "guest-report-2"];
             string[] terminalSlots = [.. acceptedSlots, "candidate-3", "evidence-3", "model-dispatch-3",
                 "snapshot-4", "guest-dispatch-4", "guest-report-4", "snapshot-5", "guest-dispatch-5", "guest-report-5"];
@@ -2339,10 +2347,8 @@ internal static class PersistenceBridgeProbe
             {
                 // Win32-compatible glob matching can include the journal itself
                 // for a trailing dot-star. Match the literal evidence prefix.
-                var actual = Directory.EnumerateFiles(root)
-                    .Select(path => Path.GetFileName(path))
-                    .Where(name => name.StartsWith(evidencePrefix, StringComparison.Ordinal))
-                    .Select(name => name[evidencePrefix.Length..])
+                var actual = EnumerateEvidenceFiles(root)
+                    .Select(path => Path.GetFileName(path)[evidencePrefix.Length..])
                     .ToHashSet(StringComparer.Ordinal);
                 if (!actual.SetEquals(expected))
                     throw new InvalidOperationException("Measurement evidence slots differ: "
