@@ -37,6 +37,39 @@ internal static class PersistenceBridgeProbe
 
     private static string CalculatorRepository(string root) => Path.Combine(root, "calculator-repo");
 
+    private static void DeleteCalculatorFixture(string root)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Git for Windows can mark loose objects read-only. Only remove
+            // that attribute from our disposable, non-local-clone object store.
+            _ = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: false);
+            string repo = CalculatorRepository(root);
+            string git = Path.Combine(repo, ".git");
+            string objects = Path.Combine(git, "objects");
+            foreach (string directory in new[] { repo, git, objects })
+                if (Directory.Exists(directory) && (File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidOperationException("Calculator fixture Git directory is a reparse point.");
+            if (Directory.Exists(objects))
+            {
+                var options = new EnumerationOptions
+                {
+                    RecurseSubdirectories = true,
+                    AttributesToSkip = FileAttributes.ReparsePoint,
+                    IgnoreInaccessible = false
+                };
+                foreach (string path in Directory.EnumerateFiles(objects, "*", options))
+                {
+                    FileAttributes attributes = File.GetAttributes(path);
+                    if ((attributes & (FileAttributes.ReadOnly | FileAttributes.ReparsePoint)) == FileAttributes.ReadOnly)
+                        File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+                }
+            }
+        }
+
+        Directory.Delete(root, recursive: true);
+    }
+
     private static byte[] ReadCalculatorResource(string name)
     {
         using Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(name)
@@ -1709,6 +1742,7 @@ internal static class PersistenceBridgeProbe
             var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
             try
             {
+                Console.WriteLine("BRIDGE_SCENARIO: " + scenario);
                 if (calculatorScenario)
                     await CreateCalculatorRepositoryAsync(root);
                 using (Process child = start(firstMode, root))
@@ -2057,9 +2091,14 @@ internal static class PersistenceBridgeProbe
                     }
                 }
             }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("Bridge scenario failed before cleanup (" + scenario + "): " + ex);
+                throw;
+            }
             finally
             {
-                Directory.Delete(root, recursive: true);
+                DeleteCalculatorFixture(root);
             }
         }
 
@@ -2138,9 +2177,14 @@ internal static class PersistenceBridgeProbe
                     }
                 }
             }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("Bridge admission boundary failed before cleanup (" + boundary + "): " + ex);
+                throw;
+            }
             finally
             {
-                Directory.Delete(root, recursive: true);
+                DeleteCalculatorFixture(root);
             }
         }
 
@@ -2325,10 +2369,15 @@ internal static class PersistenceBridgeProbe
                 $"BRIDGE_RECOVERY_METRICS: profile=offline-controlled; process=fresh; hostCache=notReset; baseline={freshApproval.Binding.BaseCommit}; freshMs={fresh.Terminal.TotalMilliseconds:F3}; freshHostReadyMs={fresh.HostReady.TotalMilliseconds:F3}; recoveryHostReadyMs={resumed.HostReady.TotalMilliseconds:F3}; recoveryMs={resumed.Ready.TotalMilliseconds:F3}; remainingMs={rest.TotalMilliseconds:F3}; recoveryTotalMs={resumed.Terminal.TotalMilliseconds:F3}; interruptionMs={interruption.TotalMilliseconds:F3}; savedMs={saving.TotalMilliseconds:F3}; economic={saving > TimeSpan.Zero}; savedControlledModelCalls=1; savedGuestOperations=1; actualProviderCalls=0; actualSandboxRuns=0"));
             Console.WriteLine("PASS: fresh and recovered pair reference runs reach the same independently verified terminal acceptance with identical candidate bytes.");
         }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("Bridge measurement failed before cleanup: " + ex);
+            throw;
+        }
         finally
         {
-            Directory.Delete(freshRoot, recursive: true);
-            Directory.Delete(resumeRoot, recursive: true);
+            try { DeleteCalculatorFixture(freshRoot); }
+            finally { DeleteCalculatorFixture(resumeRoot); }
         }
     }
 
