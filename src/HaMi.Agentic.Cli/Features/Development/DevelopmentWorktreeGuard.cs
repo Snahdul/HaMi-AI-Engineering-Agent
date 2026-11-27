@@ -108,7 +108,8 @@ internal static class DevelopmentWorktreeGuard
             string sizeText = (await GitAsync(repo, "--no-replace-objects", "cat-file", "-s", objectId)).Trim();
             OrderCheck.Require(int.TryParse(sizeText, NumberStyles.None, CultureInfo.InvariantCulture, out int size)
                 && size is > 0 and <= OrderCandidateCheckpoint.MaxBytes, "ORDER_GIT_BASELINE_SIZE");
-            byte[] checkout = DevelopmentJobEvidence.ReadBoundedFile(Path.Combine(repo, relative),
+            byte[] checkout = DevelopmentJobEvidence.ReadBoundedFile(
+                Path.Combine(repo, relative.Replace('/', Path.DirectorySeparatorChar)),
                 OrderCandidateCheckpoint.MaxBytes);
             string objectText = await GitAsync(repo, "--no-replace-objects", "cat-file", "blob", objectId);
             byte[] objectBytes = new UTF8Encoding(false, true).GetBytes(objectText);
