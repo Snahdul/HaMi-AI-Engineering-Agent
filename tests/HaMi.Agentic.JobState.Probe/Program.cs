@@ -14,6 +14,14 @@ internal static class Program
             || args.Length == 5 && args[0] == "pair-acceptance-73-resume")
             return await PairAcceptanceEntry.RunAsync(args);
 
+        // Focused offline preflight: real SDK over in-memory HTTP fixtures only.
+        if (args.Length == 1 && args[0] == "reserved-model-response-self-test")
+        {
+            await DevelopmentAiGenerator.SelfTestS01Async();
+            await DevelopmentAiGenerator.SelfTestS02Async();
+            return 0;
+        }
+
         // Explicit operator acceptance only. The default CI probe stays
         // entirely offline and never accesses the real account state root.
         if (args.Length == 5 && args[0] == "host-check")

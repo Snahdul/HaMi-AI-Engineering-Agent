@@ -146,7 +146,7 @@ internal static partial class PersistenceBridgeProbe
         string step = "S01")
     {
         using var fake = new DevelopmentAiGenerator.ScriptedChatClient("{}");
-        var generator = new DevelopmentAiGenerator(fake, ModelName);
+        var generator = new DevelopmentAiGenerator(fake, ModelName, requireNativeResponse: false);
         var original = FixtureAssignment(claim, archive, step);
         return original with
         {
@@ -850,7 +850,7 @@ internal static partial class PersistenceBridgeProbe
                 };
                 using var scripted = new DevelopmentAiGenerator.ScriptedChatClient(payload,
                     scenario == "adapter-length" ? Microsoft.Extensions.AI.ChatFinishReason.Length : null);
-                var generator = new DevelopmentAiGenerator(scripted, "fixture-model");
+                var generator = new DevelopmentAiGenerator(scripted, "fixture-model", requireNativeResponse: false);
                 bool adapter = scenario.StartsWith("adapter-", StringComparison.Ordinal) || scenario == "wrong-config";
                 if (adapter)
                     assignment = assignment with
@@ -2690,7 +2690,7 @@ internal static partial class PersistenceBridgeProbe
                         string response = reject ? """{"source":""}"""
                             : System.Text.Json.JsonSerializer.Serialize(new { source = ModelCandidate });
                         using var fake = new DevelopmentAiGenerator.ScriptedChatClient(response);
-                        var generator = new DevelopmentAiGenerator(fake, ModelName);
+                        var generator = new DevelopmentAiGenerator(fake, ModelName, requireNativeResponse: false);
                         var result = await DevelopmentOrderModelDispatch.RunS01CoreAsync(owner, current.Ledger,
                             reservation, approval, assignment, catalog,
                             calculatorScenario ? ObserveCalculatorBaseline(root, claim.Binding).Calculator : ModelBaseline, generator);
@@ -3198,7 +3198,7 @@ internal static partial class PersistenceBridgeProbe
                         var resumedApproval = await CalculatorRecoveryApprovalAsync(root);
                         using var resumedClient = new DevelopmentAiGenerator.ScriptedChatClient(
                             System.Text.Json.JsonSerializer.Serialize(new { source = "class PairFormatter {}" }));
-                        var resumedGenerator = new DevelopmentAiGenerator(resumedClient, ModelName);
+                        var resumedGenerator = new DevelopmentAiGenerator(resumedClient, ModelName, requireNativeResponse: false);
                         var resumedResult = await DevelopmentOrderModelDispatch.RunS02CoreAsync(owner, resumedPairLedger,
                             resumedPairRequest, resumedApproval, resumedAssignment, resumedCatalog, resumedInputs, resumedGenerator);
                         var resumedCandidate = resumedResult.Candidate
@@ -4050,7 +4050,7 @@ internal static partial class PersistenceBridgeProbe
                 using var formatterClient = new DevelopmentAiGenerator.ScriptedChatClient(
                     rejectedFormatter ? """{"source":""}"""
                         : System.Text.Json.JsonSerializer.Serialize(new { source = "class PairFormatter {}" }));
-                var formatterGenerator = new DevelopmentAiGenerator(formatterClient, ModelName);
+                var formatterGenerator = new DevelopmentAiGenerator(formatterClient, ModelName, requireNativeResponse: false);
                 Task<OrderModelDispatchResult> DispatchFormatter(OrderFormatterInputs inputs) =>
                     DevelopmentOrderModelDispatch.RunS02CoreAsync(owner, actualPending, actualRequest,
                         formatterApproval, formatterAssignment, formatterCatalog, inputs, formatterGenerator);
