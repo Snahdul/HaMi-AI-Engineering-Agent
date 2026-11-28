@@ -2,7 +2,7 @@ name: HaMi Agent .NET 11 CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled]
   workflow_dispatch:
     inputs:
       platform:
@@ -15,18 +15,18 @@ on:
 permissions:
   contents: read
 
-# Only the newest PR event needs CI. Manual diagnostic runs have their own
-# group and never cancel a PR or another manual run.
+# Only the newest regular PR event needs CI. Manual and label diagnostic
+# runs have their own groups and never cancel a required PR check.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.action != 'labeled' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'labeled' }}
 
 jobs:
   # IDs are deliberately different from the required check names. Even
   # a skipped draft job must not publish a check called 'build'.
   linux-tests:
-    name: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false && 'build' || (github.event_name == 'workflow_dispatch' && 'Manual Linux build' || 'Draft Linux build') }}
-    if: ${{ (github.event_name == 'pull_request' && (github.event.pull_request.draft == false || contains(github.event.pull_request.labels.*.name, 'ci:full') || !contains(github.event.pull_request.labels.*.name, 'ci:windows'))) || (github.event_name == 'workflow_dispatch' && (inputs.platform == 'linux' || inputs.platform == 'both')) }}
+    name: ${{ github.event_name == 'pull_request' && github.event.action != 'labeled' && github.event.pull_request.draft == false && 'build' || (github.event_name == 'workflow_dispatch' && 'Manual Linux build' || 'Draft Linux build') }}
+    if: ${{ (github.event_name == 'pull_request' && ((github.event.action != 'labeled' && (github.event.pull_request.draft == false || contains(github.event.pull_request.labels.*.name, 'ci:full') || !contains(github.event.pull_request.labels.*.name, 'ci:windows'))) || (github.event.action == 'labeled' && github.event.pull_request.draft == true && github.event.label.name == 'ci:full'))) || (github.event_name == 'workflow_dispatch' && (inputs.platform == 'linux' || inputs.platform == 'both')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -236,8 +236,8 @@ jobs:
           fi
 
   windows-tests:
-    name: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false && 'Windows file-handle logging regression' || (github.event_name == 'workflow_dispatch' && 'Manual Windows regression' || 'Draft Windows regression') }}
-    if: ${{ (github.event_name == 'pull_request' && (github.event.pull_request.draft == false || contains(github.event.pull_request.labels.*.name, 'ci:full') || contains(github.event.pull_request.labels.*.name, 'ci:windows'))) || (github.event_name == 'workflow_dispatch' && (inputs.platform == 'windows' || inputs.platform == 'both')) }}
+    name: ${{ github.event_name == 'pull_request' && github.event.action != 'labeled' && github.event.pull_request.draft == false && 'Windows file-handle logging regression' || (github.event_name == 'workflow_dispatch' && 'Manual Windows regression' || 'Draft Windows regression') }}
+    if: ${{ (github.event_name == 'pull_request' && ((github.event.action != 'labeled' && (github.event.pull_request.draft == false || contains(github.event.pull_request.labels.*.name, 'ci:full') || contains(github.event.pull_request.labels.*.name, 'ci:windows'))) || (github.event.action == 'labeled' && github.event.pull_request.draft == true && (github.event.label.name == 'ci:windows' || github.event.label.name == 'ci:full')))) || (github.event_name == 'workflow_dispatch' && (inputs.platform == 'windows' || inputs.platform == 'both')) }}
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
