@@ -1,0 +1,63 @@
+name: HaMi .NET Preflight pilot
+
+on:
+  push:
+    branches:
+      - preflight/issue26-build-pilot
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Pilot preflight (not a required PR check)
+    if: github.repository == 'Snahdul/HaMi-AI-Engineering-Agent' && github.ref == 'refs/heads/preflight/issue26-build-pilot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify candidate and reviewed base
+        shell: bash
+        env:
+          BASE_SHA: e1980130787426acdc5b76685a5da398923774dc
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          git merge-base --is-ancestor "$BASE_SHA" "$GITHUB_SHA"
+          printf 'PREFLIGHT_CANDIDATE=%s\nPREFLIGHT_BASE=%s\n' "$GITHUB_SHA" "$BASE_SHA"
+
+      - name: Install .NET SDK from global.json
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: global.json
+
+      - name: Restore dependency graph
+        run: dotnet restore tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low
+
+      - name: Build with static analysis
+        run: dotnet build tests/HaMi.Agentic.JobState.Probe/HaMi.Agentic.JobState.Probe.csproj --configuration Release --no-restore -p:EnableNETAnalyzers=true -p:RunAnalyzersDuringBuild=true -p:TreatWarningsAsErrors=true
+
+      - name: Verify formatting and analyzers (read-only)
+        shell: pwsh
+        env:
+          BASE_SHA: e1980130787426acdc5b76685a5da398923774dc
+        run: ./scripts/quality/Invoke-HaMiFormat.ps1 -Base $env:BASE_SHA -Mode Check -SmokeIfEmpty
+
+      - name: Verify unchanged candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          printf 'PREFLIGHT_PASS=%s\n' "$GITHUB_SHA"
