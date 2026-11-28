@@ -45,17 +45,193 @@ internal static class DevelopmentSandboxRunner
         "if [ -n \"$v\" ]; then printf 'NONEMPTY_CREDENTIAL_ENV=%s\\n' \"$n\"; exit 19; fi; " +
         "done; printf 'CREDENTIAL_ENV=clean\\n';";
 
+    // Fixed trusted template utilities, before any candidate build or code.
+    // The only argument is the host-derived guest directory. Nonregular
+    // entries yield an invalid record; any failure omits the end marker.
+    private const string GuestSnapshotCheckScript =
+        "set -eu; export LC_ALL=C; test ! -L \"$1\"; cd \"$1\"; " +
+        "find . ! -type d ! -type f -printf 'INVALID\\0'; " +
+        "find . -type f -exec sha256sum --zero -- {} +; " +
+        "printf 'HAMI_SNAPSHOT_END\\0'";
+
     internal sealed record SandboxRunReport(
         int SchemaVersion, string RunId, string Project, string Mode,
         int RestoreExitCode, int BuildExitCode, int ExecutionExitCode,
         bool TimedOut, long CreateMilliseconds, long CopyMilliseconds,
         long RestoreMilliseconds, long BuildMilliseconds, long ExecutionMilliseconds,
-        long CleanupMilliseconds, long TotalMilliseconds, bool SandboxRemovalSucceeded, string? Error);
+        long CleanupMilliseconds, long TotalMilliseconds, bool SandboxRemovalSucceeded, string? Error,
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        string? SnapshotHash = null,
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        string? VerifiedBy = null);
+
+    private sealed record SandboxRunResult(int ExitCode, byte[]? SuccessfulReport);
 
     public static async Task<int> RunAsync(
         string repo, string source, string project, string mode, string resultsDirectory,
-        Action<string, string, long, int>? phaseObserver = null)
+        Action<string, string, long, int>? phaseObserver = null) =>
+        (await RunCoreAsync(repo, source, project, mode, resultsDirectory, phaseObserver, null,
+            SbxWithCancellationAsync)).ExitCode;
+
+    // Only a trusted order host may call this after a fresh journal ack,
+    // current authorization and budget admission. Never call during replay.
+    // The caller supplies an existing private, exclusively controlled
+    // results root and a reviewed immutable source snapshot.
+    internal static Task<OrderGuestOutcome?> RunReservedAsync(string repo, string source, string resultsDirectory,
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
+        OrderOperationReservation reservation, Action<string, string, long, int>? phaseObserver = null,
+        CancellationToken cancellationToken = default) =>
+        RunReservedCoreAsync(repo, source, resultsDirectory, owner, acknowledged, reservation,
+            SbxWithCancellationAsync, phaseObserver, cancellationToken);
+
+    // Specific reviewed S01 entry. The preceding completed model ledger
+    // and fresh acknowledged guest ledger must describe the same transition.
+    // Authorization and the actual Persist acknowledgement remain host duties.
+    internal static Task<OrderGuestOutcome?> RunCalculatorReservedAsync(string repo, string source, string resultsDirectory,
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger completedModel,
+        DevelopmentOrderOperationLedger acknowledged, OrderOperationReservation reservation,
+        Action<string, string, long, int> phaseObserver, CancellationToken cancellationToken = default) =>
+        RunReservedCoreAsync(repo, source, resultsDirectory, owner, acknowledged, reservation,
+            SbxWithCancellationAsync, phaseObserver, cancellationToken, completedModel);
+
+    // Fixed reviewed S02 entry. The accepted predecessor view and its
+    // validated inputs are required in addition to the completed model view.
+    internal static Task<OrderGuestOutcome?> RunFormatterReservedAsync(string repo, string source, string resultsDirectory,
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acceptedLedger,
+        DevelopmentOrderOperationLedger completedModel, OrderFormatterInputs inputs,
+        DevelopmentOrderOperationLedger acknowledged, OrderOperationReservation reservation,
+        Action<string, string, long, int> phaseObserver, CancellationToken cancellationToken = default) =>
+        RunReservedCoreAsync(repo, source, resultsDirectory, owner, acknowledged, reservation,
+            SbxWithCancellationAsync, phaseObserver, cancellationToken, completedFormatterModel: completedModel,
+            acceptedCalculatorLedger: acceptedLedger, formatterInputs: inputs);
+
+    // Fixed FINAL entry: both accepted step histories and their independent
+    // observations are mandatory before consuming the guest dispatch.
+    internal static Task<OrderGuestOutcome?> RunIntegrationReservedAsync(string repo, string source, string resultsDirectory,
+        DevelopmentJobStateStore.Lease owner, OrderPairHistory history, OrderPairObservation observed,
+        DevelopmentOrderOperationLedger acknowledged, OrderOperationReservation reservation,
+        Action<string, string, long, int> phaseObserver, CancellationToken cancellationToken = default) =>
+        RunReservedCoreAsync(repo, source, resultsDirectory, owner, acknowledged, reservation,
+            SbxWithCancellationAsync, phaseObserver, cancellationToken, pairHistory: history, pairObservation: observed);
+
+    // Offline probe supplies the transport, not a result or report path.
+    // The production entry above fixes the executable and command surface.
+    internal static async Task<OrderGuestOutcome?> RunReservedCoreAsync(string repo, string source, string resultsDirectory,
+        DevelopmentJobStateStore.Lease owner, DevelopmentOrderOperationLedger acknowledged,
+        OrderOperationReservation reservation,
+        Func<TimeSpan, CancellationToken, string[], DevelopmentOrderSafetyWindow?, Task<SandboxProcess>> transport,
+        Action<string, string, long, int>? phaseObserver = null, CancellationToken cancellationToken = default,
+        DevelopmentOrderOperationLedger? completedCalculatorModel = null,
+        DevelopmentOrderOperationLedger? completedFormatterModel = null,
+        DevelopmentOrderOperationLedger? acceptedCalculatorLedger = null, OrderFormatterInputs? formatterInputs = null,
+        OrderPairHistory? pairHistory = null, OrderPairObservation? pairObservation = null)
     {
+        OrderCheck.Require((pairHistory is null) == (pairObservation is null)
+            && (pairHistory is null || completedCalculatorModel is null && completedFormatterModel is null
+                && acceptedCalculatorLedger is null && formatterInputs is null)
+            && (acknowledged.AcceptedS02 is null || pairHistory is not null), "ORDER_FINAL_VERIFIER_CONTEXT");
+        OrderCheck.Require(completedFormatterModel is null
+            ? acceptedCalculatorLedger is null && formatterInputs is null
+            : completedCalculatorModel is null && acceptedCalculatorLedger is not null && formatterInputs is not null,
+            "ORDER_VERIFIER_CONTEXT");
+        using var deadline = DevelopmentOrderDispatchDeadline.Start(acknowledged, reservation, cancellationToken);
+        string? verifier = null;
+        if (completedCalculatorModel is not null)
+        {
+            var modelClaim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            var limits = completedCalculatorModel.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+            OrderCheck.Require(acknowledged == completedCalculatorModel.Reserve(modelClaim.JobId, limits, reservation),
+                "ORDER_CALCULATOR_VERIFIER_ACK");
+            DevelopmentOrderCalculatorVerifier.RequireGuestSnapshot(owner, completedCalculatorModel, reservation, source);
+            verifier = DevelopmentOrderCalculatorVerifier.Id;
+        }
+        if (completedFormatterModel is not null)
+        {
+            var modelClaim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            var limits = completedFormatterModel.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+            OrderCheck.Require(acknowledged == completedFormatterModel.Reserve(modelClaim.JobId, limits, reservation),
+                "ORDER_FORMATTER_VERIFIER_ACK");
+            DevelopmentOrderFormatterVerifier.RequireGuestSnapshot(owner, acceptedCalculatorLedger!, completedFormatterModel,
+                formatterInputs!, reservation, source);
+            verifier = DevelopmentOrderFormatterVerifier.Id;
+        }
+        if (pairHistory is not null)
+        {
+            var pairClaim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+            var limits = pairHistory.AcceptedPair.CurrentLimits ?? throw new InvalidOperationException("Order budget missing.");
+            OrderCheck.Require(acknowledged == pairHistory.AcceptedPair.Reserve(pairClaim.JobId, limits, reservation),
+                "ORDER_FINAL_VERIFIER_ACK");
+            DevelopmentOrderIntegrationVerifier.RequireGuestSnapshot(owner, pairHistory, pairObservation!, reservation, source);
+            verifier = DevelopmentOrderIntegrationVerifier.Id;
+        }
+        var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(owner.RequireArchivedOrder().BudgetPolicy));
+        OrderCheck.Require(acknowledged.PolicyHash == policy.Sha256, "ORDER_BUDGET_POLICY_BINDING");
+        using var safety = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(policy.SafetyReserveSeconds));
+        // Lock order: issue lease first, account-wide backend lease second.
+        // Fail before dispatch consumption if another owner is active.
+        using var backend = owner.AcquireOrderSandboxBackend();
+        // Consume once in the private job root, independently of any chosen
+        // output directory. Failure after this point must never redispatch.
+        _ = deadline.Limit(TimeSpan.FromSeconds(1));
+        owner.ConsumeOrderGuestDispatch(acknowledged, reservation);
+        SandboxRunResult result = await RunCoreAsync(repo, source, "Demo.csproj", "run", resultsDirectory, phaseObserver, reservation,
+            (limit, token, arguments) => transport(limit, token, arguments, safety), deadline, safety,
+            verifier: verifier);
+        if (result.ExitCode != 0)
+            return null;
+
+        // Only a successful live return can supply the original serialized
+        // bytes. Never reopen a raw report or adopt it on recovery.
+        byte[] bytes = result.SuccessfulReport ?? throw new InvalidOperationException("ORDER_GUEST_CAPTURE_MISSING");
+        DevelopmentOrderClaim claim = owner.CurrentOrder ?? throw new InvalidOperationException("Order claim missing.");
+        safety.Check();
+        _ = owner.RequireOrderSnapshotManifest(reservation);
+        owner.RequireOrderGuestDispatch(reservation);
+        string name = RecoverySandboxName(DevelopmentOrderGuestReconciliation.RunId(reservation));
+        SandboxProcess observed = await transport(safety.Limit(TimeSpan.FromSeconds(30)), safety.Token,
+            ["inspect", name], safety);
+        safety.Check();
+        var outcome = DevelopmentOrderGuestReconciliation.Observe(claim.ArchiveHash, reservation, bytes,
+            observed.ExitCode, observed.Output, observed.Error, DateTime.UtcNow.Ticks);
+        if (outcome is null)
+            return null;
+
+        // Existing protected slot revalidates the claim/archive, manifest,
+        // dispatch and canonical bytes; exclusive flushed write/readback.
+        // If the safety window expires during the synchronous durable write,
+        // no outcome returns; an orphan is not authority to append or retry.
+        safety.Check();
+        owner.StoreOrderGuestReport(outcome, reservation, bytes);
+        safety.Check();
+        return outcome;
+    }
+
+    private static async Task<SandboxRunResult> RunCoreAsync(
+        string repo, string source, string project, string mode, string resultsDirectory,
+        Action<string, string, long, int>? phaseObserver, OrderOperationReservation? reservation,
+        Func<TimeSpan, CancellationToken, string[], Task<SandboxProcess>> transport,
+        DevelopmentOrderDispatchDeadline? deadline = null, DevelopmentOrderSafetyWindow? safety = null,
+        string? verifier = null)
+    {
+        OrderCheck.Require((reservation is null) == (safety is null), "ORDER_SAFETY_WINDOW_REQUIRED");
+        OrderCheck.Require(verifier is null || mode == "run" && project == "Demo.csproj"
+            && (verifier == DevelopmentOrderCalculatorVerifier.Id && reservation is { Step: "S01", Kind: "guest" }
+                || verifier == DevelopmentOrderFormatterVerifier.Id && reservation is { Step: "S02", Kind: "guest" }
+                || verifier == DevelopmentOrderIntegrationVerifier.Id && reservation is { Step: "FINAL", Kind: "guest" }),
+            "ORDER_VERIFIER_MODE");
+        Task<SandboxProcess> InvokeAsync(TimeSpan limit, params string[] arguments) =>
+            transport(deadline?.Limit(limit) ?? limit, deadline?.Token ?? CancellationToken.None, arguments);
+        // The safety window is independent of the business cancellation,
+        // but shared by process termination and every cleanup phase.
+        Task<SandboxProcess> CleanupAsync(TimeSpan limit, params string[] arguments) =>
+            transport(safety?.Limit(limit) ?? limit, safety?.Token ?? CancellationToken.None, arguments);
+        void CheckDeadline()
+        {
+            if (deadline is not null)
+                _ = deadline.Limit(TimeSpan.FromSeconds(1));
+        }
+
+        CheckDeadline();
         ValidateMode(mode);
         ValidateProjectPath(project);
         if (!Path.IsPathFullyQualified(source) || !Path.IsPathFullyQualified(resultsDirectory))
@@ -72,17 +248,28 @@ internal static class DevelopmentSandboxRunner
             throw new InvalidOperationException("Snapshot source directory does not exist.");
 
         string[] sourceFiles = InspectSnapshot(source, project);
-        string id = Guid.NewGuid().ToString("N");
-        string sandbox = "hami-code-" + id[..12];
+        string id = reservation is null ? Guid.NewGuid().ToString("N")
+            : DevelopmentOrderGuestReconciliation.RunId(reservation);
+        if (reservation is not null)
+            DevelopmentOrderSnapshot.Require(source, project, reservation.SnapshotHash);
+        string sandbox = RecoverySandboxName(id);
         string stage = Path.Combine(resultsDirectory, "staging", "hami-code-" + id);
         string reportDir = Path.Combine(resultsDirectory, "reports", "hami-code-" + id);
         string guest = "/home/agent/workspace/hami-code-" + id;
         string guestProject = project.Replace('\\', '/');
+        if (reservation is not null)
+            ReserveDispatchSlot(resultsDirectory, id, stage, reportDir);
         Directory.CreateDirectory(stage);
         Directory.CreateDirectory(reportDir);
 
+        string? verifiedSnapshotHash = null;
+        string? verifiedBy = null;
+        string[]? expectedGuestRecords = null;
         bool createAttempted = false;
+        bool createConfirmed = false;
+        string? backendIdentity = null;
         bool sandboxRemovalSucceeded = false;
+        bool transportTerminationUnconfirmed = false;
         bool timedOut = false;
         int restore = -1, build = -1, execution = -1;
         long createMs = 0, copyMs = 0, restoreMs = 0, buildMs = 0, executionMs = 0;
@@ -107,16 +294,32 @@ internal static class DevelopmentSandboxRunner
         {
             foreach (string relative in sourceFiles)
             {
+                CheckDeadline();
                 string from = Path.Combine(source, relative);
                 string to = Path.Combine(stage, relative);
                 Directory.CreateDirectory(Path.GetDirectoryName(to)!);
                 File.Copy(from, to);
             }
 
+            if (reservation is not null)
+            {
+                // Hash the actual copied files, not just the input directory.
+                // Never label a mismatched staging snapshot as verified.
+                expectedGuestRecords = DevelopmentOrderSnapshot.RequireGuestRecords(stage, project, reservation.SnapshotHash);
+            }
+
             Stopwatch watch = Stopwatch.StartNew();
             ProgressMessage($"Erstelle MicroVM {sandbox} aus {Template} (4 vCPU, 4 GiB) ...");
+            if (reservation is not null)
+            {
+                // Exact read-only absence check immediately before create.
+                // Existing name or ambiguous inspect is not ours to remove.
+                SandboxProcess existing = await InvokeAsync(TimeSpan.FromSeconds(30), "inspect", sandbox);
+                if (!IsConfirmedAbsent(id, existing.ExitCode, existing.Output, existing.Error))
+                    throw new InvalidOperationException("Reserved sandbox name absence not confirmed.");
+            }
             createAttempted = true;
-            EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(90),
+            EnsureSuccess(await InvokeAsync(TimeSpan.FromSeconds(90),
                 "create", "--name", sandbox, "--template", Template,
                 "--pull", "never", "--cpus", "4", "--memory", "4g",
                 "--skills", "off", "--static-mcp", "none",
@@ -126,29 +329,38 @@ internal static class DevelopmentSandboxRunner
                 "--env", "AZURE_CLIENT_SECRET=",
                 "--env", "AWS_SECRET_ACCESS_KEY=", "--env", "SSH_AUTH_SOCK=",
                 "shell"), "Create sandbox");
+            createConfirmed = true;
+            if (reservation is not null)
+            {
+                // Capture backend identity before any guest work. The local
+                // backend is a trusted dependency; exclusive management of
+                // this namespace is required (inspect/create is not atomic).
+                backendIdentity = RequireBackendIdentity(sandbox,
+                    await InvokeAsync(TimeSpan.FromSeconds(30), "inspect", sandbox, "--json"));
+            }
             createMs = watch.ElapsedMilliseconds;
             ProgressMessage($"MicroVM bereit ({createMs / 1000.0:F2} s).", "MICROVM_READY");
 
             ProgressMessage("Prüfe Isolation: Mounts, Secrets, MCP, Ports, Netzwerk ...");
-            SandboxProcess inspect = await SbxAsync(TimeSpan.FromSeconds(30),
+            SandboxProcess inspect = await InvokeAsync(TimeSpan.FromSeconds(30),
                 "inspect", sandbox);
             ValidateInspect(inspect, sandbox);
             // No guest network approvals, no source/package retrieval from network.
             foreach (string endpoint in new[] { "api.github.com:443", "1.1.1.1:443", "10.0.0.1:443" })
             {
-                SandboxProcess policy = await SbxAsync(TimeSpan.FromSeconds(20),
+                SandboxProcess policy = await InvokeAsync(TimeSpan.FromSeconds(20),
                     "policy", "check", "network", "--sandbox", sandbox, endpoint);
                 ValidateDeny(policy, endpoint);
             }
 
             ProgressMessage("Prüfe Gast-Umgebung auf nichtleere Credential-Variablen ...");
-            SandboxProcess credentialCheck = await SbxAsync(TimeSpan.FromSeconds(20),
+            SandboxProcess credentialCheck = await InvokeAsync(TimeSpan.FromSeconds(20),
                 "exec", sandbox, "/bin/sh", "-c", GuestEnvCheckScript);
             ValidateGuestCredentialPreflight(credentialCheck);
             ProgressMessage("Gast-Umgebung bestätigt: keine nichtleeren Credential-Variablen.");
             ProgressMessage("Isolation bestätigt: kein Host-Mount, keine Secrets, Netzwerk gesperrt.", "ISOLATION_VERIFIED");
             ProgressMessage("Prüfe .NET SDK 11.0.100 im Gast ...");
-            SandboxProcess sdk = await SbxAsync(TimeSpan.FromSeconds(40),
+            SandboxProcess sdk = await InvokeAsync(TimeSpan.FromSeconds(40),
                 "exec", sandbox, "/home/agent/bin/dotnet", "--version");
             if (sdk.ExitCode != 0
                 || !sdk.Output.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
@@ -158,23 +370,34 @@ internal static class DevelopmentSandboxRunner
 
             ProgressMessage($"Übertrage {sourceFiles.Length} Snapshot-Dateien in die MicroVM ...");
             watch.Restart();
-            EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(75),
+            EnsureSuccess(await InvokeAsync(TimeSpan.FromSeconds(75),
                 "cp", stage, sandbox + ":/home/agent/workspace/"), "Transfer snapshot");
-            EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(35),
+            EnsureSuccess(await InvokeAsync(TimeSpan.FromSeconds(35),
                 "exec", "--user", "root", sandbox, "chown", "-R", "agent:agent", guest),
                 "Set guest snapshot owner");
             copyMs = watch.ElapsedMilliseconds;
             ProgressMessage($"Snapshot übertragen und Rechte gesetzt ({copyMs / 1000.0:F2} s).", "SNAPSHOT_TRANSFERRED");
 
+            if (reservation is not null)
+            {
+                SandboxProcess observedSnapshot = await InvokeAsync(TimeSpan.FromSeconds(30),
+                    "exec", sandbox, "/bin/sh", "-c", GuestSnapshotCheckScript, "hami-snapshot", guest);
+                DevelopmentOrderSnapshot.RequireGuestRecords(
+                    expectedGuestRecords ?? throw new InvalidOperationException("Expected snapshot missing."),
+                    observedSnapshot.ExitCode, observedSnapshot.Output, observedSnapshot.Error);
+                verifiedSnapshotHash = reservation.SnapshotHash;
+                ProgressMessage("Gast-Snapshot bestätigt.", "SNAPSHOT_VERIFIED");
+            }
+
             // No shell interpolation: the project name is a validated relative
             // path and each component of the dotnet command is a fixed argv item.
-            EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(20),
+            EnsureSuccess(await InvokeAsync(TimeSpan.FromSeconds(20),
                 "exec", sandbox, "mkdir", "-p", "/home/agent/empty-nuget-source"),
                 "Prepare offline NuGet source");
 
             ProgressMessage("Offline-Restore gestartet ...");
             watch.Restart();
-            SandboxProcess restored = await SbxAsync(TimeSpan.FromSeconds(75),
+            SandboxProcess restored = await InvokeAsync(TimeSpan.FromSeconds(75),
                 "exec", "--workdir", guest, sandbox, "/home/agent/bin/dotnet",
                 "restore", guestProject, "--source", "/home/agent/empty-nuget-source",
                 "-p:NuGetAudit=false", "--nologo");
@@ -187,7 +410,7 @@ internal static class DevelopmentSandboxRunner
             {
                 ProgressMessage("Release-Build gestartet ...");
                 watch.Restart();
-                SandboxProcess built = await SbxAsync(TimeSpan.FromSeconds(120),
+                SandboxProcess built = await InvokeAsync(TimeSpan.FromSeconds(120),
                     "exec", "--workdir", guest, sandbox, "/home/agent/bin/dotnet",
                     "build", guestProject, "-c", "Release", "--no-restore", "--nologo");
                 buildMs = watch.ElapsedMilliseconds;
@@ -208,7 +431,7 @@ internal static class DevelopmentSandboxRunner
                 SandboxProcess checkedCode;
                 try
                 {
-                    checkedCode = await SbxAsync(TimeSpan.FromSeconds(60),
+                    checkedCode = await InvokeAsync(TimeSpan.FromSeconds(60),
                         ["exec", "--workdir", guest, sandbox, "/home/agent/bin/dotnet", .. arguments]);
                 }
                 finally
@@ -217,9 +440,41 @@ internal static class DevelopmentSandboxRunner
                     executionMs = watch.ElapsedMilliseconds;
                 }
                 execution = checkedCode.ExitCode;
+                if (verifier is not null && execution == 0)
+                {
+                    bool matches = verifier switch
+                    {
+                        DevelopmentOrderCalculatorVerifier.Id => DevelopmentOrderCalculatorVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error),
+                        DevelopmentOrderFormatterVerifier.Id => DevelopmentOrderFormatterVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error),
+                        DevelopmentOrderIntegrationVerifier.Id => DevelopmentOrderIntegrationVerifier.MatchesOutput(checkedCode.Output, checkedCode.Error),
+                        _ => false
+                    };
+                    if (matches)
+                        verifiedBy = verifier;
+                    else
+                        error = verifier switch
+                        {
+                            DevelopmentOrderCalculatorVerifier.Id => "ORDER_CALCULATOR_VERIFIER_STDOUT",
+                            DevelopmentOrderFormatterVerifier.Id => "ORDER_FORMATTER_VERIFIER_STDOUT",
+                            _ => "ORDER_FINAL_VERIFIER_STDOUT"
+                        };
+                }
                 await WriteOutputAsync(reportDir, "execution.log", checkedCode);
                 ProgressMessage($"Ausführung beendet: Exitcode {execution} ({executionMs / 1000.0:F2} s).", "EXECUTION_COMPLETED", execution);
             }
+            CheckDeadline();
+        }
+        catch (SandboxProcessTerminationUnconfirmedException)
+        {
+            transportTerminationUnconfirmed = true;
+            error = "ORDER_SANDBOX_PROCESS_TERMINATION_UNCONFIRMED";
+            ProgressMessage(error, "OPERATION_FAULT", -1);
+        }
+        catch (OperationCanceledException) when (deadline is not null)
+        {
+            timedOut = deadline.Remaining == TimeSpan.Zero;
+            error = timedOut ? "ORDER_OPERATION_DISPATCH_EXPIRED" : "ORDER_OPERATION_CANCELLED";
+            ProgressMessage(error, timedOut ? "OPERATION_TIMEOUT" : "OPERATION_CANCELLED", -1);
         }
         catch (TimeoutException ex)
         {
@@ -236,12 +491,30 @@ internal static class DevelopmentSandboxRunner
         {
             ProgressMessage($"Bereinige MicroVM {sandbox} und lokale Staging-Dateien ...");
             Stopwatch cleanup = Stopwatch.StartNew();
-            if (createAttempted)
+            safety?.Check();
+            // V1 preserves its existing cleanup behavior. For an order,
+            // an ambiguous create may refer to a competing name: leave it
+            // pending for reconciliation instead of deleting by name.
+            if (!transportTerminationUnconfirmed && (reservation is null ? createAttempted : createConfirmed))
             {
                 try
                 {
-                    EnsureSuccess(await SbxAsync(TimeSpan.FromSeconds(90),
+                    if (reservation is not null)
+                    {
+                        if (backendIdentity is null)
+                            throw new InvalidOperationException("ORDER_SANDBOX_OWNERSHIP_UNKNOWN");
+                        string currentIdentity = RequireBackendIdentity(sandbox,
+                            await CleanupAsync(TimeSpan.FromSeconds(30), "inspect", sandbox, "--json"));
+                        OrderCheck.Require(currentIdentity == backendIdentity, "ORDER_SANDBOX_IDENTITY_CHANGED");
+                    }
+                    EnsureSuccess(await CleanupAsync(TimeSpan.FromSeconds(90),
                         "rm", "--force", sandbox), "Remove ephemeral sandbox");
+                    if (reservation is not null)
+                    {
+                        SandboxProcess removed = await CleanupAsync(TimeSpan.FromSeconds(30), "inspect", sandbox);
+                        OrderCheck.Require(IsConfirmedAbsent(id, removed.ExitCode, removed.Output, removed.Error),
+                            "ORDER_SANDBOX_REMOVAL_UNCONFIRMED");
+                    }
                     sandboxRemovalSucceeded = true;
                 }
                 catch (Exception ex)
@@ -250,24 +523,37 @@ internal static class DevelopmentSandboxRunner
                 }
             }
             cleanupMs = cleanup.ElapsedMilliseconds;
-            if (Directory.Exists(stage))
+            safety?.Check();
+            // Local synchronous filesystem calls are not forcibly cancellable.
+            // If they exhaust the reserve, do not return success. Preserve
+            // staging when a potentially active local process still owns it.
+            if (!transportTerminationUnconfirmed && Directory.Exists(stage))
                 Directory.Delete(stage, recursive: true);
+            safety?.Check();
             ProgressMessage(sandboxRemovalSucceeded
-                ? $"MicroVM entfernt: sbx rm Exitcode 0 ({cleanupMs / 1000.0:F2} s)."
+                ? $"MicroVM entfernt ({cleanupMs / 1000.0:F2} s)."
                 : $"ACHTUNG: MicroVM-Entfernung nicht bestätigt ({cleanupMs / 1000.0:F2} s).",
                 sandboxRemovalSucceeded ? "CLEANUP_CONFIRMED" : "CLEANUP_UNCONFIRMED",
                 sandboxRemovalSucceeded ? 0 : 1);
         }
 
-        var report = new SandboxRunReport(1, id, guestProject, mode, restore, build,
+        var report = new SandboxRunReport(reservation is null ? 1 : verifier is null ? 4 : 5, id, guestProject, mode, restore, build,
             execution, timedOut, createMs, copyMs, restoreMs, buildMs, executionMs, cleanupMs, lifecycle.ElapsedMilliseconds,
-            sandboxRemovalSucceeded, error);
+            sandboxRemovalSucceeded, error, verifiedSnapshotHash, verifiedBy);
         string reportPath = Path.Combine(reportDir, "report.json");
-        await File.WriteAllTextAsync(reportPath,
-            JsonSerializer.Serialize(report, new JsonSerializerOptions(JsonSerializerDefaults.Web)
-            {
-                WriteIndented = true
-            }));
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true };
+        byte[]? reportBytes = null;
+        if (reservation is null)
+            await File.WriteAllTextAsync(reportPath, JsonSerializer.Serialize(report, options));
+        else
+        {
+            reportBytes = JsonSerializer.SerializeToUtf8Bytes(report, options);
+            // Raw diagnostic copy only. Protected capture below uses these
+            // exact live bytes, not a subsequent path lookup.
+            await File.WriteAllBytesAsync(reportPath, reportBytes, safety!.Token);
+        }
+
+        safety?.Check();
         ProgressMessage($"Auftrag beendet ({report.TotalMilliseconds / 1000.0:F2} s), Bericht erstellt.");
         if (phaseObserver is null)
         {
@@ -276,8 +562,49 @@ internal static class DevelopmentSandboxRunner
             if (error is not null) Console.Error.WriteLine(error);
             ShowResultLog(reportDir, mode, restore, build, timedOut);
         }
-        return error is null && sandboxRemovalSucceeded && restore == 0 && build == 0
-            && (mode == "build" || execution == 0) ? 0 : 1;
+        bool succeeded = error is null && sandboxRemovalSucceeded && restore == 0 && build == 0
+            && (mode == "build" || execution == 0)
+            && (verifier is null || verifiedBy == verifier);
+        safety?.Check();
+        return new(succeeded ? 0 : 1, succeeded ? reportBytes : null);
+    }
+
+    private static bool EntryExists(string path)
+    {
+        try
+        {
+            _ = File.GetAttributes(path);
+            return true;
+        }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
+    }
+
+    private static void ReserveDispatchSlot(string resultsDirectory, string id, string stage, string reportDir)
+    {
+        if (!Directory.Exists(resultsDirectory))
+            throw new InvalidOperationException("Reserved sandbox requires an existing private results root.");
+        CheckNoReparseAncestors(resultsDirectory);
+        foreach (string path in new[] { stage, reportDir })
+        {
+            string parent = Path.GetDirectoryName(path)!;
+            if (EntryExists(parent))
+            {
+                if (!Directory.Exists(parent))
+                    throw new InvalidOperationException("Reserved sandbox output parent is not a directory.");
+                CheckNoReparseAncestors(parent);
+            }
+            if (EntryExists(path))
+                throw new InvalidOperationException("Reserved sandbox output already exists.");
+        }
+
+        // Persistent one-shot guard for this trusted results root and short
+        // name. Not a workflow journal or proof of global name ownership.
+        // Never remove/reuse the slot after a fault or successful run.
+        string slot = Path.Combine(resultsDirectory, "." + RecoverySandboxName(id) + ".dispatch");
+        using var stream = new FileStream(slot, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        stream.Write(Encoding.UTF8.GetBytes(id));
+        stream.Flush(flushToDisk: true);
     }
 
     private static void Progress(Stopwatch elapsed, string message)
@@ -451,6 +778,83 @@ internal static class DevelopmentSandboxRunner
             throw new InvalidOperationException("Recovery sandbox absence not confirmed.");
     }
 
+    // The caller supplies an already authenticated historical descriptor
+    // under the exclusive order lease. This adapter cannot adopt arbitrary
+    // report files, create a VM, or append an event.
+    internal static async Task<OrderGuestOutcome> RequireProtectedGuestAsync(
+        DevelopmentJobStateStore.Lease owner, OrderGuestOutcome recorded,
+        CancellationToken cancellationToken = default) =>
+        (await RequireProtectedGuestsAsync(owner, [recorded], cancellationToken))[0];
+
+    // One explicitly authorized read-only reentry pass, not a new business
+    // budget or a retry loop. The host supplies journal-derived descriptors.
+    internal static Task<OrderGuestOutcome[]> RequireProtectedGuestsAsync(
+        DevelopmentJobStateStore.Lease owner, IReadOnlyList<OrderGuestOutcome> recorded,
+        CancellationToken cancellationToken = default) =>
+        RequireProtectedGuestsCoreAsync(owner, recorded, SbxWithCancellationAsync, cancellationToken);
+
+    internal static async Task<OrderGuestOutcome[]> RequireProtectedGuestsCoreAsync(
+        DevelopmentJobStateStore.Lease owner, IReadOnlyList<OrderGuestOutcome> recorded,
+        Func<TimeSpan, CancellationToken, string[], DevelopmentOrderSafetyWindow?, Task<SandboxProcess>> transport,
+        CancellationToken cancellationToken = default, TimeProvider? clock = null)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var policy = DevelopmentOrderBudgetPolicy.Parse(Encoding.UTF8.GetBytes(owner.RequireArchivedOrder().BudgetPolicy));
+        using var safety = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(policy.SafetyReserveSeconds), clock);
+        safety.Start();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(safety.Token, cancellationToken);
+        void Check()
+        {
+            safety.Check();
+            linked.Token.ThrowIfCancellationRequested();
+        }
+
+        // Copy the trusted descriptor list once. Bound work by the archived
+        // profile, reject duplicate operation IDs before any backend call.
+        OrderCheck.Require(recorded.Count > 0 && recorded.Count <= policy.Maximums.Guests,
+            "ORDER_GUEST_RECONCILIATION_COUNT");
+        OrderGuestOutcome[] items = recorded.ToArray();
+        OrderCheck.Require(items.Length > 0 && items.Length <= policy.Maximums.Guests
+            && items.Select(x => x.Reservation.OperationId).Distinct(StringComparer.Ordinal).Count() == items.Length,
+            "ORDER_GUEST_RECONCILIATION_COUNT");
+        using var backend = owner.AcquireOrderSandboxBackend();
+        var originals = new byte[items.Length][];
+        for (int i = 0; i < items.Length; i++)
+        {
+            Check();
+            originals[i] = owner.RequireOrderGuestReport(items[i], items[i].Reservation);
+        }
+
+        var observations = new OrderGuestOutcome[items.Length];
+        for (int i = 0; i < items.Length; i++)
+        {
+            Check();
+            OrderGuestOutcome item = items[i];
+            string runId = DevelopmentOrderGuestReconciliation.RunId(item.Reservation);
+            SandboxProcess result = await transport(safety.Limit(TimeSpan.FromSeconds(30)), linked.Token,
+                ["inspect", RecoverySandboxName(runId)], safety);
+            Check();
+            byte[] readback = owner.RequireOrderGuestReport(item, item.Reservation);
+            OrderCheck.Require(originals[i].AsSpan().SequenceEqual(readback), "ORDER_GUEST_REPORT_CHANGED");
+            var observed = DevelopmentOrderGuestReconciliation.Observe(item.ArchiveHash, item.Reservation,
+                readback, result.ExitCode, result.Output, result.Error, DateTime.UtcNow.Ticks);
+            DevelopmentOrderGuestReconciliation.RequireObserved(item, observed);
+            observations[i] = observed ?? throw new InvalidOperationException("ORDER_GUEST_RECONCILIATION");
+        }
+
+        // Earlier evidence must also survive later observations. No partial
+        // batch is returned and no journal event is appended here.
+        for (int i = 0; i < items.Length; i++)
+        {
+            Check();
+            byte[] readback = owner.RequireOrderGuestReport(items[i], items[i].Reservation);
+            OrderCheck.Require(originals[i].AsSpan().SequenceEqual(readback), "ORDER_GUEST_REPORT_CHANGED");
+        }
+
+        Check();
+        return observations;
+    }
+
     private static string RecoverySandboxName(string runId)
     {
         if (!DevelopmentPublicationPolicy.IsSha(runId, 32) || runId != runId.ToLowerInvariant())
@@ -461,7 +865,7 @@ internal static class DevelopmentSandboxRunner
     internal static bool IsConfirmedAbsent(string runId, int exitCode, string output, string error)
     {
         string name = RecoverySandboxName(runId);
-        if (exitCode == 0)
+        if (exitCode == 0 || output.Length >= MaxOutputChars || error.Length >= MaxOutputChars)
             return false;
         // Observed on HaMi11: sbx reports the exact sandbox name followed
         // by 'not found', with optional wrapping and the fixed CLI hint.
@@ -470,6 +874,39 @@ internal static class DevelopmentSandboxRunner
         return Regex.IsMatch(diagnostic, @"\Aerror:\s+sandbox\s+'" + Regex.Escape(name)
             + @"'\s+not\s+found(?:\s+try:\s+sbx\s+ls)?\s*\z",
             RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+    }
+
+    // The local CLI documents JSON inspection, but name-based removal
+    // is not an atomic compare-and-delete. Never infer ownership from a name
+    // or fall back to removal when the identity is missing or changed.
+    private static string RequireBackendIdentity(string sandbox, SandboxProcess result)
+    {
+        OrderCheck.Require(result.ExitCode == 0 && result.Error.Length == 0
+            && result.Output.Length is > 0 and < MaxOutputChars, "ORDER_SANDBOX_IDENTITY_UNKNOWN");
+        try
+        {
+            using var document = JsonDocument.Parse(result.Output);
+            JsonElement root = document.RootElement;
+            OrderCheck.Require(root.ValueKind == JsonValueKind.Object, "ORDER_SANDBOX_IDENTITY_UNKNOWN");
+            var fields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (JsonProperty property in root.EnumerateObject())
+                OrderCheck.Require(fields.Add(property.Name), "ORDER_SANDBOX_IDENTITY_UNKNOWN");
+            OrderCheck.Require(root.TryGetProperty("name", out JsonElement name)
+                && name.ValueKind == JsonValueKind.String && name.GetString() == sandbox,
+                "ORDER_SANDBOX_IDENTITY_UNKNOWN");
+            if (!root.TryGetProperty("id", out JsonElement id) || id.ValueKind != JsonValueKind.String)
+                throw new InvalidOperationException("ORDER_SANDBOX_IDENTITY_UNKNOWN");
+            string? identity = id.GetString();
+            if (identity is not { Length: >= 8 and <= 128 }
+                || !identity.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_')
+                || identity == sandbox)
+                throw new InvalidOperationException("ORDER_SANDBOX_IDENTITY_UNKNOWN");
+            return identity;
+        }
+        catch (JsonException)
+        {
+            throw new InvalidOperationException("ORDER_SANDBOX_IDENTITY_UNKNOWN");
+        }
     }
 
     private static void ValidateInspect(SandboxProcess result, string sandbox)
@@ -542,8 +979,23 @@ internal static class DevelopmentSandboxRunner
         DevelopmentChildEnvironment.RestrictSandboxProcess(info);
     }
 
-    private static async Task<SandboxProcess> SbxAsync(TimeSpan limit, params string[] arguments)
+    private static Task<SandboxProcess> SbxAsync(TimeSpan limit, params string[] arguments) =>
+        SbxWithCancellationAsync(limit, CancellationToken.None, arguments);
+
+    private static Task<SandboxProcess> SbxWithCancellationAsync(TimeSpan limit,
+        CancellationToken cancellationToken, string[] arguments) =>
+        SbxWithCancellationAsync(limit, cancellationToken, arguments, null);
+
+    private sealed class SandboxProcessTerminationUnconfirmedException : InvalidOperationException
     {
+    }
+
+    private static async Task<SandboxProcess> SbxWithCancellationAsync(TimeSpan limit,
+        CancellationToken cancellationToken, string[] arguments, DevelopmentOrderSafetyWindow? safety)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(limit);
         var info = new ProcessStartInfo("sbx")
         {
             UseShellExecute = false,
@@ -554,21 +1006,64 @@ internal static class DevelopmentSandboxRunner
         ScrubHostCredentials(info);
         info.ArgumentList.Add("--no-input");
         foreach (string argument in arguments) info.ArgumentList.Add(argument);
+        cts.Token.ThrowIfCancellationRequested();
         using Process process = Process.Start(info)
             ?? throw new InvalidOperationException("sbx CLI is not available.");
-        using var cts = new CancellationTokenSource(limit);
-        Task<string> stdout = ReadBoundedAsync(process.StandardOutput, cts.Token);
-        Task<string> stderr = ReadBoundedAsync(process.StandardError, cts.Token);
+        return await ObserveStartedProcessAsync(process, cts.Token, cancellationToken, arguments[0], safety);
+    }
+
+    // Test assembly only: observe an already-started controlled child with
+    // the same cancellation/termination path as the reserved sbx transport.
+    // No executable selection or additional production command.
+    internal static async Task<SandboxProcess> ObserveReservedProcessForProbeAsync(Process process,
+        TimeSpan limit, CancellationToken cancellationToken, DevelopmentOrderSafetyWindow safety)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(limit);
+        return await ObserveStartedProcessAsync(process, cts.Token, cancellationToken, "offline-probe", safety);
+    }
+
+    private static async Task<SandboxProcess> ObserveStartedProcessAsync(Process process,
+        CancellationToken phaseToken, CancellationToken cancellationToken, string operation,
+        DevelopmentOrderSafetyWindow? safety)
+    {
+        Task<string> stdout = ReadBoundedAsync(process.StandardOutput, phaseToken);
+        Task<string> stderr = ReadBoundedAsync(process.StandardError, phaseToken);
         try
         {
-            await process.WaitForExitAsync(cts.Token);
+            await process.WaitForExitAsync(phaseToken);
+            if (safety is not null)
+                await Task.WhenAll(stdout, stderr).WaitAsync(phaseToken);
             return new SandboxProcess(process.ExitCode, await stdout, await stderr);
         }
         catch (OperationCanceledException)
         {
-            if (!process.HasExited) process.Kill(entireProcessTree: true);
-            await process.WaitForExitAsync();
-            throw new TimeoutException("sbx operation timed out: " + arguments[0]);
+            if (safety is null)
+            {
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync();
+            }
+            else
+            {
+                // One best-effort local kill. The OS Kill call itself is not
+                // cancellable; waiting for exit must not open another window.
+                try
+                {
+                    safety.Start();
+                    if (!process.HasExited)
+                        process.Kill(entireProcessTree: true);
+                    await process.WaitForExitAsync(safety.Token);
+                    safety.Check();
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception
+                    or OperationCanceledException or TimeoutException or NotSupportedException)
+                {
+                    throw new SandboxProcessTerminationUnconfirmedException();
+                }
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new TimeoutException("sbx operation timed out: " + operation);
         }
     }
 
@@ -655,6 +1150,291 @@ internal static class DevelopmentSandboxRunner
             "api.github.com:443"));
         ExpectRejected(() => ValidateDeny(new SandboxProcess(1, "Allowed: api.github.com:443", ""),
             "api.github.com:443"));
+        ReservedRunnerSelfTestAsync().GetAwaiter().GetResult();
+    }
+
+    private static async Task ReservedRunnerSelfTestAsync()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "hami-reserved-runner-" + Guid.NewGuid().ToString("N"));
+        string repo = Path.Combine(root, "repo");
+        string source = Path.Combine(root, "source");
+        Directory.CreateDirectory(repo);
+        Directory.CreateDirectory(source);
+        try
+        {
+            File.WriteAllText(Path.Combine(source, "Demo.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"/>");
+            File.WriteAllText(Path.Combine(source, "Program.cs"), "Console.WriteLine(42);");
+            long now = DateTime.UtcNow.Ticks;
+            string snapshotHash = DevelopmentOrderSnapshot.Capture(source, "Demo.csproj");
+            var reservation = new OrderOperationReservation(4, new string('a', 32) + ":1",
+                "S01", "guest", 30, now, null, snapshotHash);
+            DevelopmentOrderSnapshot.SelfTest(source);
+            string rejectedResults = Path.Combine(root, "wrong-snapshot");
+            Directory.CreateDirectory(rejectedResults);
+            bool snapshotRejected = false;
+            using var rejectedSafety = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(150));
+            try
+            {
+                _ = await RunCoreAsync(repo, source, "Demo.csproj", "run", rejectedResults,
+                    (_, _, _, _) => { }, reservation with { SnapshotHash = new string('F', 64) },
+                    (_, _, _) => throw new InvalidOperationException("Unexpected transport invocation."), safety: rejectedSafety);
+            }
+            catch (InvalidOperationException ex) when (ex.Message == "ORDER_SNAPSHOT_MISMATCH") { snapshotRejected = true; }
+            if (!snapshotRejected || Directory.EnumerateFileSystemEntries(rejectedResults).Any())
+                throw new InvalidOperationException("Wrong snapshot reached dispatch.");
+            string id = DevelopmentOrderGuestReconciliation.RunId(reservation);
+            string name = RecoverySandboxName(id);
+            string absent = "error: sandbox '" + name + "' not found";
+            string healthy = string.Join('\n', new[]
+            {
+                "Name: " + name, "Agent: shell", "Workspace: -", "Clone source: -",
+                "Configured host mounts: none", "Secrets: none", "MCP mode: static",
+                "MCP servers: none", "Ports: none published", "Network policy: global (local policy)",
+                "Auth mode: not configured", "State: running"
+            });
+
+            string[] expectedRecords = DevelopmentOrderSnapshot.RequireGuestRecords(source, "Demo.csproj", snapshotHash);
+            string guestOutput = string.Join('\0', expectedRecords.Reverse()) + "\0"
+                + DevelopmentOrderSnapshot.GuestEndMarker + "\0";
+            foreach (string scenario in new[]
+            {
+                "existing", "backend", "ambiguous-create", "guest-modified", "guest-extra",
+                "guest-missing", "guest-link", "guest-truncated", "guest-stderr",
+                "identity-missing", "identity-duplicate", "identity-changed", "identity-backend",
+                "removal-unconfirmed", "cancel-after-identity", "cancel-during-create",
+                "deadline-before-restore", "cancel-during-restore", "cleanup-reserve-shortened",
+                "cleanup-reserve-exhausted", "termination-unconfirmed", "success"
+            })
+            {
+                string results = Path.Combine(root, scenario);
+                Directory.CreateDirectory(results);
+                var calls = new List<string[]>();
+                int identityChecks = 0;
+                bool removed = false;
+                bool interrupted = scenario is "cancel-after-identity" or "cancel-during-create"
+                    or "deadline-before-restore" or "cancel-during-restore";
+                var clock = new RunnerClock(now);
+                using var stop = new CancellationTokenSource();
+                // This fixture constructs only the already-acknowledged view;
+                // the separate ledger tests cover admission and journal replay.
+                var limits = new OrderOperationLimits(4, 5, 1800, 2, 2, 2, 2, 1);
+                var acknowledged = new DevelopmentOrderOperationLedger(Pending: reservation,
+                    StartedUtcTicks: now, LastUtcTicks: now, CurrentLimits: limits, FinalReserveSeconds: 30);
+                using var deadline = interrupted
+                    ? DevelopmentOrderDispatchDeadline.Start(acknowledged, reservation, stop.Token, clock)
+                    : null;
+                using var safety = new DevelopmentOrderSafetyWindow(
+                    TimeSpan.FromSeconds(scenario.StartsWith("cleanup-reserve-", StringComparison.Ordinal) ? 40 : 150), clock);
+                var callLimits = new List<TimeSpan>();
+                var callTokens = new List<CancellationToken>();
+                string Identity(string identity) => JsonSerializer.Serialize(new { name, id = identity });
+                Task<SandboxProcess> FakeTransport(TimeSpan limit, CancellationToken token, string[] args)
+                {
+                    token.ThrowIfCancellationRequested();
+                    calls.Add(args);
+                    callLimits.Add(limit);
+                    callTokens.Add(token);
+                    if (scenario == "deadline-before-restore" && calls.Count == 1)
+                        clock.Timestamp += TimeSpan.FromSeconds(5).Ticks;
+                    if ((scenario == "cancel-during-create" && args[0] == "create")
+                        || (scenario == "cancel-during-restore" && args.Contains("restore", StringComparer.Ordinal)))
+                    {
+                        stop.Cancel();
+                        token.ThrowIfCancellationRequested();
+                    }
+                    if (scenario == "termination-unconfirmed" && args.Contains("restore", StringComparer.Ordinal))
+                        throw new SandboxProcessTerminationUnconfirmedException();
+                    SandboxProcess response = new(0, "", "");
+                    switch (args[0])
+                    {
+                        case "inspect":
+                            if (args.Contains("--json", StringComparer.Ordinal))
+                            {
+                                identityChecks++;
+                                response = scenario switch
+                                {
+                                    "identity-missing" => new(0, JsonSerializer.Serialize(new { name }), ""),
+                                    "identity-duplicate" => new(0, Identity("sandbox-id-original")[..^1] + ",\"id\":\"sandbox-id-other\"}", ""),
+                                    "identity-changed" when identityChecks > 1 => new(0, Identity("sandbox-id-other"), ""),
+                                    "identity-backend" when identityChecks > 1 => new(1, "", "backend unavailable"),
+                                    _ => new(0, Identity("sandbox-id-original"), "")
+                                };
+                            }
+                            else
+                                response = calls.Count == 1
+                                    ? scenario == "existing" ? new(0, healthy, "")
+                                        : scenario == "backend" ? new(1, "", "backend unavailable")
+                                        : new(1, "", absent)
+                                    : removed && scenario != "removal-unconfirmed" ? new(1, "", absent) : new(0, healthy, "");
+                            break;
+                        case "create":
+                            if (scenario == "ambiguous-create")
+                                response = new(1, "", "unconfirmed create");
+                            break;
+                        case "rm":
+                            removed = true;
+                            break;
+                        case "policy":
+                            response = new(1, "Denied: " + args[^1] + " default deny", "");
+                            break;
+                        case "exec":
+                            if (args.Contains(GuestEnvCheckScript, StringComparer.Ordinal))
+                                response = new(0, "CREDENTIAL_ENV=clean", "");
+                            else if (args.Contains("--version", StringComparer.Ordinal))
+                                response = new(0, "11.0.100", "");
+                            else if (args.Contains(GuestSnapshotCheckScript, StringComparer.Ordinal))
+                            {
+                                string observed = scenario switch
+                                {
+                                    "guest-modified" => guestOutput.Replace(expectedRecords[0],
+                                        new string('f', 64) + expectedRecords[0][64..], StringComparison.Ordinal),
+                                    "guest-extra" => expectedRecords[0] + "\0" + guestOutput,
+                                    "guest-missing" => guestOutput.Replace(expectedRecords[0] + "\0", "", StringComparison.Ordinal),
+                                    "guest-link" => "INVALID\0" + guestOutput,
+                                    "guest-truncated" => guestOutput[..^1],
+                                    _ => guestOutput
+                                };
+                                response = new(0, observed, scenario == "guest-stderr" ? "unexpected stderr" : "");
+                            }
+                            break;
+                    }
+                    if (scenario == "cancel-after-identity" && identityChecks == 1 && !removed
+                        && args.Contains("--json", StringComparer.Ordinal))
+                        stop.Cancel();
+                    if (scenario == "deadline-before-restore" && args.Contains(GuestSnapshotCheckScript, StringComparer.Ordinal))
+                        clock.Timestamp += TimeSpan.FromSeconds(25).Ticks;
+                    if (scenario.StartsWith("cleanup-reserve-", StringComparison.Ordinal)
+                        && identityChecks == 2 && args.Contains("--json", StringComparer.Ordinal))
+                        clock.Timestamp += TimeSpan.FromSeconds(25).Ticks;
+                    if (scenario.StartsWith("cleanup-reserve-", StringComparison.Ordinal) && args[0] == "rm")
+                        clock.Timestamp += TimeSpan.FromSeconds(scenario == "cleanup-reserve-exhausted" ? 15 : 10).Ticks;
+                    return Task.FromResult(response);
+                }
+
+                int exit;
+                try
+                {
+                    exit = (await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
+                        (_, _, _, _) => { }, reservation, FakeTransport, deadline, safety)).ExitCode;
+                }
+                catch (TimeoutException ex) when (scenario == "cleanup-reserve-exhausted"
+                    && ex.Message == "ORDER_SAFETY_RESERVE_EXHAUSTED")
+                {
+                    if (calls[^1][0] != "rm" || callLimits[^1] != TimeSpan.FromSeconds(15)
+                        || File.Exists(Path.Combine(results, "reports", "hami-code-" + id, "report.json")))
+                        throw new InvalidOperationException("Exhausted safety reserve permitted more work.");
+                    continue;
+                }
+
+                if (scenario == "cleanup-reserve-exhausted")
+                    throw new InvalidOperationException("Exhausted safety reserve accepted.");
+                if (scenario == "termination-unconfirmed")
+                {
+                    if (exit == 0 || calls.Any(a => a[0] == "rm") || identityChecks != 1
+                        || calls.Any(a => a.Contains("build", StringComparer.Ordinal))
+                        || !Directory.Exists(Path.Combine(results, "staging", "hami-code-" + id)))
+                        throw new InvalidOperationException("Unconfirmed transport termination allowed another effect.");
+                    continue;
+                }
+
+                if (scenario == "cleanup-reserve-shortened"
+                    && (callLimits[^3] != TimeSpan.FromSeconds(30) || callLimits[^2] != TimeSpan.FromSeconds(15)
+                        || callLimits[^1] != TimeSpan.FromSeconds(5) || callTokens[^3] != callTokens[^2]
+                        || callTokens[^2] != callTokens[^1] || !callTokens[^1].CanBeCanceled))
+                    throw new InvalidOperationException("Cleanup phases reset the safety reserve.");
+                if (interrupted)
+                {
+                    string interruptedReportPath = Path.Combine(results, "reports", "hami-code-" + id, "report.json");
+                    byte[] interruptedBytes = File.ReadAllBytes(interruptedReportPath);
+                    var interruptedReport = JsonSerializer.Deserialize<SandboxRunReport>(interruptedBytes,
+                        new JsonSerializerOptions(JsonSerializerDefaults.Web))
+                        ?? throw new InvalidOperationException("Interrupted report missing.");
+                    bool unknownCreate = scenario == "cancel-during-create";
+                    bool expired = scenario == "deadline-before-restore";
+                    bool restoreStarted = scenario == "cancel-during-restore";
+                    int regularCalls = unknownCreate ? calls.Count : calls.Count - 3;
+                    if (exit == 0 || interruptedReport.Error is null || interruptedReport.TimedOut != expired
+                        || interruptedReport.SandboxRemovalSucceeded == unknownCreate
+                        || (calls.Count(a => a[0] == "rm") != (unknownCreate ? 0 : 1))
+                        || calls.Any(a => a.Contains("build", StringComparer.Ordinal))
+                        || calls.Any(a => a.Contains("restore", StringComparer.Ordinal)) != restoreStarted
+                        || regularCalls < 2 || callTokens.Take(regularCalls).Any(t => t != deadline!.Token)
+                        || callTokens.Skip(regularCalls).Any(t => t != safety.Token || !t.CanBeCanceled)
+                        || (!unknownCreate && (calls[^2][0] != "rm" || calls[^1][0] != "inspect"))
+                        || (expired && callLimits[1] != TimeSpan.FromSeconds(25))
+                        || DevelopmentOrderGuestReconciliation.Observe(new string('A', 64), reservation,
+                            interruptedBytes, 1, "", absent, DateTime.UtcNow.Ticks) is not null)
+                        throw new InvalidOperationException("Interrupted reserved runner escaped deadline or cleanup guard.");
+                    continue;
+                }
+                bool success = scenario is "success" or "cleanup-reserve-shortened";
+                bool guestMismatch = scenario.StartsWith("guest-", StringComparison.Ordinal);
+                bool ownershipUnknown = scenario is "identity-missing" or "identity-duplicate";
+                bool ownershipChanged = scenario is "identity-changed" or "identity-backend";
+                bool guestChecked = success || guestMismatch || ownershipChanged || scenario == "removal-unconfirmed";
+                bool guestVerified = guestChecked && !guestMismatch;
+                bool removalExpected = guestChecked && !ownershipChanged;
+                bool removalConfirmed = removalExpected && scenario != "removal-unconfirmed";
+                int creates = calls.Count(a => a[0] == "create");
+                int removes = calls.Count(a => a[0] == "rm");
+                int checkIndex = calls.FindIndex(a => a.Contains(GuestSnapshotCheckScript, StringComparer.Ordinal));
+                int restoreIndex = calls.FindIndex(a => a.Contains("restore", StringComparer.Ordinal));
+                if ((exit == 0) != success || creates != (guestChecked || ownershipUnknown || scenario == "ambiguous-create" ? 1 : 0)
+                    || removes != (removalExpected ? 1 : 0)
+                    || identityChecks != (guestChecked ? 2 : ownershipUnknown ? 1 : 0)
+                    || (checkIndex >= 0) != guestChecked
+                    || (guestVerified ? restoreIndex <= checkIndex : restoreIndex != -1)
+                    || (removalExpected && (calls[^1][0] != "inspect" || calls[^1][1] != name))
+                    || calls[0][0] != "inspect" || calls[0][1] != name
+                    || calls.Any(a => a[0] == "create" && a[2] != name)
+                    || calls.Any(a => a[0] == "rm" && a[^1] != name))
+                    throw new InvalidOperationException("Reserved runner dispatch/cleanup differed.");
+
+                string reportPath = Path.Combine(results, "reports", "hami-code-" + id, "report.json");
+                byte[] bytes = File.ReadAllBytes(reportPath);
+                var report = JsonSerializer.Deserialize<SandboxRunReport>(bytes, new JsonSerializerOptions(JsonSerializerDefaults.Web))
+                    ?? throw new InvalidOperationException("Reserved runner report missing.");
+                if (report.SchemaVersion != 4 || report.RunId != id
+                    || report.SnapshotHash != (guestVerified ? snapshotHash : null)
+                    || report.SandboxRemovalSucceeded != removalConfirmed)
+                    throw new InvalidOperationException("Reserved report identity or cleanup differs.");
+                var observed = DevelopmentOrderGuestReconciliation.Observe(new string('A', 64),
+                    reservation, bytes, 1, "", absent, DateTime.UtcNow.Ticks);
+                if ((observed is not null) != success)
+                    throw new InvalidOperationException("Reserved report reconciliation differs.");
+
+                // Remove test report/staging to exercise the durable one-shot
+                // slot itself; never a repair action in the real path.
+                Directory.Delete(Path.GetDirectoryName(reportPath)!, recursive: true);
+                int before = calls.Count;
+                bool rejected = false;
+                try
+                {
+                    _ = await RunCoreAsync(repo, source, "Demo.csproj", "run", results,
+                        (_, _, _, _) => { }, reservation, FakeTransport, safety: safety);
+                }
+                catch (IOException) { rejected = true; }
+                if (!rejected || calls.Count != before)
+                    throw new InvalidOperationException("Reserved run was dispatched twice.");
+            }
+            Console.WriteLine("PASS: reserved sandbox runner uses pre-bound identity, rejects collisions and ambiguous create, retains one-shot slot.");
+            Console.WriteLine("PASS: guest snapshot observation precedes restore; changed/extra/missing/nonregular/truncated/diagnostic evidence blocks execution.");
+            Console.WriteLine("PASS: reserved cleanup checks backend identity before removal and fresh absence after removal; unknown/changed identity blocks rm.");
+            Console.WriteLine("PASS: reserved deadline and caller cancellation stop regular work; cleanup retains independent token and ownership gates.");
+            Console.WriteLine("PASS: shared safety reserve limits cleanup phases without reset; exhaustion and unknown transport termination block further effects.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private sealed class RunnerClock(long utcTicks) : TimeProvider
+    {
+        internal long Timestamp { get; set; }
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => Timestamp;
+        public override DateTimeOffset GetUtcNow() => new(utcTicks, TimeSpan.Zero);
     }
 
     private static void ExpectRejected(Action action)
@@ -665,5 +1445,5 @@ internal static class DevelopmentSandboxRunner
         throw new InvalidOperationException("Unsafe input was accepted.");
     }
 
-    private sealed record SandboxProcess(int ExitCode, string Output, string Error);
+    internal sealed record SandboxProcess(int ExitCode, string Output, string Error);
 }

@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "finalVerificationSeconds": 30,
+  "safetyReserveSeconds": 150,
+  "defaults": {
+    "modelCalls": 4,
+    "sandboxRuns": 5,
+    "elapsedSeconds": 1800,
+    "s01ModelCalls": 2,
+    "s01SandboxRuns": 2,
+    "s02ModelCalls": 2,
+    "s02SandboxRuns": 2,
+    "finalSandboxRuns": 1
+  },
+  "maximums": {
+    "modelCalls": 4,
+    "sandboxRuns": 5,
+    "elapsedSeconds": 1800,
+    "s01ModelCalls": 2,
+    "s01SandboxRuns": 2,
+    "s02ModelCalls": 2,
+    "s02SandboxRuns": 2,
+    "finalSandboxRuns": 1
+  }
+}

@@ -80,10 +80,11 @@ internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy p
 
 #pragma warning restore OPENAI001
 
-    public static IChatClient CreateOpenAi(string apiKey)
+    public static IChatClient CreateOpenAi(string apiKey, OpenAIClientOptions? options = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
-        OpenAIClient provider = new(apiKey);
+        OpenAIClient provider = options is null ? new(apiKey)
+            : new(new System.ClientModel.ApiKeyCredential(apiKey), options);
         // OPENAI001 marks this Responses->IChatClient adapter experimental.
         // It is kept behind an explicit CLI opt-in pending a real compatibility test.
 #pragma warning disable OPENAI001
@@ -117,7 +118,7 @@ internal sealed class CodingAiClient(IChatClient client, CodingExecutionPolicy p
             || fake.Options.Tools?.Count != 0
             || fake.Options.AllowBackgroundResponses != false
             || fake.Options.RawRepresentationFactory?.Invoke(fake) is not CreateResponseOptions
-                { StoredOutputEnabled: false })
+            { StoredOutputEnabled: false })
             throw new InvalidOperationException(
                 "AI adapter did not preserve strict JSON format, no-tools, token budget or store=false.");
 #pragma warning restore OPENAI001

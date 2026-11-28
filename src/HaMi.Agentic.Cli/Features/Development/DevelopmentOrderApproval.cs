@@ -27,8 +27,11 @@ internal sealed record OrderBinding(
 internal sealed class DevelopmentOrderApproval
 {
     private DevelopmentOrderApproval(DevelopmentOrder order, OrderBinding binding,
-        string title, DateTimeOffset observedAt, OrderCommentObservation comment)
+        string title, DateTimeOffset observedAt, OrderCommentObservation comment,
+        DevelopmentOrderBudgetPolicy budgetPolicy, OrderOperationLimits effectiveLimits)
     {
+        BudgetPolicy = budgetPolicy;
+        EffectiveLimits = effectiveLimits;
         Order = order;
         Binding = binding;
         Title = title;
@@ -41,8 +44,11 @@ internal sealed class DevelopmentOrderApproval
     internal string Title { get; }
     internal DateTimeOffset ObservedAt { get; }
     internal OrderCommentObservation Comment { get; }
+    internal DevelopmentOrderBudgetPolicy BudgetPolicy { get; }
+    internal OrderOperationLimits EffectiveLimits { get; }
 
-    internal static DevelopmentOrderApproval Observe(OrderIssueObservation issue, OrderReviewedProfile profile)
+    internal static DevelopmentOrderApproval Observe(OrderIssueObservation issue, OrderReviewedProfile profile,
+        DevelopmentOrderBudgetPolicy budgetPolicy)
     {
         OrderCheck.Require(issue.Repository == profile.Repository && issue.IssueId > 0
             && issue.Number > 0 && profile.OwnerId > 0 && OrderCheck.Text(profile.OwnerLogin, 100)
@@ -53,7 +59,9 @@ internal sealed class DevelopmentOrderApproval
             && OrderCheck.Hash(profile.CalculatorBaselineHash) && OrderCheck.Hash(profile.FormatterBaselineHash),
             "ORDER_REVIEW_PROFILE");
 
+        OrderCheck.Require(budgetPolicy.Sha256 == profile.PolicyHash, "ORDER_BUDGET_POLICY_BINDING");
         DevelopmentOrder order = DevelopmentOrder.ParseIssueBody(issue.Body);
+        OrderOperationLimits effectiveLimits = budgetPolicy.Resolve(order);
         JsonElement plan = order.Document;
         int revision = plan.GetProperty("revision").GetInt32();
         OrderCheck.Require(plan.GetProperty("repository").GetString() == issue.Repository
@@ -102,7 +110,7 @@ internal sealed class DevelopmentOrderApproval
         return new DevelopmentOrderApproval(order, new OrderBinding(issue.Repository, issue.IssueId, issue.Number,
             revision, order.Sha256, profile.BaseCommit, latest.Id, profile.OwnerId, profile.OwnerLogin,
             profile.ContractHash, profile.ScopeHash, profile.PolicyHash, profile.CalculatorBaselineHash,
-            profile.FormatterBaselineHash), issue.Title, issue.ObservedAt, latest);
+            profile.FormatterBaselineHash), issue.Title, issue.ObservedAt, latest, budgetPolicy, effectiveLimits);
     }
 }
 

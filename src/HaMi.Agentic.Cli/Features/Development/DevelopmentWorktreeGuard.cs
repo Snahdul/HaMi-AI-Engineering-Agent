@@ -1,6 +1,22 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.Text;
 
 namespace HaMi.Agentic.Cli.Features.Development;
+
+// Exact bytes observed from a trusted clean main checkout and its Git
+// objects. This is observation only, not a fresh issue approval.
+internal sealed record OrderGitBaseline(string Commit, byte[] Contract, byte[] Scope,
+    byte[] Calculator, byte[] Formatter)
+{
+    internal void RequireBinding(OrderBinding binding) =>
+        OrderCheck.Require(Commit == binding.BaseCommit
+            && DevelopmentJobState.Hash(Contract) == binding.ContractHash
+            && DevelopmentJobState.Hash(Scope) == binding.ScopeHash
+            && DevelopmentJobState.Hash(Calculator) == binding.CalculatorBaselineHash
+            && DevelopmentJobState.Hash(Formatter) == binding.FormatterBaselineHash,
+            "ORDER_GIT_BASELINE_BINDING");
+}
 
 /// <summary>
 /// Read-only verifier. It never builds, executes, integrates or writes model code.
@@ -51,6 +67,74 @@ internal static class DevelopmentWorktreeGuard
         foreach (string path in changedPaths)
             RejectReparsePoints(worktree, path);
         return changedPaths;
+    }
+
+    // Bounded first pair slice. The host must own the repository and Git
+    // configuration exclusively; no model code or arbitrary paths are used.
+    // Require a clean checkout, including ignored entries, and compare the
+    // four relevant regular tracked UTF-8 files to their exact Git objects.
+    internal static async Task<OrderGitBaseline> ObserveOrderBaselineAsync(string repository,
+        OrderBinding? binding = null)
+    {
+        string repo = Path.GetFullPath(repository);
+        async Task<string> RequireCleanAsync()
+        {
+            string root = (await GitAsync(repo, "--no-replace-objects", "rev-parse", "--show-toplevel")).Trim();
+            string branch = (await GitAsync(repo, "branch", "--show-current")).Trim();
+            string commit = (await GitAsync(repo, "--no-replace-objects", "rev-parse", "--verify", "HEAD")).Trim();
+            string main = (await GitAsync(repo, "--no-replace-objects", "rev-parse", "--verify", "refs/heads/main")).Trim();
+            OrderCheck.Require(SamePath(repo, root) && branch == "main" && OrderCheck.Commit(commit)
+                && commit == main && (binding is null || commit == binding.BaseCommit), "ORDER_GIT_BASELINE_COMMIT");
+            string status = await GitAsync(repo, "--no-optional-locks", "-c", "core.fsmonitor=false",
+                "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none");
+            string tracked = await GitAsync(repo, "ls-files", "-v", "-z");
+            OrderCheck.Require(status.Length == 0 && tracked.Length > 0 && tracked.EndsWith('\0')
+                && tracked.Split('\0')[..^1].All(entry => entry.StartsWith("H ", StringComparison.Ordinal)),
+                "ORDER_GIT_BASELINE_DIRTY");
+            return commit;
+        }
+
+        string baseCommit = await RequireCleanAsync();
+        async Task<byte[]> ReadTrackedAsync(string relative)
+        {
+            string entry = await GitAsync(repo, "--no-replace-objects", "ls-tree", "-z", baseCommit, "--", relative);
+            string prefix = "100644 blob ";
+            string suffix = "\t" + relative + '\0';
+            OrderCheck.Require(entry.StartsWith(prefix, StringComparison.Ordinal)
+                && entry.EndsWith(suffix, StringComparison.Ordinal)
+                && entry.Length == prefix.Length + 40 + suffix.Length, "ORDER_GIT_BASELINE_TREE");
+            string objectId = entry.Substring(prefix.Length, 40);
+            OrderCheck.Require(OrderCheck.Commit(objectId), "ORDER_GIT_BASELINE_TREE");
+            string sizeText = (await GitAsync(repo, "--no-replace-objects", "cat-file", "-s", objectId)).Trim();
+            OrderCheck.Require(int.TryParse(sizeText, NumberStyles.None, CultureInfo.InvariantCulture, out int size)
+                && size is > 0 and <= OrderCandidateCheckpoint.MaxBytes, "ORDER_GIT_BASELINE_SIZE");
+            byte[] checkout = DevelopmentJobEvidence.ReadBoundedFile(
+                Path.Combine(repo, relative.Replace('/', Path.DirectorySeparatorChar)),
+                OrderCandidateCheckpoint.MaxBytes);
+            string objectText = await GitAsync(repo, "--no-replace-objects", "cat-file", "blob", objectId);
+            byte[] objectBytes = new UTF8Encoding(false, true).GetBytes(objectText);
+            // The object-ID comparison independently excludes lossy decoding,
+            // newline conversion and checkout filters in this bounded slice.
+            string checkoutObject = (await GitAsync(repo, "hash-object", "--no-filters", "--", relative)).Trim();
+            OrderCheck.Require(checkout.Length == size && checkoutObject == objectId
+                && checkout.AsSpan().SequenceEqual(objectBytes), "ORDER_GIT_BASELINE_BYTES");
+            return checkout;
+        }
+
+        var observed = new OrderGitBaseline(baseCommit,
+            await ReadTrackedAsync(DevelopmentAgentContract.PairPath),
+            await ReadTrackedAsync(DevelopmentAgentContract.PairScopePath),
+            await ReadTrackedAsync(DevelopmentAgentContract.PairFirst),
+            await ReadTrackedAsync(DevelopmentAgentContract.PairSecond));
+        var scope = DevelopmentContract.Parse(new UTF8Encoding(false, true).GetString(observed.Scope));
+        OrderCheck.Require(scope.TaskId == "sandbox-pair"
+            && scope.AllowedWritePaths.SequenceEqual(
+                [DevelopmentAgentContract.PairFirst, DevelopmentAgentContract.PairSecond], StringComparer.Ordinal),
+            "ORDER_GIT_BASELINE_SCOPE");
+        OrderCheck.Require(await RequireCleanAsync() == baseCommit, "ORDER_GIT_BASELINE_CHANGED");
+        if (binding is not null)
+            observed.RequireBinding(binding);
+        return observed;
     }
 
     internal static string[] VerifyChanges(string status, DevelopmentContract contract)

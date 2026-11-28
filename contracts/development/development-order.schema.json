@@ -14,7 +14,6 @@
     "context",
     "decisions",
     "contractId",
-    "limits",
     "steps",
     "finalVerification"
   ],
@@ -160,9 +159,7 @@
           "outputs",
           "allowedWritePaths",
           "verifier",
-          "criteria",
-          "maxModelCalls",
-          "maxSandboxRuns"
+          "criteria"
         ],
         "properties": {
           "id": {
@@ -300,8 +297,7 @@
       "additionalProperties": false,
       "required": [
         "verifier",
-        "criteria",
-        "maxSandboxRuns"
+        "criteria"
       ],
       "properties": {
         "verifier": {

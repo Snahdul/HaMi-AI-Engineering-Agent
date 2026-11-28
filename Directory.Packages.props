@@ -1,0 +1,27 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="Akka.Hosting" Version="1.5.74" />
+    <PackageVersion Include="Akka.Persistence" Version="1.5.74" />
+    <PackageVersion Include="Akka.Persistence.Hosting" Version="1.5.74" />
+    <PackageVersion Include="Akka.Persistence.Sql.Hosting" Version="1.5.73" />
+    <PackageVersion Include="Microsoft.Data.Sqlite" Version="11.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.AI" Version="11.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.AI.OpenAI" Version="11.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Binder" Version="11.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="11.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="11.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Logging" Version="11.0.0" />
+    <PackageVersion Include="Serilog" Version="4.4.0" />
+    <PackageVersion Include="Serilog.Extensions.Logging" Version="11.0.0" />
+    <PackageVersion Include="Serilog.Formatting.Compact" Version="3.0.0" />
+    <PackageVersion Include="Serilog.Sinks.File" Version="7.0.0" />
+    <!-- Exact native security patch reviewed in Issue #70; used by the probe only. -->
+    <PackageVersion Include="SQLite" Version="[3.54.1]" />
+    <PackageVersion Include="System.CommandLine" Version="3.0.0" />
+    <PackageVersion Include="YamlDotNet" Version="18.1.0" />
+  </ItemGroup>
+</Project>

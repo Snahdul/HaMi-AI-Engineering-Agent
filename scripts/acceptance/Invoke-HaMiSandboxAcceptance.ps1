@@ -28,7 +28,7 @@ if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw 'dotnet feh
 if (-not (Get-Command sbx -ErrorAction SilentlyContinue)) { throw 'sbx fehlt.' }
 New-Item -ItemType Directory -Path $out,$src -Force | Out-Null
 [IO.File]::WriteAllText($canary, ('HOST-ONLY-CANARY-' + $guid))
-$projectXml = '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net11.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>'
+$projectXml = '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net11.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup></Project>'
 
 function New-Snapshot([string]$name,[string]$program) {
     $dir = Join-Path $src $name

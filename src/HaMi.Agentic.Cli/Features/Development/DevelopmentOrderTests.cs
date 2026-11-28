@@ -9,6 +9,8 @@ internal static class DevelopmentOrderTests
     internal static void SelfTest(string repo)
     {
         DevelopmentOrderSchemaTests.SelfTest();
+        DevelopmentOrderCalculatorVerifier.SelfTest();
+        DevelopmentOrderFormatterVerifier.SelfTest();
         string plan = File.ReadAllText(Path.Combine(repo, "samples/DevelopmentOrder/pair-order.json"))
             .Replace("\r\n", "\n", StringComparison.Ordinal);
         if (!plan.EndsWith('\n'))
@@ -65,7 +67,9 @@ internal static class DevelopmentOrderTests
         RejectMutation(x => x["limits"]!["sandboxRuns"] = 4);
         RejectMutation(x => x["limits"]!["elapsedSeconds"] = 1801);
         Console.WriteLine("Development order schema, scope, dependencies, budgets and exact-byte identity self-test passed.");
-        DevelopmentOrderHandoverTests.SelfTest(plan);
+        var policy = DevelopmentOrderBudgetPolicy.Parse(File.ReadAllBytes(Path.Combine(repo,
+            "policies/development/pair-budget.fixture.policy.json")));
+        DevelopmentOrderHandoverTests.SelfTest(plan, policy);
     }
 
     private static void ExpectRejected(Action action)

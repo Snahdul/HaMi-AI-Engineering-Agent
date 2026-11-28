@@ -10,6 +10,18 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
+        if (args.Length == 4 && args[0] == "pair-acceptance-73-start"
+            || args.Length == 5 && args[0] == "pair-acceptance-73-resume")
+            return await PairAcceptanceEntry.RunAsync(args);
+
+        // Focused offline preflight: real SDK over in-memory HTTP fixtures only.
+        if (args.Length == 1 && args[0] == "reserved-model-response-self-test")
+        {
+            await DevelopmentAiGenerator.SelfTestS01Async();
+            await DevelopmentAiGenerator.SelfTestS02Async();
+            return 0;
+        }
+
         // Explicit operator acceptance only. The default CI probe stays
         // entirely offline and never accesses the real account state root.
         if (args.Length == 5 && args[0] == "host-check")
@@ -36,7 +48,80 @@ internal static class Program
             return 0;
         }
 
-        if (args.Length == 2 && args[0] is "hold" or "probe")
+        if (args.Length == 2 && args[0] is "transport-parent" or "transport-leaf")
+        {
+            string root = args[1];
+            string name = Path.GetFileName(root);
+            if (!name.StartsWith(Prefix, StringComparison.Ordinal)
+                || !Guid.TryParseExact(name[Prefix.Length..], "N", out _)
+                || Path.Combine(Path.GetTempPath(), name) != root || !Directory.Exists(root))
+                throw new InvalidOperationException("Transport probe root rejected.");
+
+            if (args[0] == "transport-leaf")
+            {
+                Console.WriteLine("TRANSPORT_LEAF_READY");
+                Console.Out.Flush();
+                await Task.Delay(Timeout.InfiniteTimeSpan);
+                return 1;
+            }
+
+            using var leaf = Start("transport-leaf", root);
+            try
+            {
+                if (await leaf.StandardOutput.ReadLineAsync().WaitAsync(Deadline) != "TRANSPORT_LEAF_READY"
+                    || leaf.HasExited)
+                    throw new InvalidOperationException("Transport leaf did not become ready.");
+                Console.WriteLine("TRANSPORT_READY:" + leaf.Id);
+                Console.Out.Flush();
+                await Task.Delay(Timeout.InfiniteTimeSpan);
+                return 1;
+            }
+            finally
+            {
+                if (!leaf.HasExited)
+                    leaf.Kill(entireProcessTree: true);
+                await leaf.WaitForExitAsync().WaitAsync(Deadline);
+            }
+        }
+
+        if (args.Length == 2 && args[0] is "backend-hold" or "backend-probe")
+        {
+            var backendStore = DevelopmentJobStateRoot.OpenOrderProbeFixture(args[1], create: false);
+            FileStream backend;
+            try { backend = backendStore.AcquireSandboxBackend(); }
+            catch (IOException) when (args[0] == "backend-probe")
+            {
+                Console.WriteLine("BUSY");
+                return 0;
+            }
+            using (backend)
+            {
+                Console.WriteLine("BACKEND_ACQUIRED");
+                Console.Out.Flush();
+                if (args[0] == "backend-probe")
+                    return 0;
+                await Task.Delay(Timeout.InfiniteTimeSpan);
+                return 1;
+            }
+        }
+
+        if (args.Length == 2 && args[0] is "hold" or "probe" or "bridge-hold" or "bridge-unknown" or "bridge-resume" or "bridge-blocked" or "bridge-failed" or "bridge-retry" or "bridge-guest" or "bridge-guest-resume" or "bridge-guest-unknown" or "bridge-guest-blocked" or "bridge-guest-orphan" or "bridge-guest-orphan-resume" or "bridge-probe"
+            or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
+            or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan"
+            or "bridge-model-resume-blocked" or "bridge-model-resume-generated" or "bridge-model-resume-rejected"
+            or "bridge-soft-stop" or "bridge-soft-resume" or "bridge-model-accepted" or "bridge-model-resume-accepted"
+            or "bridge-model-verified" or "bridge-model-resume-verified"
+            or "bridge-model-resume-formatter-receipt" or "bridge-model-resume-formatter-orphan"
+            or "bridge-model-resume-formatter-checkpoint" or "bridge-model-resume-formatter-rejected"
+            or "bridge-model-resume-formatter-rejected-orphan"
+            or "bridge-model-resume-formatter-budget-hard" or "bridge-model-resume-formatter-budget-soft"
+            or "bridge-model-resume-formatter-budget-hard-generated"
+            or "bridge-model-continuous" or "bridge-model-resume-continuous"
+            or "bridge-model-pair-stop-s01-model" or "bridge-model-pair-stop-s01-guest"
+            or "bridge-model-resume-pair-stop-s01-model" or "bridge-model-resume-pair-stop-s01-guest"
+            or "bridge-model-resume-pair-stop-s02-guest" or "bridge-model-resume-pair-stop-final"
+            or "bridge-model-resume-final-pre-dispatch" or "bridge-model-resume-final-wrong-output"
+            or "bridge-model-resume-final-orphan")
         {
             string root = args[1];
             string name = Path.GetFileName(root);
@@ -45,6 +130,37 @@ internal static class Program
                 || Path.Combine(Path.GetTempPath(), name) != root)
                 throw new InvalidOperationException("Probe root rejected.");
             var store = new DevelopmentJobStateStore(root);
+            if (args[0].StartsWith("bridge-", StringComparison.Ordinal))
+            {
+                var orderStore = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: false);
+                DevelopmentJobStateStore.Lease owner;
+                try { owner = orderStore.AcquireOrder(PersistenceBridgeProbe.Issue); }
+                catch (IOException) when (args[0] == "bridge-probe")
+                {
+                    Console.WriteLine("BUSY");
+                    return 0;
+                }
+                using (owner)
+                {
+                    if (args[0] == "bridge-probe")
+                    {
+                        Console.WriteLine(owner.CurrentOrder is null ? "ACQUIRED:none" : "ACQUIRED:order");
+                        return 0;
+                    }
+                    if (args[0] is "bridge-hold" or "bridge-unknown" or "bridge-failed" or "bridge-guest"
+                        or "bridge-guest-unknown" or "bridge-guest-orphan"
+                        or "bridge-model-receipt" or "bridge-model-orphan" or "bridge-model-checkpoint"
+                        or "bridge-model-generated" or "bridge-model-rejected" or "bridge-model-rejected-orphan"
+                        or "bridge-soft-stop" or "bridge-model-accepted" or "bridge-model-verified"
+                        or "bridge-model-pair-stop-s01-model" or "bridge-model-pair-stop-s01-guest" or "bridge-model-continuous")
+                        owner.ClaimOrder(Guid.NewGuid().ToString("N"), args[0] is "bridge-model-accepted" or "bridge-model-verified"
+                            or "bridge-model-pair-stop-s01-model" or "bridge-model-pair-stop-s01-guest" or "bridge-model-continuous"
+                            ? await PersistenceBridgeProbe.CalculatorRecoveryApprovalAsync(root) : PersistenceBridgeProbe.FixtureApproval());
+                    _ = owner.RequireArchivedOrder();
+                    return await PersistenceBridgeProbe.RunChildAsync(args[0], root, owner);
+                }
+            }
+
             if (args[0] == "probe")
             {
                 DevelopmentJobStateStore.Lease owner;
@@ -69,6 +185,7 @@ internal static class Program
 
         if (args.Length != 0)
             return 2;
+        PairAcceptanceProfile.SelfTest();
         string fixture = Path.Combine(Path.GetTempPath(), Prefix + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(fixture);
         try
@@ -108,11 +225,186 @@ internal static class Program
             }
             await ExpectProbeAsync(fixture, "ACQUIRED:recovery-blocked");
             Console.WriteLine("PASS: cross-process exclusive ownership and abrupt termination retain claim.");
+            await RunReservedTransportProbeAsync(fixture);
+            await RunBackendLeaseProbeAsync();
+            await PersistenceBridgeProbe.RunAsync(Prefix, Start,
+                (root, expected) => ExpectProbeAsync(root, expected, "bridge-probe"));
             return 0;
         }
         finally
         {
             Directory.Delete(fixture, recursive: true);
+        }
+    }
+
+    private static async Task RunReservedTransportProbeAsync(string root)
+    {
+        foreach (bool callerCancellation in new[] { false, true })
+        {
+            using var parent = Start("transport-parent", root);
+            Process? leaf = null;
+            try
+            {
+                const string marker = "TRANSPORT_READY:";
+                string? ready = await parent.StandardOutput.ReadLineAsync().WaitAsync(Deadline);
+                if (ready is null || !ready.StartsWith(marker, StringComparison.Ordinal)
+                    || !int.TryParse(ready[marker.Length..], out int pid) || pid <= 0 || pid == parent.Id
+                    || pid == Environment.ProcessId || parent.HasExited)
+                    throw new InvalidOperationException("Transport parent did not become ready.");
+                leaf = Process.GetProcessById(pid);
+                if (NoLongerExecuting(leaf))
+                    throw new InvalidOperationException("Transport leaf exited before cancellation.");
+
+                using var caller = new CancellationTokenSource();
+                using var safety = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(10));
+                TimeSpan phaseLimit = callerCancellation ? Deadline : TimeSpan.FromMilliseconds(250);
+                Task<DevelopmentSandboxRunner.SandboxProcess> operation =
+                    DevelopmentSandboxRunner.ObserveReservedProcessForProbeAsync(parent, phaseLimit, caller.Token, safety);
+                if (callerCancellation)
+                    caller.Cancel();
+
+                bool expected = false;
+                try { _ = await operation.WaitAsync(Deadline); }
+                catch (OperationCanceledException ex) when (callerCancellation && ex.CancellationToken == caller.Token)
+                { expected = true; }
+                catch (TimeoutException ex) when (!callerCancellation && ex.Message == "sbx operation timed out: offline-probe")
+                { expected = true; }
+                if (!expected || !parent.HasExited || parent.ExitCode == 0)
+                    throw new InvalidOperationException("Reserved transport did not terminate with the expected outcome.");
+                // The cleanup token remains independent of the cancelled
+                // business token, and uses the already-started safety window.
+                safety.Check();
+                if (safety.Token.IsCancellationRequested)
+                    throw new InvalidOperationException("Safety token inherited business cancellation.");
+
+                // A killed Linux grandchild can briefly remain as a zombie
+                // until the OS reaps it. A zombie cannot execute instructions.
+                var observation = Stopwatch.StartNew();
+                while (!NoLongerExecuting(leaf) && observation.Elapsed < TimeSpan.FromSeconds(5))
+                    await Task.Delay(25);
+                if (!NoLongerExecuting(leaf))
+                    throw new InvalidOperationException("Controlled transport descendant still executing.");
+                Console.WriteLine("PASS: reserved transport " + (callerCancellation ? "caller cancellation" : "phase timer")
+                    + " terminated the controlled process and descendant.");
+            }
+            finally
+            {
+                // A failing regression must not leave the controlled fixture
+                // running. This fallback does not count towards test success.
+                try
+                {
+                    if (!parent.HasExited)
+                        parent.Kill(entireProcessTree: true);
+                    await parent.WaitForExitAsync().WaitAsync(Deadline);
+                    if (leaf is not null && !NoLongerExecuting(leaf))
+                    {
+                        leaf.Kill(entireProcessTree: true);
+                        var fallback = Stopwatch.StartNew();
+                        while (!NoLongerExecuting(leaf) && fallback.Elapsed < Deadline)
+                            await Task.Delay(25);
+                        if (!NoLongerExecuting(leaf))
+                            throw new InvalidOperationException("Transport fixture cleanup failed.");
+                    }
+                }
+                finally
+                {
+                    leaf?.Dispose();
+                }
+            }
+        }
+
+        // Exercise the real safety timer as well as deterministic clock
+        // exhaustion in the existing reserved runner self-tests.
+        using var window = new DevelopmentOrderSafetyWindow(TimeSpan.FromSeconds(1));
+        CancellationToken safetyToken = window.Token;
+        bool expired = false;
+        try { await Task.Delay(Timeout.InfiniteTimeSpan, safetyToken).WaitAsync(Deadline); }
+        catch (OperationCanceledException ex) when (ex.CancellationToken == safetyToken) { expired = true; }
+        if (!expired || !safetyToken.IsCancellationRequested)
+            throw new InvalidOperationException("Safety timer did not cancel.");
+        try
+        {
+            window.Check();
+            throw new InvalidOperationException("Expired safety window restarted.");
+        }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+        {
+            Console.WriteLine("PASS: real safety timer cancels without restarting its window.");
+        }
+    }
+
+    private static bool NoLongerExecuting(Process process)
+    {
+        if (process.HasExited)
+            return true;
+        if (!OperatingSystem.IsLinux())
+            return false;
+        try
+        {
+            string stat = File.ReadAllText("/proc/" + process.Id + "/stat");
+            int nameEnd = stat.LastIndexOf(')');
+            return nameEnd >= 0 && stat.Length > nameEnd + 2 && stat[nameEnd + 2] is 'Z' or 'X';
+        }
+        catch (FileNotFoundException) { return process.HasExited; }
+        catch (DirectoryNotFoundException) { return process.HasExited; }
+    }
+
+    private static async Task RunBackendLeaseProbeAsync()
+    {
+        string root = Path.Combine(Path.GetTempPath(), Prefix + Guid.NewGuid().ToString("N"));
+        var store = DevelopmentJobStateRoot.OpenOrderProbeFixture(root, create: true);
+        try
+        {
+            string path = Path.Combine(root, "sandbox-backend.lock");
+            using (var child = Start("backend-hold", root))
+            {
+                try
+                {
+                    if (await child.StandardOutput.ReadLineAsync().WaitAsync(Deadline) != "BACKEND_ACQUIRED"
+                        || child.HasExited)
+                        throw new InvalidOperationException("Backend owner did not acquire.");
+                    await ExpectProbeAsync(root, "BUSY", "backend-probe");
+                    Reject(() => store.AcquireSandboxBackend().Dispose());
+                    if (!File.Exists(path))
+                        throw new InvalidOperationException("Backend lock missing.");
+                }
+                finally
+                {
+                    if (!child.HasExited)
+                        child.Kill(entireProcessTree: true);
+                    await child.WaitForExitAsync().WaitAsync(Deadline);
+                }
+                if (child.ExitCode == 0)
+                    throw new InvalidOperationException("Backend owner did not terminate abnormally.");
+            }
+
+            // Do not unlink the lock to recover. The OS releases the handle.
+            if (!File.Exists(path))
+                throw new InvalidOperationException("Backend lock lost after crash.");
+            await ExpectProbeAsync(root, "BACKEND_ACQUIRED", "backend-probe");
+            using (var backend = store.AcquireSandboxBackend())
+            {
+                await ExpectProbeAsync(root, "BUSY", "backend-probe");
+            }
+            await ExpectProbeAsync(root, "BACKEND_ACQUIRED", "backend-probe");
+            store.RequireAcceptanceBackendIdle(PairAcceptanceProfile.IssueNumber);
+            using (var competing = store.Acquire(Issue))
+            {
+                competing.Claim(Initial(root));
+                competing.Commit(competing.Current!.Start());
+                Reject(() => store.RequireAcceptanceBackendIdle(PairAcceptanceProfile.IssueNumber));
+                competing.Commit(competing.Current!.BlockUnknownExecution());
+                Reject(() => store.RequireAcceptanceBackendIdle(PairAcceptanceProfile.IssueNumber));
+            }
+            File.WriteAllText(path, "unexpected");
+            Reject(() => store.AcquireSandboxBackend().Dispose());
+            Reject(() => new DevelopmentJobStateStore(root).AcquireSandboxBackend().Dispose());
+            Console.WriteLine("PASS: private account-wide sandbox backend lease excludes cooperating processes and releases on process kill without unlink.");
+            Console.WriteLine("PASS: isolated acceptance registry gate rejects executing and unknown competing issue claims.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
         }
     }
 
@@ -152,9 +444,9 @@ internal static class Program
         return Process.Start(start) ?? throw new InvalidOperationException("Probe launch failed.");
     }
 
-    private static async Task ExpectProbeAsync(string root, string expected)
+    private static async Task ExpectProbeAsync(string root, string expected, string mode = "probe")
     {
-        using var child = Start("probe", root);
+        using var child = Start(mode, root);
         Task<string> stdout = child.StandardOutput.ReadToEndAsync();
         Task<string> stderr = child.StandardError.ReadToEndAsync();
         try
